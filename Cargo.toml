@@ -1,0 +1,13 @@
+[package]
+name = "batchflow"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.85"
+description = "A production-grade batch processing framework for Rust, inspired by Spring Batch. Under active development — name reservation release."
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+documentation = "https://docs.rs/batchflow"
+keywords = ["batch", "etl", "pipeline", "orchestration", "job"]
+categories = ["asynchronous", "concurrency"]
+
+[dependencies]
