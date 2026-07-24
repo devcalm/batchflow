@@ -1,13 +1,19 @@
-[package]
-name = "batchflow"
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+# Metadata shared by every member crate. Individual crates opt in with
+# `field.workspace = true`, so we bump versions / edition / license in one place.
+[workspace.package]
 version = "0.0.0"
 edition = "2024"
 rust-version = "1.85"
-description = "A production-grade batch processing framework for Rust, inspired by Spring Batch. Under active development — name reservation release."
 license = "MIT OR Apache-2.0"
-readme = "README.md"
-documentation = "https://docs.rs/batchflow"
-keywords = ["batch", "etl", "pipeline", "orchestration", "job"]
-categories = ["asynchronous", "concurrency"]
+authors = ["Oleksii Tsvietaiev <o.tsvietaiev92@gmail.com>"]
 
-[dependencies]
+# Dependencies shared across the workspace. Members reference them with
+# `dep.workspace = true`, keeping versions aligned in one place.
+[workspace.dependencies]
+batchflow-core = { path = "crates/batchflow-core", version = "0.0.0" }
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread"] }

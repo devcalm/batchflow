@@ -166,10 +166,11 @@ Principle: **own orchestration, integrate everything else.** Selections and one-
 **Decision:** Prefer native for generic/`impl Trait` paths. Introduce `async-trait` (or manual boxing) only where trait objects are required (e.g. heterogeneous step lists, plugin readers).
 **Consequences:** Zero-cost in the hot path; localized macro use where dynamism is genuinely needed. Revisit if RPITIT ergonomics change.
 
-### ADR-003 — Associated types over generic type params on core traits `[PROPOSED — pending user's Phase-2 call]`
+### ADR-003 — Associated types over generic type params on core traits `[DECIDED 2026-07-24]`
 **Context:** `ItemReader<I>` (generic) vs `trait ItemReader { type Item; }` (associated).
-**Leaning:** Associated types — a reader produces exactly one item type; a type param invites nonsensical `ItemReader<A> + ItemReader<B>` and worsens inference. Generic params are for when a type meaningfully implements the trait for *many* parameters (like `From<T>`). A reader is not that.
-**Status:** Deliberately left for the user to decide + defend in Phase 2. Will finalize then.
+**Rule applied:** Generic param = *input* type the caller chooses, multiple coexist per impl (`From<T>`). Associated type = *output* type the impl determines uniquely, functional dependency `Self → Item` (`Iterator::Item`). A reader/processor/writer produces/consumes exactly one type per impl ⇒ output ⇒ associated.
+**Decision:** Associated types on all three core traits. `ItemProcessor` gets two (`In`, `Out`) — both are outputs of the impl.
+**Consequences:** (1) Compiler enforces "a reader reads one thing" (second impl = conflict error). (2) Inference flows: `read_chunk<R: ItemReader>() -> Vec<R::Item>` needs no turbofish. (3) Step type-wiring is 3 equality bounds (`P: ItemProcessor<In = R::Item>`, `W: ItemWriter<Item = P::Out>`) instead of 4 viral generic params threaded everywhere. (4) Write-anything polymorphism (e.g. JSON) lives on the concrete type via `impl<T: Serialize> ItemWriter for JsonWriter<T> { type Item = T; }` + `PhantomData<T>`, NOT on the trait — keeps the guarantee and the ergonomics.
 
 ### ADR-004 — Errors: typed `BatchError` via thiserror, `#[non_exhaustive]`
 **Context:** Need retry/skip classification without exceptions.
