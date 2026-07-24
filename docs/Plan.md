@@ -23,14 +23,14 @@
 - **Acceptance:** `cargo build` workspace clean; core has minimal deps.
 - **Testing:** build only. **Docs:** README workspace map.
 
-## Phase 2 — Core Traits ☐
+## Phase 2 — Core Traits ☑
 - **Goals:** `ItemReader`/`ItemProcessor`/`ItemWriter`, `BatchError`, `read_chunk`.
 - **Learning:** associated types vs generics (ADR-003); `Option`=exhaust/filter; `Result`=fail; `&mut self` reader ⇒ not `Sync`; async-fn-in-traits caveats.
 - **Tasks:** Define 3 traits; `BatchError` (thiserror, `#[non_exhaustive]`); `read_chunk`; a fake reader for tests.
 - **Acceptance:** compiles; `clippy -D warnings` clean; user can defend the assoc-type-vs-generic call.
 - **Testing:** unit test `read_chunk` (full chunk, partial/EOF, error short-circuit). **Docs:** trait rustdoc + doctest.
 
-## Phase 3 — Job Model ☐
+## Phase 3 — Job Model ☑ (basic: `Job` holds `Vec<Box<dyn Step>>`, runs in order, fail-fast; builders/DAG deferred)
 - **Goals:** `Job`, `Step` definitions + builders; linear step ordering.
 - **Learning:** builder pattern in Rust; typestate for build-time validation; DAG deferred.
 - **Tasks:** `Job`/`Step` types; `JobBuilder`/`StepBuilder`; heterogeneous step list (trait objects, ADR-002).
@@ -42,7 +42,7 @@
 - **Tasks:** `StepExecution`, `StepContribution`, status enums; tasklet trait.
 - **Acceptance:** counters fold in correctly; rollback discards deltas. **Testing:** unit. **Docs:** rustdoc.
 
-## Phase 5 — Execution Engine ☐
+## Phase 5 — Execution Engine ☑ (basic: `run_step` chunk loop + `Step`/`ChunkStep`; no TX/persistence yet)
 - **Goals:** Drive a Job through its Steps; the chunk loop (no persistence/TX yet).
 - **Learning:** ownership of reader/processor/writer during a run; where `?` triggers failure.
 - **Tasks:** step executor running `read_chunk` → process → write with in-memory counters.
@@ -118,5 +118,6 @@
 `cargo fmt` · `cargo clippy -- -D warnings` · `cargo test` (+ doctests) · examples compile · no dead code · no needless clone/alloc.
 
 ## Current position
-Phase 0 ◐ → docs written. **Next actionable:** Phase 2 core-traits implementation task already handed to the user
-(define traits + `BatchError` + `read_chunk`, decide assoc-types-vs-generics). Phase 1 workspace split can be interleaved.
+Phase 0 ☑ docs · Phase 1 ☑ workspace · Phase 2 ☑ traits · Phase 3 ☑ Job (basic) · Phase 4 ◐ StepExecution counters (StepContribution/tasklet trait pending) · Phase 5 ☑ engine (basic) · Phase 6 ◐ chunk processing (filtering + counts done; property tests/tuning-guide pending).
+All in `batchflow-core/src/lib.rs`, 7 tests green, clippy clean. ADR-002 applied for real: readers/processors/writers use native async (static dispatch); `Step` uses `#[async_trait(?Send)]` for `Box<dyn Step>`.
+**Next candidate milestones:** (a) fault tolerance — skip/retry via an error `Classifier` (Phase 10); (b) persistence — `JobRepository` trait + InMemory, giving Job/Step identity + `JobExecution` (Phase 7), the path to restart. Work is uncommitted — good checkpoint to commit.

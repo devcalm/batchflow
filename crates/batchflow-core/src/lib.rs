@@ -3,6 +3,7 @@
 //! Core traits and execution engine for BatchFlow.
 #![forbid(unsafe_code)]
 
+use async_trait::async_trait;
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -15,6 +16,16 @@ pub enum BatchError {
     Write(String),
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct StepExecution {
+    /// Items pulled from the reader.
+    pub read_count: usize,
+    /// Items written (i.e. survived the processor's filter).
+    pub write_count: usize,
+    /// Items dropped by the processor (it returned `None`).
+    pub filter_count: usize,
+}
+
 #[allow(async_fn_in_trait)]
 pub trait ItemReader {
     type Item;
@@ -24,14 +35,14 @@ pub trait ItemReader {
 #[allow(async_fn_in_trait)]
 pub trait ItemWriter {
     type Item;
-    async fn write(&mut self, item: Self::Item) -> Result<(), BatchError>;
+    async fn write(&mut self, items: &[Self::Item]) -> Result<(), BatchError>;
 }
 
 #[allow(async_fn_in_trait)]
 pub trait ItemProcessor {
     type In;
     type Out;
-    async fn process(&mut self, item: Self::In) -> Result<Self::Out, BatchError>;
+    async fn process(&mut self, item: Self::In) -> Result<Option<Self::Out>, BatchError>;
 }
 
 pub async fn read_chunk<R>(reader: &mut R, chunk_size: usize) -> Result<Vec<R::Item>, BatchError>
@@ -49,6 +60,117 @@ where
     }
 
     Ok(chunk)
+}
+
+pub async fn process_chunk<P, W>(
+    processor: &mut P,
+    writer: &mut W,
+    items: Vec<P::In>,
+) -> Result<usize, BatchError>
+where
+    P: ItemProcessor,
+    W: ItemWriter<Item = P::Out>,
+{
+    let mut outputs: Vec<P::Out> = Vec::with_capacity(items.len());
+
+    for item in items {
+        if let Some(out) = processor.process(item).await? {
+            outputs.push(out);
+        }
+    }
+
+    writer.write(&outputs).await?;
+
+    Ok(outputs.len())
+}
+
+pub async fn run_step<R, P, W>(
+    reader: &mut R,
+    processor: &mut P,
+    writer: &mut W,
+    chunk_size: usize,
+) -> Result<StepExecution, BatchError>
+where
+    R: ItemReader,
+    P: ItemProcessor<In = R::Item>, // processor consumes what the reader produces
+    W: ItemWriter<Item = P::Out>,   // writer consumes what the processor produces
+{
+    let mut step = StepExecution::default();
+    loop {
+        let chunk = read_chunk(reader, chunk_size).await?;
+        if chunk.is_empty() {
+            break;
+        }
+        let read = chunk.len();
+        let written = process_chunk(processor, writer, chunk).await?;
+
+        step.read_count += read;
+        step.write_count += written;
+        step.filter_count += read - written;
+    }
+
+    Ok(step)
+}
+
+#[async_trait(?Send)]
+pub trait Step {
+    async fn run(&mut self) -> Result<StepExecution, BatchError>;
+}
+
+pub struct ChunkStep<R, P, W> {
+    reader: R,
+    processor: P,
+    writer: W,
+    chunk_size: usize,
+}
+
+impl<R, P, W> ChunkStep<R, P, W> {
+    pub fn new(reader: R, processor: P, writer: W, chunk_size: usize) -> Self {
+        Self {
+            reader,
+            processor,
+            writer,
+            chunk_size,
+        }
+    }
+}
+
+#[async_trait(?Send)]
+impl<R, P, W> Step for ChunkStep<R, P, W>
+where
+    R: ItemReader,
+    P: ItemProcessor<In = R::Item>,
+    W: ItemWriter<Item = P::Out>,
+{
+    async fn run(&mut self) -> Result<StepExecution, BatchError> {
+        run_step(
+            &mut self.reader,
+            &mut self.processor,
+            &mut self.writer,
+            self.chunk_size,
+        )
+        .await
+    }
+}
+
+pub struct Job {
+    steps: Vec<Box<dyn Step>>,
+}
+
+impl Job {
+    pub fn new(steps: Vec<Box<dyn Step>>) -> Self {
+        Self { steps }
+    }
+
+    pub async fn run(&mut self) -> Result<Vec<StepExecution>, BatchError> {
+        let mut executions = Vec::with_capacity(self.steps.len());
+
+        for step in &mut self.steps {
+            executions.push(step.run().await?);
+        }
+
+        Ok(executions)
+    }
 }
 
 #[cfg(test)]
@@ -94,7 +216,7 @@ mod tests {
             items: vec![1, 2, 3, 4, 5],
             pos: 0,
         };
-        let chunk: Vec<u32> = read_chunk(&mut reader, 3).await.unwrap();
+        let chunk = read_chunk(&mut reader, 3).await.unwrap();
 
         assert_eq!(chunk, vec![1, 2, 3]);
     }
@@ -105,7 +227,7 @@ mod tests {
             items: vec![1, 2],
             pos: 0,
         };
-        let chunk: Vec<u32> = read_chunk(&mut reader, 5).await.unwrap();
+        let chunk = read_chunk(&mut reader, 5).await.unwrap();
 
         assert_eq!(chunk, vec![1, 2]);
     }
@@ -116,5 +238,120 @@ mod tests {
         let result = read_chunk(&mut reader, 5).await;
 
         assert!(result.is_err());
+    }
+
+    struct EvenDoubler;
+
+    impl ItemProcessor for EvenDoubler {
+        type In = u32;
+        type Out = u32;
+        async fn process(&mut self, item: u32) -> Result<Option<u32>, BatchError> {
+            if item % 2 == 0 {
+                Ok(Some(item * 2))
+            } else {
+                Ok(None) // odd → filtered out
+            }
+        }
+    }
+    struct CollectingWriter {
+        written: Vec<u32>,
+    }
+
+    impl ItemWriter for CollectingWriter {
+        type Item = u32;
+        async fn write(&mut self, items: &[u32]) -> Result<(), BatchError> {
+            self.written.extend_from_slice(items);
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn processes_filters_and_writes() {
+        let mut processor = EvenDoubler;
+        let mut writer = CollectingWriter {
+            written: Vec::new(),
+        };
+
+        process_chunk(&mut processor, &mut writer, vec![1, 2, 3, 4])
+            .await
+            .unwrap();
+
+        assert_eq!(writer.written, vec![4, 8]);
+    }
+
+    #[tokio::test]
+    async fn run_step_reads_processes_writes_end_to_end() {
+        let mut reader = VecReader {
+            items: vec![1, 2, 3, 4, 5, 6],
+            pos: 0,
+        };
+        let mut processor = EvenDoubler;
+        let mut writer = CollectingWriter {
+            written: Vec::new(),
+        };
+
+        // chunk_size = 2 -> the loop runs several times, proving it iterates.
+        let step = run_step(&mut reader, &mut processor, &mut writer, 2)
+            .await
+            .unwrap();
+
+        // odds filtered out; evens doubled: 2->4, 4->8, 6->12
+        assert_eq!(writer.written, vec![4, 8, 12]);
+        assert_eq!(step.read_count, 6); // read all six
+        assert_eq!(step.write_count, 3); // three evens written
+        assert_eq!(step.filter_count, 3); // three odds filtered
+    }
+
+    #[tokio::test]
+    async fn chunk_step_owns_and_runs_its_pipeline() {
+        let reader = VecReader {
+            items: vec![1, 2, 3, 4, 5, 6],
+            pos: 0,
+        };
+        let processor = EvenDoubler;
+        let writer = CollectingWriter {
+            written: Vec::new(),
+        };
+
+        let mut step = ChunkStep::new(reader, processor, writer, 2);
+        let exec = step.run().await.unwrap();
+
+        assert_eq!(exec.read_count, 6);
+        assert_eq!(exec.write_count, 3);
+        assert_eq!(exec.filter_count, 3);
+    }
+
+    struct LogStep;
+
+    #[async_trait(?Send)]
+    impl Step for LogStep {
+        async fn run(&mut self) -> Result<StepExecution, BatchError> {
+            // A real tasklet would do work here (delete temp files, send a report).
+            Ok(StepExecution::default())
+        }
+    }
+
+    #[tokio::test]
+    async fn job_runs_heterogeneous_steps_in_order() {
+        let chunk_step = ChunkStep::new(
+            VecReader {
+                items: vec![1, 2, 3, 4],
+                pos: 0,
+            },
+            EvenDoubler,
+            CollectingWriter {
+                written: Vec::new(),
+            },
+            2,
+        );
+        let log_step = LogStep;
+
+        let mut job = Job::new(vec![Box::new(chunk_step), Box::new(log_step)]);
+        let execs = job.run().await.unwrap();
+
+        assert_eq!(execs.len(), 2);
+        assert_eq!(execs[0].read_count, 4); // chunk step read 1,2,3,4
+        assert_eq!(execs[0].write_count, 2); // evens 2,4 → written 4,8
+        assert_eq!(execs[1], StepExecution::default()); // log step did no I/O
     }
 }
