@@ -4,6 +4,8 @@
 #![forbid(unsafe_code)]
 
 use async_trait::async_trait;
+use std::future::Future;
+use std::num::NonZeroUsize;
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -14,6 +16,9 @@ pub enum BatchError {
 
     #[error("Write failed: {0}")]
     Write(String),
+
+    #[error("Process failed: {0}")]
+    Process(String),
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -26,32 +31,42 @@ pub struct StepExecution {
     pub filter_count: usize,
 }
 
-#[allow(async_fn_in_trait)]
 pub trait ItemReader {
     type Item;
-    async fn read(&mut self) -> Result<Option<Self::Item>, BatchError>;
+
+    fn read(&mut self) -> impl Future<Output = Result<Option<Self::Item>, BatchError>> + Send;
 }
 
-#[allow(async_fn_in_trait)]
 pub trait ItemWriter {
     type Item;
-    async fn write(&mut self, items: &[Self::Item]) -> Result<(), BatchError>;
+
+    fn write(
+        &mut self,
+        items: &[Self::Item],
+    ) -> impl Future<Output = Result<(), BatchError>> + Send;
 }
 
-#[allow(async_fn_in_trait)]
 pub trait ItemProcessor {
     type In;
     type Out;
-    async fn process(&mut self, item: Self::In) -> Result<Option<Self::Out>, BatchError>;
+
+    fn process(
+        &mut self,
+        item: Self::In,
+    ) -> impl Future<Output = Result<Option<Self::Out>, BatchError>> + Send;
 }
 
-pub async fn read_chunk<R>(reader: &mut R, chunk_size: usize) -> Result<Vec<R::Item>, BatchError>
+pub async fn read_chunk<R>(
+    reader: &mut R,
+    chunk_size: NonZeroUsize,
+) -> Result<Vec<R::Item>, BatchError>
 where
     R: ItemReader,
 {
-    let mut chunk: Vec<R::Item> = Vec::with_capacity(chunk_size);
+    let non_zero_chunk_size: usize = chunk_size.get();
+    let mut chunk: Vec<R::Item> = Vec::with_capacity(non_zero_chunk_size);
 
-    for _ in 0..chunk_size {
+    for _ in 0..non_zero_chunk_size {
         if let Some(item) = reader.read().await? {
             chunk.push(item);
         } else {
@@ -88,7 +103,7 @@ pub async fn run_step<R, P, W>(
     reader: &mut R,
     processor: &mut P,
     writer: &mut W,
-    chunk_size: usize,
+    chunk_size: NonZeroUsize,
 ) -> Result<StepExecution, BatchError>
 where
     R: ItemReader,
@@ -112,8 +127,8 @@ where
     Ok(step)
 }
 
-#[async_trait(?Send)]
-pub trait Step {
+#[async_trait]
+pub trait Step: Send {
     async fn run(&mut self) -> Result<StepExecution, BatchError>;
 }
 
@@ -121,11 +136,11 @@ pub struct ChunkStep<R, P, W> {
     reader: R,
     processor: P,
     writer: W,
-    chunk_size: usize,
+    chunk_size: NonZeroUsize,
 }
 
 impl<R, P, W> ChunkStep<R, P, W> {
-    pub fn new(reader: R, processor: P, writer: W, chunk_size: usize) -> Self {
+    pub fn new(reader: R, processor: P, writer: W, chunk_size: NonZeroUsize) -> Self {
         Self {
             reader,
             processor,
@@ -135,12 +150,14 @@ impl<R, P, W> ChunkStep<R, P, W> {
     }
 }
 
-#[async_trait(?Send)]
+#[async_trait]
 impl<R, P, W> Step for ChunkStep<R, P, W>
 where
-    R: ItemReader,
-    P: ItemProcessor<In = R::Item>,
-    W: ItemWriter<Item = P::Out>,
+    R: ItemReader + Send,
+    P: ItemProcessor<In = R::Item> + Send,
+    W: ItemWriter<Item = P::Out> + Send,
+    R::Item: Send,
+    P::Out: Send,
 {
     async fn run(&mut self) -> Result<StepExecution, BatchError> {
         run_step(
@@ -149,7 +166,7 @@ where
             &mut self.writer,
             self.chunk_size,
         )
-        .await
+            .await
     }
 }
 
@@ -176,6 +193,12 @@ impl Job {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Test-only shorthand for a chunk size literal. A zero here is a bug in the
+    /// test itself, so panicking is the right response.
+    fn nz(n: usize) -> NonZeroUsize {
+        NonZeroUsize::new(n).expect("test chunk size must be non-zero")
+    }
 
     struct VecReader {
         items: Vec<u32>,
@@ -216,7 +239,7 @@ mod tests {
             items: vec![1, 2, 3, 4, 5],
             pos: 0,
         };
-        let chunk = read_chunk(&mut reader, 3).await.unwrap();
+        let chunk = read_chunk(&mut reader, nz(3)).await.unwrap();
 
         assert_eq!(chunk, vec![1, 2, 3]);
     }
@@ -227,7 +250,7 @@ mod tests {
             items: vec![1, 2],
             pos: 0,
         };
-        let chunk = read_chunk(&mut reader, 5).await.unwrap();
+        let chunk = read_chunk(&mut reader, nz(5)).await.unwrap();
 
         assert_eq!(chunk, vec![1, 2]);
     }
@@ -235,7 +258,7 @@ mod tests {
     #[tokio::test]
     async fn error_short_circuits() {
         let mut reader = FailingReader { remaining_ok: 2 };
-        let result = read_chunk(&mut reader, 5).await;
+        let result = read_chunk(&mut reader, nz(5)).await;
 
         assert!(result.is_err());
     }
@@ -291,7 +314,7 @@ mod tests {
         };
 
         // chunk_size = 2 -> the loop runs several times, proving it iterates.
-        let step = run_step(&mut reader, &mut processor, &mut writer, 2)
+        let step = run_step(&mut reader, &mut processor, &mut writer, nz(2))
             .await
             .unwrap();
 
@@ -313,7 +336,7 @@ mod tests {
             written: Vec::new(),
         };
 
-        let mut step = ChunkStep::new(reader, processor, writer, 2);
+        let mut step = ChunkStep::new(reader, processor, writer, nz(2));
         let exec = step.run().await.unwrap();
 
         assert_eq!(exec.read_count, 6);
@@ -323,7 +346,7 @@ mod tests {
 
     struct LogStep;
 
-    #[async_trait(?Send)]
+    #[async_trait]
     impl Step for LogStep {
         async fn run(&mut self) -> Result<StepExecution, BatchError> {
             // A real tasklet would do work here (delete temp files, send a report).
@@ -342,7 +365,7 @@ mod tests {
             CollectingWriter {
                 written: Vec::new(),
             },
-            2,
+            nz(2),
         );
         let log_step = LogStep;
 
@@ -353,5 +376,16 @@ mod tests {
         assert_eq!(execs[0].read_count, 4); // chunk step read 1,2,3,4
         assert_eq!(execs[0].write_count, 2); // evens 2,4 → written 4,8
         assert_eq!(execs[1], StepExecution::default()); // log step did no I/O
+    }
+
+    /// Auto-traits are part of the public API under SemVer, but nothing warns you
+    /// when you lose one. Assert it, so a future change to `Step` can't silently
+    /// make jobs un-`tokio::spawn`able again.
+    #[test]
+    fn job_run_future_is_send() {
+        fn assert_send<T: Send>(_: T) {}
+
+        let mut job = Job::new(vec![]);
+        assert_send(job.run());
     }
 }

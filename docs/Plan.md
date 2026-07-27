@@ -119,5 +119,10 @@
 
 ## Current position
 Phase 0 ☑ docs · Phase 1 ☑ workspace · Phase 2 ☑ traits · Phase 3 ☑ Job (basic) · Phase 4 ◐ StepExecution counters (StepContribution/tasklet trait pending) · Phase 5 ☑ engine (basic) · Phase 6 ◐ chunk processing (filtering + counts done; property tests/tuning-guide pending).
-All in `batchflow-core/src/lib.rs`, 7 tests green, clippy clean. ADR-002 applied for real: readers/processors/writers use native async (static dispatch); `Step` uses `#[async_trait(?Send)]` for `Box<dyn Step>`.
-**Next candidate milestones:** (a) fault tolerance — skip/retry via an error `Classifier` (Phase 10); (b) persistence — `JobRepository` trait + InMemory, giving Job/Step identity + `JobExecution` (Phase 7), the path to restart. Work is uncommitted — good checkpoint to commit.
+All in `batchflow-core/src/lib.rs`, 8 tests green, clippy `-D warnings` clean, `cargo fmt` applied.
+
+**API hardening pass done (2026-07-27):** `BatchError::Process` variant added (processors could not previously report failure); `chunk_size` is `NonZeroUsize` everywhere, so the silent `chunk_size == 0` no-op — a job reporting success having processed nothing — is now unrepresentable; **ADR-002a**: the framework is `Send` end-to-end (`Step: Send` supertrait + RPITIT `+ Send` on the three core traits), so `tokio::spawn(job.run())` compiles — it did not before. `job_run_future_is_send` locks that in.
+
+**Known debt, deliberately deferred:** (1) `filter_count` is computed as `read - written` (`run_step`) — correct today, but derived-by-subtraction breaks the moment skip exists, and underflow-panics if the invariant does; fix with `StepContribution` (Phase 4). (2) `Step` has no name/identity — blocks per-step persistence and "skip completed steps" on restart; resolve in Phase 7. (3) Library-craft gap: no `#![warn(missing_docs)]`, zero doctests, `Job`/`ChunkStep` lack `Debug` (API guideline C-DEBUG), and `read_chunk`/`process_chunk` are `pub` without a deliberate decision to support them under SemVer.
+
+**Next candidate milestones:** (a) persistence — `JobRepository` trait + InMemory, giving Job/Step identity + `JobExecution` (Phase 7), the path to restart; (b) fault tolerance — skip/retry via an error `Classifier` (Phase 10). Phase 7 subsumes debt item (2), so it is the recommended next move.

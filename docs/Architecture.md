@@ -84,10 +84,11 @@ from "restart at row 4000" — the goal property.
 ## 3. Core Traits (target shape)
 
 ```rust
-#[async_trait-or-native]  // see ADR-002
-trait ItemReader   { type Item; async fn read(&mut self) -> Result<Option<Self::Item>, BatchError>; }
-trait ItemProcessor { type In; type Out; async fn process(&mut self, item: Self::In) -> Result<Option<Self::Out>, BatchError>; }
-trait ItemWriter   { type Item; async fn write(&mut self, items: &[Self::Item]) -> Result<(), BatchError>; }
+// RPITIT with an explicit `+ Send` bound — see ADR-002a.
+// Implementors still write plain `async fn`.
+trait ItemReader    { type Item; fn read(&mut self) -> impl Future<Output = Result<Option<Self::Item>, BatchError>> + Send; }
+trait ItemProcessor { type In; type Out; fn process(&mut self, item: Self::In) -> impl Future<Output = Result<Option<Self::Out>, BatchError>> + Send; }
+trait ItemWriter    { type Item; fn write(&mut self, items: &[Self::Item]) -> impl Future<Output = Result<(), BatchError>> + Send; }
 ```
 
 - `&mut self` reader — stateful cursor ⇒ **not shareable across threads** (parallelism ⇒ partition, don't share). Compile-enforced.
@@ -165,6 +166,17 @@ Principle: **own orchestration, integrate everything else.** Selections and one-
 **Context:** Core traits are async. Native async-fn-in-traits is stable but has `dyn`/object-safety + auto-trait-bound caveats.
 **Decision:** Prefer native for generic/`impl Trait` paths. Introduce `async-trait` (or manual boxing) only where trait objects are required (e.g. heterogeneous step lists, plugin readers).
 **Consequences:** Zero-cost in the hot path; localized macro use where dynamism is genuinely needed. Revisit if RPITIT ergonomics change.
+
+#### ADR-002a — Amendment: the framework is `Send` `[DECIDED 2026-07-27]`
+**Context:** The original decision used `#[async_trait(?Send)]` for `Step`, which made `Job::run()`'s future non-`Send`. Consequence discovered by compiling an assertion: **`tokio::spawn(job.run())` did not compile** — jobs were locked to a current-thread runtime. `#[tokio::test]` defaults to current-thread, so no test caught it.
+
+**Decision:** `Send` is a framework-wide requirement.
+1. `Step: Send` supertrait + `#[async_trait]` (not `?Send`). `Box<dyn Step>` is then `Send` for free — no `+ Send` at use sites.
+2. The three core traits keep native async but declare the bound explicitly via **RPITIT**: `fn read(&mut self) -> impl Future<Output = ..> + Send`. The `async fn` sugar desugars to an *unnameable* associated future type, so `R: ItemReader + Send` cannot constrain it — writing the return type by hand is the only way to say `+ Send`. Implementors are unaffected and still write `async fn`.
+3. `#[allow(async_fn_in_trait)]` is removed from all three traits — that lint exists precisely to flag the unbounded-future hole this closes.
+4. The same rule applies to every future trait, notably `JobRepository` (Phase 7).
+
+**Consequences:** Jobs are spawnable and multi-threaded-runtime-safe. Cost: implementors' futures **must** be `Send` — an `Rc`/`RefCell`-based reader will not compile. Accepted deliberately; if a non-`Send` variant is ever needed, generate both with the `trait_variant` crate rather than forking the traits by hand. Auto-traits are SemVer-visible and silently lost, so `job_run_future_is_send` asserts this at compile time in the test suite.
 
 ### ADR-003 — Associated types over generic type params on core traits `[DECIDED 2026-07-24]`
 **Context:** `ItemReader<I>` (generic) vs `trait ItemReader { type Item; }` (associated).
