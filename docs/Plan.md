@@ -54,7 +54,11 @@
 - **Tasks:** finalize chunk semantics; StepContribution integration.
 - **Acceptance:** filter drops items; big-N vs small-N both correct. **Testing:** property tests on counts. **Docs:** tuning guide.
 
-## Phase 7 — JobRepository ☐  ← **first hard problem**
+## Phase 7 — JobRepository ◐  ← **first hard problem**
+> **7a ☑** domain types (`JobParameters`/`JobInstance`/`JobExecution`/`BatchStatus`/newtype ids), module split, `Step::name`.
+> **7b ☑** `JobRepository` trait + `InMemoryJobRepository`; identity dedup working; ADR-007 decides TX ownership (opt-in `TransactionalWriter`, **implemented in Phase 11** — an InMemory fake cannot validate a transaction abstraction).
+> **7c ☐** engine wiring: launcher creates instance + execution, persists status transitions, enforces FR-4.4 (no re-run of a completed instance). Needs `StepExecution` to gain identity (id/name/status) — which is where `StepContribution` finally earns its keep.
+
 - **Goals:** `JobRepository` trait + InMemory impl; **transaction ownership** design.
 - **Learning:** where the `tx` lives across writer + repository update in async Rust; JobInstance identity from params.
 - **Tasks:** trait design; `batchflow-memory`; instance/execution/step persistence; atomic update contract.
@@ -119,7 +123,7 @@
 
 ## Current position
 Phase 0 ☑ docs · Phase 1 ☑ workspace · Phase 2 ☑ traits · Phase 3 ☑ Job (basic) · Phase 4 ◐ StepExecution counters (StepContribution/tasklet trait pending) · Phase 5 ☑ engine (basic) · Phase 6 ◐ chunk processing (filtering + counts done; property tests/tuning-guide pending).
-All in `batchflow-core/src/lib.rs`, 8 tests green, clippy `-D warnings` clean, `cargo fmt` applied.
+`batchflow-core` is now split into modules (`chunk`/`error`/`execution`/`item`/`job`/`memory`/`repository`/`step` + `#[cfg(test)] testing`), with `lib.rs` as a pure re-export surface. **26 tests green**, clippy `-D warnings` clean, `cargo fmt` clean.
 
 **API hardening pass done (2026-07-27):** `BatchError::Process` variant added (processors could not previously report failure); `chunk_size` is `NonZeroUsize` everywhere, so the silent `chunk_size == 0` no-op — a job reporting success having processed nothing — is now unrepresentable; **ADR-002a**: the framework is `Send` end-to-end (`Step: Send` supertrait + RPITIT `+ Send` on the three core traits), so `tokio::spawn(job.run())` compiles — it did not before. `job_run_future_is_send` locks that in.
 

@@ -11,4 +11,7 @@ pub enum BatchError {
 
     #[error("Process failed: {0}")]
     Process(String),
+
+    #[error("Repository failed: {0}")]
+    Repository(String),
 }

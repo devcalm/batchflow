@@ -99,9 +99,10 @@ trait ItemWriter    { type Item; fn write(&mut self, items: &[Self::Item]) -> im
 `JobRepository`, `ExecutionContextStore`, `CheckpointStore`, `LockProvider`, `MetricsExporter` — all traits.
 Impl order: **InMemory → Postgres → Redis**. `[FUTURE]` SQLite, DynamoDB, Mongo.
 
-Open design question `[OPEN]`: **where does the transaction live** in an async Rust `JobRepository`?
-Who owns the `tx` handle across `write` + `repository.update`? This drives the whole repository signature and
-is the first hard problem (Phase 7).
+**Where does the transaction live** in an async Rust `JobRepository`? `[DECIDED 2026-07-27 — see ADR-007]`
+Answer: the repository owns it (`type Tx` + `begin`/`commit`/`rollback`), and writers *opt in* to enlisting via
+`TransactionalWriter<Tx>`; plain `ItemWriter` impls are adapted with an `Unmanaged<W>` wrapper. Implemented in
+Phase 11 against real Postgres, not against the InMemory fake.
 
 ---
 
@@ -196,6 +197,25 @@ Principle: **own orchestration, integrate everything else.** Selections and one-
 
 ### ADR-006 — Scheduling is integration, not an engine `[DECIDED]`
 BatchFlow exposes a launch API; external schedulers trigger it. No home-grown cron engine.
+
+### ADR-007 — Transaction ownership: opt-in transactional writer `[DECIDED 2026-07-27]`
+**Context:** §2's chunk loop promises data + metadata + bookmark commit atomically (FR-2.4), which is what makes restart non-duplicating (FR-5.3). But `ItemWriter::write(&mut self, items)` has no access to a transaction, so as written the promise is unachievable — the writer commits independently of the repository.
+
+**Options considered:**
+- **(A) `tx` in every writer** — `write(&mut self, items, tx: &mut Tx)`. Atomic by construction, but `Tx` becomes a viral generic across `ItemWriter`/`ChunkStep`/`Step`/`Job`, and non-transactional writers (CSV, S3, stdout) must accept a transaction they cannot use.
+- **(B) Repository owns its own tx** — simplest trait, but data and metadata commit separately ⇒ at-least-once only; FR-2.4/FR-5.3 downgrade from guarantees to best-effort.
+- **(C) Opt-in transactional writer** — chosen.
+
+**Decision:** `JobRepository` gains an associated `type Tx` plus `begin`/`commit`/`rollback`. Writers that *can* enlist in the step's transaction implement `TransactionalWriter<Tx>`; plain `ItemWriter` impls are unaffected and are adapted explicitly via an `Unmanaged<W>` wrapper. Exactly-once where the backend supports it, honest degradation where it doesn't.
+
+**Consequences:**
+- Two writer traits instead of one. The obvious blanket `impl<W: ItemWriter, Tx> TransactionalWriter<Tx> for W` is **not possible** — it would overlap with any direct impl, and Rust cannot prove a type doesn't implement `ItemWriter` (no negative reasoning without specialization). Hence the explicit `Unmanaged<W>` newtype: different `Self` type ⇒ no coherence conflict.
+- `JobRepository` is used as a *generic* parameter (`R: JobRepository`), not `Box<dyn>`. There is exactly one repository per job — heterogeneity is what justifies `dyn` (as for `Step`), and it is absent here. This also sidesteps having to name `Tx` in a trait-object type.
+- Per ADR-002a, `JobRepository: Send + Sync` and its futures are `+ Send`.
+
+**Implementation is deferred to Phase 11**, when a real sqlx backend exists. Rationale: an InMemory repository has no transactions and will satisfy *any* `begin`/`commit` shape, including a wrong one — validating a transaction abstraction against a fake is how it ends up wrong. Phase 7b therefore ships metadata CRUD + identity dedup only, with no `Tx` in the trait yet. Adding it is a breaking change, which is free pre-0.1.0.
+
+**Amends ADR-005:** the InMemory repository lives in `batchflow-core` rather than a separate `batchflow-memory` crate — it needs zero extra dependencies and core's own tests depend on it, which a separate crate would turn into a dev-dependency cycle. Revisit if it grows non-trivial.
 
 ---
 

@@ -10,6 +10,8 @@ mod item;
 mod job;
 mod step;
 
+mod memory;
+mod repository;
 #[cfg(test)]
 mod testing;
 
@@ -21,4 +23,6 @@ pub use execution::{
 };
 pub use item::{ItemProcessor, ItemReader, ItemWriter};
 pub use job::Job;
+pub use memory::InMemoryJobRepository;
+pub use repository::JobRepository;
 pub use step::{ChunkStep, Step, StepExecution};
