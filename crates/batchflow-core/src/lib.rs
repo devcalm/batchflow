@@ -8,6 +8,7 @@ mod error;
 mod execution;
 mod item;
 mod job;
+mod launcher;
 mod step;
 
 mod memory;
@@ -19,10 +20,11 @@ pub use chunk::{process_chunk, read_chunk, run_step};
 pub use error::BatchError;
 pub use execution::{
     BatchStatus, JobExecution, JobExecutionId, JobInstance, JobInstanceId, JobParameter,
-    JobParameters, StepExecutionId,
+    JobParameters, StepExecution, StepExecutionId,
 };
 pub use item::{ItemProcessor, ItemReader, ItemWriter};
 pub use job::Job;
+pub use launcher::JobLauncher;
 pub use memory::InMemoryJobRepository;
 pub use repository::JobRepository;
-pub use step::{ChunkStep, Step, StepExecution};
+pub use step::{ChunkStep, Step, StepContribution};

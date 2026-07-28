@@ -1,4 +1,4 @@
-use crate::StepExecution;
+use crate::StepContribution;
 use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -116,7 +116,6 @@ pub struct JobExecution {
     id: JobExecutionId,
     instance_id: JobInstanceId,
     status: BatchStatus,
-    step_executions: Vec<StepExecution>,
 }
 
 impl JobExecution {
@@ -125,7 +124,6 @@ impl JobExecution {
             id,
             instance_id,
             status: BatchStatus::Starting,
-            step_executions: Vec::new(),
         }
     }
 
@@ -144,13 +142,88 @@ impl JobExecution {
     pub fn set_status(&mut self, status: BatchStatus) {
         self.status = status;
     }
+}
 
-    pub fn step_executions(&self) -> &[StepExecution] {
-        &self.step_executions
+/// The persisted record of one step inside a [`JobExecution`].
+///
+/// Deliberately *not* nested inside `JobExecution`: the two are separate rows
+/// joined by `job_execution_id`, the shape Phase 11's Postgres schema needs.
+/// Holding the same fact in two places is how the two copies come to disagree.
+/// Query them with `JobRepository::step_executions`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StepExecution {
+    id: StepExecutionId,
+    job_execution_id: JobExecutionId,
+    step_name: String,
+    status: BatchStatus,
+    read_count: usize,
+    write_count: usize,
+    filter_count: usize,
+}
+
+impl StepExecution {
+    /// The `id` is assigned by the `JobRepository`, never by the caller — which
+    /// is precisely why a `Step` cannot produce one of these itself.
+    pub fn new(
+        id: StepExecutionId,
+        job_execution_id: JobExecutionId,
+        step_name: impl Into<String>,
+    ) -> Self {
+        Self {
+            id,
+            job_execution_id,
+            step_name: step_name.into(),
+            status: BatchStatus::Starting,
+            read_count: 0,
+            write_count: 0,
+            filter_count: 0,
+        }
     }
 
-    pub fn push_step_execution(&mut self, execution: StepExecution) {
-        self.step_executions.push(execution);
+    pub fn id(&self) -> StepExecutionId {
+        self.id
+    }
+
+    pub fn job_execution_id(&self) -> JobExecutionId {
+        self.job_execution_id
+    }
+
+    pub fn step_name(&self) -> &str {
+        &self.step_name
+    }
+
+    pub fn status(&self) -> BatchStatus {
+        self.status
+    }
+
+    pub fn set_status(&mut self, status: BatchStatus) {
+        self.status = status;
+    }
+
+    /// Items pulled from the reader.
+    pub fn read_count(&self) -> usize {
+        self.read_count
+    }
+
+    /// Items written (i.e. survived the processor's filter).
+    pub fn write_count(&self) -> usize {
+        self.write_count
+    }
+
+    /// Items dropped by the processor (it returned `None`).
+    pub fn filter_count(&self) -> usize {
+        self.filter_count
+    }
+
+    /// Fold a step's reported deltas into this record.
+    ///
+    /// The engine calls this once the step's work is safe; Phase 11 moves the
+    /// call inside the chunk loop, where a rollback drops the contribution
+    /// unapplied and these counters stay consistent with what committed.
+    pub fn apply(&mut self, contribution: &StepContribution) {
+        self.read_count += contribution.read_count();
+        self.write_count += contribution.write_count();
+        self.filter_count += contribution.filter_count();
     }
 }
 

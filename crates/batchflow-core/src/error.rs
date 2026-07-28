@@ -1,3 +1,4 @@
+use crate::JobInstanceId;
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -14,4 +15,10 @@ pub enum BatchError {
 
     #[error("Repository failed: {0}")]
     Repository(String),
+
+    #[error("job instance '{job_name}' ({instance_id:?}) is already complete")]
+    JobInstanceAlreadyComplete {
+        job_name: String,
+        instance_id: JobInstanceId,
+    },
 }

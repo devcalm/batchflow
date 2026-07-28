@@ -1,5 +1,8 @@
 use crate::repository::JobRepository;
-use crate::{BatchError, JobExecution, JobExecutionId, JobInstance, JobInstanceId, JobParameters};
+use crate::{
+    BatchError, JobExecution, JobExecutionId, JobInstance, JobInstanceId, JobParameters,
+    StepExecution, StepExecutionId,
+};
 use std::collections::HashMap;
 use std::sync::Mutex;
 
@@ -13,6 +16,9 @@ struct Inner {
     next_id: i64,
     instances: HashMap<(String, JobParameters), JobInstance>,
     executions: Vec<JobExecution>,
+    /// Kept flat and joined by `job_execution_id` rather than nested inside
+    /// `JobExecution` — the same shape the SQL backend will have.
+    step_executions: Vec<StepExecution>,
 }
 
 impl JobRepository for InMemoryJobRepository {
@@ -119,12 +125,80 @@ impl JobRepository for InMemoryJobRepository {
             .find(|e| e.instance_id() == instance_id)
             .cloned())
     }
+
+    async fn create_step_execution(
+        &self,
+        job_execution_id: JobExecutionId,
+        step_name: &str,
+    ) -> Result<StepExecution, BatchError> {
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|e| BatchError::Repository(e.to_string()))?;
+
+        if !inner.executions.iter().any(|e| e.id() == job_execution_id) {
+            return Err(BatchError::Repository(format!(
+                "unknown job execution {job_execution_id:?}"
+            )));
+        }
+
+        inner.next_id += 1;
+        let step_execution = StepExecution::new(
+            StepExecutionId::new(inner.next_id),
+            job_execution_id,
+            step_name,
+        );
+        inner.step_executions.push(step_execution.clone());
+        Ok(step_execution)
+    }
+
+    async fn update_step_execution(
+        &self,
+        step_execution: &StepExecution,
+    ) -> Result<(), BatchError> {
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|e| BatchError::Repository(e.to_string()))?;
+
+        match inner
+            .step_executions
+            .iter_mut()
+            .find(|s| s.id() == step_execution.id())
+        {
+            Some(slot) => {
+                *slot = step_execution.clone();
+                Ok(())
+            }
+            None => Err(BatchError::Repository(format!(
+                "unknown step execution {:?}",
+                step_execution.id()
+            ))),
+        }
+    }
+
+    async fn step_executions(
+        &self,
+        job_execution_id: JobExecutionId,
+    ) -> Result<Vec<StepExecution>, BatchError> {
+        let inner = self
+            .inner
+            .lock()
+            .map_err(|e| BatchError::Repository(e.to_string()))?;
+
+        Ok(inner
+            .step_executions
+            .iter()
+            .filter(|s| s.job_execution_id() == job_execution_id)
+            .cloned()
+            .collect())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{BatchStatus, JobParameter, JobParameters};
+    use crate::{BatchStatus, JobParameter, JobParameters, StepContribution};
 
     fn params(pairs: &[(&str, &str)]) -> JobParameters {
         pairs.iter().fold(JobParameters::new(), |acc, (k, v)| {
@@ -132,7 +206,17 @@ mod tests {
         })
     }
 
-    // ---- instance identity (FR-4.2) ----
+    /// Step executions are joined to a job execution by foreign key, so the
+    /// parent row has to exist before any of them can be created.
+    async fn open_execution(repo: &InMemoryJobRepository) -> JobExecution {
+        let instance = repo
+            .find_or_create_instance("nightly", &params(&[("date", "d")]))
+            .await
+            .unwrap();
+
+        repo.create_execution(instance.id()).await.unwrap()
+    }
+
 
     #[tokio::test]
     async fn identical_parameters_resolve_to_the_same_instance() {
@@ -311,6 +395,102 @@ mod tests {
             .unwrap();
 
         assert!(repo.last_execution(instance.id()).await.unwrap().is_none());
+    }
+
+    // ---- step executions ----
+
+    #[tokio::test]
+    async fn update_step_execution_persists_counters_and_status() {
+        let repo = InMemoryJobRepository::default();
+        let job_execution = open_execution(&repo).await;
+
+        let mut step = repo
+            .create_step_execution(job_execution.id(), "load")
+            .await
+            .unwrap();
+        assert_eq!(step.status(), BatchStatus::Starting);
+
+        let mut contribution = StepContribution::new();
+        contribution.increment_read(10);
+        contribution.increment_write(7);
+        contribution.increment_filter(3);
+
+        step.apply(&contribution);
+        step.set_status(BatchStatus::Completed);
+        repo.update_step_execution(&step).await.unwrap();
+
+        let reloaded = repo.step_executions(job_execution.id()).await.unwrap();
+
+        // Length pins replace-in-place; an appending impl leaves two rows.
+        assert_eq!(reloaded.len(), 1);
+        assert_eq!(reloaded[0].read_count(), 10);
+        assert_eq!(reloaded[0].write_count(), 7);
+        assert_eq!(reloaded[0].filter_count(), 3);
+        assert_eq!(reloaded[0].status(), BatchStatus::Completed);
+    }
+
+    /// Two attempts at one instance must not see each other's steps — Phase 9
+    /// decides what to skip from exactly this query.
+    #[tokio::test]
+    async fn step_executions_are_scoped_to_their_job_execution() {
+        let repo = InMemoryJobRepository::default();
+        let first = open_execution(&repo).await;
+        let second = repo.create_execution(first.instance_id()).await.unwrap();
+
+        repo.create_step_execution(first.id(), "load")
+            .await
+            .unwrap();
+        repo.create_step_execution(second.id(), "load")
+            .await
+            .unwrap();
+
+        let steps = repo.step_executions(first.id()).await.unwrap();
+
+        assert_eq!(steps.len(), 1);
+        assert_eq!(steps[0].job_execution_id(), first.id());
+    }
+
+    /// Order is part of the contract, not an accident of storage.
+    #[tokio::test]
+    async fn step_executions_come_back_in_the_order_they_ran() {
+        let repo = InMemoryJobRepository::default();
+        let execution = open_execution(&repo).await;
+
+        for name in ["extract", "transform", "load"] {
+            repo.create_step_execution(execution.id(), name)
+                .await
+                .unwrap();
+        }
+
+        let names: Vec<String> = repo
+            .step_executions(execution.id())
+            .await
+            .unwrap()
+            .iter()
+            .map(|s| s.step_name().to_string())
+            .collect();
+
+        assert_eq!(names, ["extract", "transform", "load"]);
+    }
+
+    #[tokio::test]
+    async fn create_step_execution_rejects_an_unknown_job_execution() {
+        let repo = InMemoryJobRepository::default();
+
+        let result = repo
+            .create_step_execution(JobExecutionId::new(999), "load")
+            .await;
+
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn update_step_execution_rejects_an_unknown_step_execution() {
+        let repo = InMemoryJobRepository::default();
+        let orphan =
+            StepExecution::new(StepExecutionId::new(999), JobExecutionId::new(999), "ghost");
+
+        assert!(repo.update_step_execution(&orphan).await.is_err());
     }
 
     #[test]

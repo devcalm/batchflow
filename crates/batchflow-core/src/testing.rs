@@ -4,7 +4,7 @@
 //! release build. Lives in its own module because several modules' tests need the
 //! same fakes, and duplicating them is how test suites drift apart.
 
-use crate::{BatchError, ItemProcessor, ItemReader, ItemWriter, Step, StepExecution};
+use crate::{BatchError, ItemProcessor, ItemReader, ItemWriter, Step, StepContribution};
 use async_trait::async_trait;
 use std::num::NonZeroUsize;
 
@@ -93,6 +93,18 @@ impl ItemWriter for CollectingWriter {
     }
 }
 
+/// Fails every write — pins the rule that counters are recorded only once the
+/// write has succeeded.
+pub(crate) struct FailingWriter;
+
+impl ItemWriter for FailingWriter {
+    type Item = u32;
+
+    async fn write(&mut self, _items: &[u32]) -> Result<(), BatchError> {
+        Err(BatchError::Write("boom".into()))
+    }
+}
+
 /// A tasklet-style step that does no item I/O — stands in for "delete temp files,
 /// send a report". Proves a `Job` can hold heterogeneous step types.
 pub(crate) struct LogStep;
@@ -103,7 +115,23 @@ impl Step for LogStep {
         "log"
     }
 
-    async fn run(&mut self) -> Result<StepExecution, BatchError> {
-        Ok(StepExecution::default())
+    // A tasklet reads and writes nothing, so it has no counters to report.
+    async fn run(&mut self, _contribution: &mut StepContribution) -> Result<(), BatchError> {
+        Ok(())
+    }
+}
+
+/// A step that always fails — lets tests drive the launcher's failure path and
+/// assert that the step's *own* error reaches the caller unwrapped.
+pub(crate) struct FailingStep;
+
+#[async_trait]
+impl Step for FailingStep {
+    fn name(&self) -> &str {
+        "failing"
+    }
+
+    async fn run(&mut self, _contribution: &mut StepContribution) -> Result<(), BatchError> {
+        Err(BatchError::Process("boom".into()))
     }
 }

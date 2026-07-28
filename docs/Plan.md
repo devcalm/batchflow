@@ -2,7 +2,7 @@
 
 > Status: **Living roadmap.** Phased. Each phase: goals · learning objectives · tasks · rationale · acceptance · testing · docs.
 > Mentoring cadence per phase: **concept → Rust lens → minimal sketch → you implement → I review → improve.**
-> Last updated: 2026-07-24
+> Last updated: 2026-07-28
 
 **Legend:** ☐ not started · ◐ in progress · ☑ done
 
@@ -15,7 +15,7 @@
 - **Acceptance:** Docs exist and capture the model + crate choices + ADRs.
 - **Testing:** n/a. **Docs:** the three files.
 
-## Phase 1 — Workspace ☐
+## Phase 1 — Workspace ☑
 - **Goals:** Convert single crate → Cargo workspace per Architecture §4.
 - **Learning:** Workspace layout, feature flags, dependency hygiene, why core stays thin.
 - **Tasks:** Create `batchflow-core` + placeholder crates; wire workspace `Cargo.toml`; CI-style lint gate.
@@ -36,11 +36,11 @@
 - **Tasks:** `Job`/`Step` types; `JobBuilder`/`StepBuilder`; heterogeneous step list (trait objects, ADR-002).
 - **Acceptance:** define a 2-step job in code. **Testing:** builder unit tests. **Docs:** example.
 
-## Phase 4 — Step Model ☐
+## Phase 4 — Step Model ◐ (`StepContribution` + `StepExecution` done in 7c-2; dedicated tasklet trait pending)
 - **Goals:** Chunk-step vs tasklet-step; `StepContribution`; `StepExecution` counters.
 - **Learning:** pending-delta pattern; step status lifecycle.
-- **Tasks:** `StepExecution`, `StepContribution`, status enums; tasklet trait.
-- **Acceptance:** counters fold in correctly; rollback discards deltas. **Testing:** unit. **Docs:** rustdoc.
+- **Tasks:** ☑ `StepExecution` (id/job_execution_id/step_name/status/counters) · ☑ `StepContribution` (private fields, `increment_*` only, `apply` folds) · ☑ status lifecycle (`Starting`→`Started`→`Completed`/`Failed`) · ☐ tasklet trait (today a tasklet is a hand-written `Step` impl that ignores its contribution).
+- **Acceptance:** ☑ counters fold in correctly. Rollback-discards-deltas is structural today (an errored chunk yields no contribution to fold) and becomes a real transaction in Phase 11. **Testing:** unit. **Docs:** rustdoc.
 
 ## Phase 5 — Execution Engine ☑ (basic: `run_step` chunk loop + `Step`/`ChunkStep`; no TX/persistence yet)
 - **Goals:** Drive a Job through its Steps; the chunk loop (no persistence/TX yet).
@@ -48,21 +48,28 @@
 - **Tasks:** step executor running `read_chunk` → process → write with in-memory counters.
 - **Acceptance:** end-to-end in-memory job runs to completion. **Testing:** integration w/ fakes. **Docs:** flow diagram.
 
-## Phase 6 — Chunk Processing (full) ☐
+## Phase 6 — Chunk Processing (full) ◐ (semantics + `StepContribution` integration done; property tests + tuning guide pending)
 - **Goals:** commit interval, filtering, empty-chunk termination, chunk-oriented writer semantics.
 - **Learning:** memory vs throughput tradeoff of N; batched writes.
-- **Tasks:** finalize chunk semantics; StepContribution integration.
-- **Acceptance:** filter drops items; big-N vs small-N both correct. **Testing:** property tests on counts. **Docs:** tuning guide.
+- **Tasks:** ☑ chunk semantics (`NonZeroUsize` interval, empty chunk terminates, `write(&[O])`) · ☑ `StepContribution` integration — `process_chunk` returns a chunk-local contribution, `run_step` folds it per chunk · ☐ property tests · ☐ tuning guide.
+- **Acceptance:** ☑ filter drops items and is counted at the `None` arm, not derived by subtraction. **Testing:** property tests on counts. **Docs:** tuning guide.
 
-## Phase 7 — JobRepository ◐  ← **first hard problem**
+## Phase 7 — JobRepository ☑  ← **first hard problem**
 > **7a ☑** domain types (`JobParameters`/`JobInstance`/`JobExecution`/`BatchStatus`/newtype ids), module split, `Step::name`.
 > **7b ☑** `JobRepository` trait + `InMemoryJobRepository`; identity dedup working; ADR-007 decides TX ownership (opt-in `TransactionalWriter`, **implemented in Phase 11** — an InMemory fake cannot validate a transaction abstraction).
-> **7c ☐** engine wiring: launcher creates instance + execution, persists status transitions, enforces FR-4.4 (no re-run of a completed instance). Needs `StepExecution` to gain identity (id/name/status) — which is where `StepContribution` finally earns its keep.
+> **7c-1 ☑** `JobLauncher<R: JobRepository>`: resolves the instance, enforces FR-4.4, opens the execution, persists every status transition. `Job` gained a name. `BatchError::JobInstanceAlreadyComplete` is a *struct* variant — domain errors exist for callers who branch (a scheduler must tell "already ran today, skip" from "DB down, page someone").
+> **7c-2 ☑** `StepContribution` + `StepExecution` identity, and the engine wiring that needs them. `Job::run<R>(&mut self, JobExecutionId, &R)` drives the per-step lifecycle.
 
 - **Goals:** `JobRepository` trait + InMemory impl; **transaction ownership** design.
 - **Learning:** where the `tx` lives across writer + repository update in async Rust; JobInstance identity from params.
-- **Tasks:** trait design; `batchflow-memory`; instance/execution/step persistence; atomic update contract.
-- **Acceptance:** metadata persisted; identity dedup works. **Testing:** unit + property. **Docs:** ADR on TX ownership.
+- **Tasks:** ☑ trait design · ☑ InMemory impl (ADR-007 amended: it lives in `batchflow-core`, not a separate `batchflow-memory` crate — zero deps, and core's own tests need it) · ☑ instance/execution/step persistence · ☑ atomic update contract (update replaces in place, errors on unknown id).
+- **Acceptance:** ☑ metadata persisted; ☑ identity dedup works; ☑ FR-4.4 enforced. **Testing:** unit (property tests deferred to Phase 6). **Docs:** ADR-007.
+
+**Design decisions worth carrying forward:**
+- **A step cannot produce a `StepExecution`.** Its id is minted by the repository and a step has no repository, so `Step::run` takes `&mut StepContribution` and returns `Result<(), BatchError>`. That is a type-level consequence, not a style preference.
+- **`JobExecution` does not nest its step executions.** They are a flat collection joined by `job_execution_id` and read via `JobRepository::step_executions`, ordered by insertion. Persisting the same fact twice lets the copies drift; the real schema is two tables + FK, so the InMemory repo is built the shape Phase 11's SQL one must have.
+- **The rule "a `Job` never sees the repository" expired in 7c-2.** Spring's `AbstractJob` holds one too — something must mint step ids. What survives: the launcher decides *whether* a job may run, the `Job` drives steps, and a **`Step`** never touches the repository.
+- **`?` is the bug in any lifecycle method.** `job.run().await?` skips the status write and strands the execution at `Started`; Rust has no `finally` and no async `Drop`. Both the launcher and `Job::run` bind the `Result`, persist the outcome, then propagate last.
 
 ## Phase 8 — Execution Context ☐
 - **Goals:** serializable bookmark bag per Job/Step execution.
@@ -73,7 +80,7 @@
 ## Phase 9 — Restart Support ☐
 - **Goals:** resume a failed JobExecution; skip completed steps; reader seeks from bookmark.
 - **Learning:** why atomicity (Phase 7) makes restart safe; no duplicate items.
-- **Tasks:** restart path in engine; status checks; reader open-from-context.
+- **Tasks:** restart path in engine (skip steps whose previous `StepExecution` is `Completed`, read via `JobRepository::step_executions`); status checks; reader open-from-context; **`abandon_execution` on `JobRepository` + the `Starting`/`Started` gate that depends on it** (see debt (1) below — the guard and its escape hatch ship together or a crash becomes unrecoverable).
 - **Acceptance:** kill at row 4000 → restart resumes, no dupes. **Testing:** failure-injection + restart tests. **Docs:** restart guide.
 
 ## Phase 10 — Retry ☐
@@ -96,9 +103,9 @@
 - **Goals:** `tracing` spans per job/step/chunk; correlation IDs; OTel export.
 - **Tasks:** `batchflow-tracing`; span instrumentation. **Acceptance:** nested spans visible. **Testing:** span capture. **Docs:** OTel setup.
 
-## Phase 14 — Scheduling ☐
-- **Goals:** launch API + adapters (tokio-cron-scheduler / cron / k8s). No home-grown engine.
-- **Tasks:** `batchflow-scheduler` adapters; `JobLauncher`. **Acceptance:** external trigger runs a job. **Testing:** launcher unit. **Docs:** integration guide.
+## Phase 14 — Scheduling ☐ (`JobLauncher` already exists — this phase is the adapters only)
+- **Goals:** launch API + adapters (tokio-cron-scheduler / cron / k8s). No home-grown engine (ADR-006).
+- **Tasks:** `batchflow-scheduler` adapters. `JobLauncher` ☑ landed in 7c-1; a scheduler consumes it and branches on `BatchError::JobInstanceAlreadyComplete` to skip a run it has already done. **Acceptance:** external trigger runs a job. **Testing:** launcher unit. **Docs:** integration guide.
 
 ## Phase 15 — Storage Backends ☐
 - **Goals:** Redis backend; harden Postgres; backend conformance suite.
@@ -121,12 +128,21 @@
 ## Cross-cutting quality gate (every phase)
 `cargo fmt` · `cargo clippy -- -D warnings` · `cargo test` (+ doctests) · examples compile · no dead code · no needless clone/alloc.
 
-## Current position
-Phase 0 ☑ docs · Phase 1 ☑ workspace · Phase 2 ☑ traits · Phase 3 ☑ Job (basic) · Phase 4 ◐ StepExecution counters (StepContribution/tasklet trait pending) · Phase 5 ☑ engine (basic) · Phase 6 ◐ chunk processing (filtering + counts done; property tests/tuning-guide pending).
-`batchflow-core` is now split into modules (`chunk`/`error`/`execution`/`item`/`job`/`memory`/`repository`/`step` + `#[cfg(test)] testing`), with `lib.rs` as a pure re-export surface. **26 tests green**, clippy `-D warnings` clean, `cargo fmt` clean.
+## Current position (2026-07-28)
+Phase 0 ◐ docs (tech-eval open items) · 1 ☑ workspace · 2 ☑ traits · 3 ☑ Job · 4 ◐ step model (tasklet trait pending) · 5 ☑ engine · 6 ◐ chunk processing (property tests/tuning guide pending) · **7 ☑ JobRepository — complete**.
+`batchflow-core` modules: `chunk`/`error`/`execution`/`item`/`job`/`launcher`/`memory`/`repository`/`step` + `#[cfg(test)] testing`, with `lib.rs` as a pure re-export surface (private `mod` + flat `pub use`, so module layout stays refactorable). **42 tests green**, clippy `-D warnings` clean, `cargo fmt` clean.
 
-**API hardening pass done (2026-07-27):** `BatchError::Process` variant added (processors could not previously report failure); `chunk_size` is `NonZeroUsize` everywhere, so the silent `chunk_size == 0` no-op — a job reporting success having processed nothing — is now unrepresentable; **ADR-002a**: the framework is `Send` end-to-end (`Step: Send` supertrait + RPITIT `+ Send` on the three core traits), so `tokio::spawn(job.run())` compiles — it did not before. `job_run_future_is_send` locks that in.
+A job now runs end to end through metadata: `JobLauncher::run` resolves a `JobInstance` from `(job_name, JobParameters)`, refuses a completed one (FR-4.4), opens a `JobExecution`, and `Job::run` persists a counted `StepExecution` per step — all reloadable from the repository alone.
 
-**Known debt, deliberately deferred:** (1) `filter_count` is computed as `read - written` (`run_step`) — correct today, but derived-by-subtraction breaks the moment skip exists, and underflow-panics if the invariant does; fix with `StepContribution` (Phase 4). (2) `Step` has no name/identity — blocks per-step persistence and "skip completed steps" on restart; resolve in Phase 7. (3) Library-craft gap: no `#![warn(missing_docs)]`, zero doctests, `Job`/`ChunkStep` lack `Debug` (API guideline C-DEBUG), and `read_chunk`/`process_chunk` are `pub` without a deliberate decision to support them under SemVer.
+**API hardening (2026-07-27):** `BatchError::Process` added (processors could not previously report failure); `chunk_size` is `NonZeroUsize` everywhere, so the silent `chunk_size == 0` no-op — a job reporting success having processed nothing — is unrepresentable; **ADR-002a**: the framework is `Send` end-to-end (`Step: Send` supertrait + RPITIT `+ Send` on the three core traits), so `tokio::spawn(job.run())` compiles. `job_run_future_is_send` and `launcher_run_future_is_send` lock that in.
 
-**Next candidate milestones:** (a) persistence — `JobRepository` trait + InMemory, giving Job/Step identity + `JobExecution` (Phase 7), the path to restart; (b) fault tolerance — skip/retry via an error `Classifier` (Phase 10). Phase 7 subsumes debt item (2), so it is the recommended next move.
+**Debt closed in Phase 7:** ~~`filter_count` derived as `read - written`~~ — now counted at the processor's `None` arm, so the underflow panic is gone. ~~`Step` has no name/identity~~ — `Step::name()` plus a persisted `StepExecution` per step.
+
+**Known debt, deliberately deferred:**
+1. `Starting`/`Started` still passes the FR-4.4 gate. Rejecting it needs `JobRepository::abandon_execution` **in the same change** — a guard with no escape hatch turns a recoverable crash into a permanently unlaunchable instance. Both in Phase 9.
+2. `JobLauncher::run` resolves the instance and reads its last execution under **separate lock acquisitions**, so two processes can both pass the gate. Closed by a real transaction in Phase 11.
+3. A failing `update_execution` masks the job's original error (`launcher.rs`). Real systems log the cause before propagating — Phase 13.
+4. Library-craft gap: no `#![warn(missing_docs)]`, zero doctests, `Job`/`ChunkStep` lack `Debug` (API guideline C-DEBUG).
+5. `read_chunk`/`process_chunk`/`run_step` are `pub` without a deliberate SemVer decision — and `run_step`'s signature changed in 7c-2, which is exactly the kind of break that decision governs. Settle it before 0.1.0.
+
+**Next milestone: Phase 8 — `ExecutionContext`.** Phase 7 gives restart its identity and its per-step status; Phase 8 gives it the bookmark, and Phase 9 joins them. Phase 10 (retry/skip via a `Classifier`) is the alternative branch, but restart is the deeper capability and everything for it is now in place.
