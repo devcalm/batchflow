@@ -4,7 +4,10 @@
 //! release build. Lives in its own module because several modules' tests need the
 //! same fakes, and duplicating them is how test suites drift apart.
 
-use crate::{BatchError, ItemProcessor, ItemReader, ItemWriter, Step, StepContribution};
+use crate::{
+    BatchError, ContextValue, ExecutionContext, ItemProcessor, ItemReader, ItemWriter, Step,
+    StepContribution,
+};
 use async_trait::async_trait;
 use std::num::NonZeroUsize;
 
@@ -35,6 +38,55 @@ impl ItemReader for VecReader {
             self.pos += 1;
         }
         Ok(item)
+    }
+}
+
+/// Key `BookmarkReader` stores its position under.
+pub(crate) const POSITION: &str = "position";
+
+/// Like [`VecReader`], but restartable: it records its position and seeks back
+/// to it on `open`.
+///
+/// `VecReader` stays plain on purpose, so the *default* (non-restartable)
+/// `open`/`update` bodies keep getting exercised too.
+pub(crate) struct BookmarkReader {
+    pub items: Vec<u32>,
+    pub pos: usize,
+}
+
+impl BookmarkReader {
+    pub(crate) fn new(items: Vec<u32>) -> Self {
+        Self { items, pos: 0 }
+    }
+}
+
+impl ItemReader for BookmarkReader {
+    type Item = u32;
+
+    async fn read(&mut self) -> Result<Option<Self::Item>, BatchError> {
+        let item = self.items.get(self.pos).copied();
+        if item.is_some() {
+            self.pos += 1;
+        }
+        Ok(item)
+    }
+
+    async fn open(&mut self, context: &ExecutionContext) -> Result<(), BatchError> {
+        // The `?` is what makes a corrupt bookmark abort the run instead of
+        // silently restarting it from zero.
+        if let Some(position) = context.get_long(POSITION)? {
+            // `try_from`, not `as`: a negative position is corrupt data, and
+            // `as` would wrap it into a huge number instead of complaining.
+            self.pos = usize::try_from(position)
+                .map_err(|_| BatchError::Read(format!("negative bookmark {position}")))?;
+        }
+
+        Ok(())
+    }
+
+    fn update(&self, context: &mut ExecutionContext) {
+        // usize -> i64 only loses data above 2^63 items, which is not a batch.
+        context.put(POSITION, ContextValue::Long(self.pos as i64));
     }
 }
 
@@ -105,6 +157,35 @@ impl ItemWriter for FailingWriter {
     }
 }
 
+/// Succeeds for `ok_writes` chunks, then fails — lets tests observe the state a
+/// partially-completed step leaves behind.
+pub(crate) struct FlakyWriter {
+    pub written: Vec<u32>,
+    pub ok_writes: usize,
+}
+
+impl FlakyWriter {
+    pub(crate) fn new(ok_writes: usize) -> Self {
+        Self {
+            written: Vec::new(),
+            ok_writes,
+        }
+    }
+}
+
+impl ItemWriter for FlakyWriter {
+    type Item = u32;
+
+    async fn write(&mut self, items: &[u32]) -> Result<(), BatchError> {
+        if self.ok_writes == 0 {
+            return Err(BatchError::Write("boom".into()));
+        }
+        self.ok_writes -= 1;
+        self.written.extend_from_slice(items);
+        Ok(())
+    }
+}
+
 /// A tasklet-style step that does no item I/O — stands in for "delete temp files,
 /// send a report". Proves a `Job` can hold heterogeneous step types.
 pub(crate) struct LogStep;
@@ -115,8 +196,13 @@ impl Step for LogStep {
         "log"
     }
 
-    // A tasklet reads and writes nothing, so it has no counters to report.
-    async fn run(&mut self, _contribution: &mut StepContribution) -> Result<(), BatchError> {
+    // A tasklet reads and writes nothing, so it has neither counters to report
+    // nor a position to bookmark.
+    async fn run(
+        &mut self,
+        _contribution: &mut StepContribution,
+        _context: &mut ExecutionContext,
+    ) -> Result<(), BatchError> {
         Ok(())
     }
 }
@@ -131,7 +217,11 @@ impl Step for FailingStep {
         "failing"
     }
 
-    async fn run(&mut self, _contribution: &mut StepContribution) -> Result<(), BatchError> {
+    async fn run(
+        &mut self,
+        _contribution: &mut StepContribution,
+        _context: &mut ExecutionContext,
+    ) -> Result<(), BatchError> {
         Err(BatchError::Process("boom".into()))
     }
 }

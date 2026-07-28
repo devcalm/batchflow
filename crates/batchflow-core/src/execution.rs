@@ -1,4 +1,4 @@
-use crate::StepContribution;
+use crate::{ExecutionContext, StepContribution};
 use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -76,10 +76,7 @@ impl StepExecutionId {
     }
 }
 
-/// One logical run of a job, identified by its name plus its [`JobParameters`].
-///
-/// Re-running with identical parameters resolves to the *same* instance — that is
-/// what makes a restart a restart rather than a fresh run (FR-4.2).
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JobInstance {
     id: JobInstanceId,
@@ -116,6 +113,7 @@ pub struct JobExecution {
     id: JobExecutionId,
     instance_id: JobInstanceId,
     status: BatchStatus,
+    execution_context: ExecutionContext,
 }
 
 impl JobExecution {
@@ -124,6 +122,7 @@ impl JobExecution {
             id,
             instance_id,
             status: BatchStatus::Starting,
+            execution_context: ExecutionContext::new(),
         }
     }
 
@@ -142,14 +141,19 @@ impl JobExecution {
     pub fn set_status(&mut self, status: BatchStatus) {
         self.status = status;
     }
+
+    /// Job-scoped bookmark bag — for data one step needs to hand to a later
+    /// one. Nothing in the engine writes it yet; the per-step context on
+    /// [`StepExecution`] is what carries reader positions.
+    pub fn execution_context(&self) -> &ExecutionContext {
+        &self.execution_context
+    }
+
+    pub fn set_execution_context(&mut self, context: ExecutionContext) {
+        self.execution_context = context;
+    }
 }
 
-/// The persisted record of one step inside a [`JobExecution`].
-///
-/// Deliberately *not* nested inside `JobExecution`: the two are separate rows
-/// joined by `job_execution_id`, the shape Phase 11's Postgres schema needs.
-/// Holding the same fact in two places is how the two copies come to disagree.
-/// Query them with `JobRepository::step_executions`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StepExecution {
     id: StepExecutionId,
@@ -159,6 +163,7 @@ pub struct StepExecution {
     read_count: usize,
     write_count: usize,
     filter_count: usize,
+    execution_context: ExecutionContext,
 }
 
 impl StepExecution {
@@ -177,6 +182,7 @@ impl StepExecution {
             read_count: 0,
             write_count: 0,
             filter_count: 0,
+            execution_context: ExecutionContext::new(),
         }
     }
 
@@ -213,6 +219,17 @@ impl StepExecution {
     /// Items dropped by the processor (it returned `None`).
     pub fn filter_count(&self) -> usize {
         self.filter_count
+    }
+
+    /// The step's bookmark: where its reader had got to when the last chunk
+    /// committed. This is what Phase 9 feeds back in to resume rather than
+    /// re-run.
+    pub fn execution_context(&self) -> &ExecutionContext {
+        &self.execution_context
+    }
+
+    pub fn set_execution_context(&mut self, context: ExecutionContext) {
+        self.execution_context = context;
     }
 
     /// Fold a step's reported deltas into this record.

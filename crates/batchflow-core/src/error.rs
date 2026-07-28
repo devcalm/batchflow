@@ -21,4 +21,11 @@ pub enum BatchError {
         job_name: String,
         instance_id: JobInstanceId,
     },
+
+    #[error("execution context key '{key}' holds a {actual}, expected {expected}")]
+    ExecutionContextType {
+        key: String,
+        expected: &'static str,
+        actual: &'static str,
+    },
 }

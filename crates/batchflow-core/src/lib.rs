@@ -11,12 +11,14 @@ mod job;
 mod launcher;
 mod step;
 
+mod context;
 mod memory;
 mod repository;
 #[cfg(test)]
 mod testing;
 
 pub use chunk::{process_chunk, read_chunk, run_step};
+pub use context::{ContextValue, ExecutionContext};
 pub use error::BatchError;
 pub use execution::{
     BatchStatus, JobExecution, JobExecutionId, JobInstance, JobInstanceId, JobParameter,

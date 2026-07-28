@@ -13,6 +13,8 @@ categories = ["asynchronous", "concurrency"]
 [dependencies]
 async-trait.workspace = true
 thiserror.workspace = true
+serde.workspace = true
 
 [dev-dependencies]
 tokio.workspace = true
+serde_json.workspace = true

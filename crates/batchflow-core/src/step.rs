@@ -1,14 +1,8 @@
 use crate::run_step;
-use crate::{BatchError, ItemProcessor, ItemReader, ItemWriter};
+use crate::{BatchError, ExecutionContext, ItemProcessor, ItemReader, ItemWriter};
 use async_trait::async_trait;
 use std::num::NonZeroUsize;
 
-/// Counter deltas a step reports while it runs.
-///
-/// A step may only *accumulate* into one — it cannot assign a count, and cannot
-/// reach identity or status. Those live on [`StepExecution`](crate::StepExecution),
-/// which the engine owns. Phase 11 makes this the rollback unit: a chunk's contribution is
-/// folded in only once its transaction commits, so a rollback drops it.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct StepContribution {
     read_count: usize,
@@ -60,13 +54,11 @@ impl StepContribution {
 pub trait Step: Send {
     fn name(&self) -> &str;
 
-    /// Run the step, reporting counter deltas into `contribution`.
-    ///
-    /// A step deliberately cannot return a [`StepExecution`](crate::StepExecution):
-    /// that record's id is minted by the `JobRepository`, and a step has no
-    /// repository — nor should it, since that is the separation the engine and
-    /// launcher exist to enforce.
-    async fn run(&mut self, contribution: &mut StepContribution) -> Result<(), BatchError>;
+    async fn run(
+        &mut self,
+        contribution: &mut StepContribution,
+        context: &mut ExecutionContext,
+    ) -> Result<(), BatchError>;
 }
 
 pub struct ChunkStep<R, P, W> {
@@ -108,13 +100,18 @@ where
         &self.name
     }
 
-    async fn run(&mut self, contribution: &mut StepContribution) -> Result<(), BatchError> {
+    async fn run(
+        &mut self,
+        contribution: &mut StepContribution,
+        context: &mut ExecutionContext,
+    ) -> Result<(), BatchError> {
         run_step(
             &mut self.reader,
             &mut self.processor,
             &mut self.writer,
             self.chunk_size,
             contribution,
+            context,
         )
         .await
     }
@@ -173,7 +170,8 @@ mod tests {
         assert_eq!(step.name(), "double-evens");
 
         let mut contribution = StepContribution::new();
-        step.run(&mut contribution).await.unwrap();
+        let mut context = ExecutionContext::new();
+        step.run(&mut contribution, &mut context).await.unwrap();
 
         assert_eq!(contribution.read_count(), 6);
         assert_eq!(contribution.write_count(), 3);

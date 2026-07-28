@@ -1,5 +1,5 @@
 use crate::BatchError;
-use crate::{BatchStatus, JobExecutionId, JobRepository, Step, StepContribution};
+use crate::{BatchStatus, ExecutionContext, JobExecutionId, JobRepository, Step, StepContribution};
 use std::marker::PhantomData;
 
 pub struct Job {
@@ -8,6 +8,7 @@ pub struct Job {
 }
 
 impl Job {
+
     pub fn builder(name: impl Into<String>) -> JobBuilder<NoSteps> {
         JobBuilder {
             name: name.into(),
@@ -36,11 +37,12 @@ impl Job {
             repository.update_step_execution(&step_execution).await?;
 
             let mut contribution = StepContribution::new();
-            let outcome = step.run(&mut contribution).await;
-
-            // Fold whatever the step managed to report, success or not: a step
-            // that failed at item 900 of 1000 really did process 900.
+            
+            let mut context = ExecutionContext::new();
+            let outcome = step.run(&mut contribution, &mut context).await;
+            
             step_execution.apply(&contribution);
+            step_execution.set_execution_context(context);
             step_execution.set_status(if outcome.is_ok() {
                 BatchStatus::Completed
             } else {
@@ -97,7 +99,10 @@ impl JobBuilder<HasSteps> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::{CollectingWriter, EvenDoubler, FailingStep, LogStep, VecReader, nz};
+    use crate::testing::{
+        BookmarkReader, CollectingWriter, EvenDoubler, FailingStep, FlakyWriter, LogStep, POSITION,
+        VecReader, nz,
+    };
     use crate::{ChunkStep, InMemoryJobRepository, JobExecution, JobParameters};
 
     /// A job execution to hang step executions off. Steps are stored by
@@ -157,6 +162,59 @@ mod tests {
         assert_eq!(steps.len(), 1, "the step after a failure must not run");
         assert_eq!(steps[0].step_name(), "failing");
         assert_eq!(steps[0].status(), BatchStatus::Failed);
+    }
+
+    #[tokio::test]
+    async fn a_step_bookmark_is_persisted_on_its_step_execution() {
+        let repository = InMemoryJobRepository::default();
+        let execution = open_execution(&repository).await;
+
+        let chunk_step = ChunkStep::new(
+            "bookmarked",
+            BookmarkReader::new(vec![2, 4, 6, 8]),
+            EvenDoubler,
+            CollectingWriter::new(),
+            nz(2),
+        );
+        let mut job = Job::new("test-name", vec![Box::new(chunk_step)]);
+
+        job.run(execution.id(), &repository).await.unwrap();
+
+        let steps = repository.step_executions(execution.id()).await.unwrap();
+
+        assert_eq!(
+            steps[0].execution_context().get_long(POSITION).unwrap(),
+            Some(4)
+        );
+    }
+
+    /// The bookmark matters *more* on failure than on success: it is the only
+    /// reason a restart can skip the chunks that did commit. A step recorded as
+    /// `Failed` with an empty context would force a full re-run.
+    #[tokio::test]
+    async fn a_failing_step_still_persists_its_bookmark() {
+        let repository = InMemoryJobRepository::default();
+        let execution = open_execution(&repository).await;
+
+        let chunk_step = ChunkStep::new(
+            "bookmarked",
+            BookmarkReader::new(vec![2, 4, 6, 8]),
+            EvenDoubler,
+            FlakyWriter::new(1), // first chunk commits, second does not
+            nz(2),
+        );
+        let mut job = Job::new("test-name", vec![Box::new(chunk_step)]);
+
+        assert!(job.run(execution.id(), &repository).await.is_err());
+
+        let steps = repository.step_executions(execution.id()).await.unwrap();
+
+        assert_eq!(steps[0].status(), BatchStatus::Failed);
+        assert_eq!(steps[0].read_count(), 2);
+        assert_eq!(
+            steps[0].execution_context().get_long(POSITION).unwrap(),
+            Some(2)
+        );
     }
 
     #[tokio::test]

@@ -1,4 +1,4 @@
-use crate::{BatchError, StepContribution};
+use crate::{BatchError, ExecutionContext, StepContribution};
 use crate::{ItemProcessor, ItemReader, ItemWriter};
 use std::num::NonZeroUsize;
 
@@ -60,27 +60,27 @@ pub async fn run_step<R, P, W>(
     writer: &mut W,
     chunk_size: NonZeroUsize,
     contribution: &mut StepContribution,
+    context: &mut ExecutionContext,
 ) -> Result<(), BatchError>
 where
     R: ItemReader,
     P: ItemProcessor<In = R::Item>, // processor consumes what the reader produces
     W: ItemWriter<Item = P::Out>,   // writer consumes what the processor produces
 {
+    reader.open(context).await?;
+
     loop {
         let chunk = read_chunk(reader, chunk_size).await?;
         if chunk.is_empty() {
             break;
         }
         let read = chunk.len();
-
-        // Chunk-local: the `?` discards these counts along with the work that
-        // produced them. Phase 11 turns that discard into a real rollback.
+        
         let mut chunk_contribution = process_chunk(processor, writer, chunk).await?;
         chunk_contribution.increment_read(read);
-
-        // The commit point: pending deltas fold into the step's totals only
-        // once the chunk has succeeded.
+        
         contribution.apply(&chunk_contribution);
+        reader.update(context);
     }
 
     Ok(())
@@ -89,8 +89,10 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ContextValue;
     use crate::testing::{
-        CollectingWriter, EvenDoubler, FailingReader, FailingWriter, VecReader, nz,
+        BookmarkReader, CollectingWriter, EvenDoubler, FailingReader, FailingWriter, FlakyWriter,
+        POSITION, VecReader, nz,
     };
 
     #[tokio::test]
@@ -142,6 +144,7 @@ mod tests {
         let mut processor = EvenDoubler;
         let mut writer = CollectingWriter::new();
         let mut contribution = StepContribution::new();
+        let mut context = ExecutionContext::new();
 
         // chunk_size = 2 -> the loop runs several times, proving it iterates
         // and that each chunk's contribution folds in rather than overwriting.
@@ -151,6 +154,7 @@ mod tests {
             &mut writer,
             nz(2),
             &mut contribution,
+            &mut context,
         )
         .await
         .unwrap();
@@ -171,6 +175,7 @@ mod tests {
         let mut processor = EvenDoubler;
         let mut writer = FailingWriter;
         let mut contribution = StepContribution::new();
+        let mut context = ExecutionContext::new();
 
         let result = run_step(
             &mut reader,
@@ -178,10 +183,91 @@ mod tests {
             &mut writer,
             nz(2),
             &mut contribution,
+            &mut context,
         )
         .await;
 
         assert!(result.is_err());
         assert_eq!(contribution, StepContribution::default());
+    }
+
+    // ---- the atomic bookmark ----
+
+    #[tokio::test]
+    async fn run_step_records_the_readers_position() {
+        let mut reader = BookmarkReader::new(vec![2, 4, 6]);
+        let mut processor = EvenDoubler;
+        let mut writer = CollectingWriter::new();
+        let mut contribution = StepContribution::new();
+        let mut context = ExecutionContext::new();
+
+        run_step(
+            &mut reader,
+            &mut processor,
+            &mut writer,
+            nz(2),
+            &mut contribution,
+            &mut context,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(context.get_long(POSITION).unwrap(), Some(3));
+    }
+
+    #[tokio::test]
+    async fn run_step_resumes_from_a_recorded_position() {
+        let mut context = ExecutionContext::new();
+        context.put(POSITION, ContextValue::Long(2));
+
+        let mut reader = BookmarkReader::new(vec![2, 4, 6, 8]);
+        let mut processor = EvenDoubler;
+        let mut writer = CollectingWriter::new();
+        let mut contribution = StepContribution::new();
+
+        run_step(
+            &mut reader,
+            &mut processor,
+            &mut writer,
+            nz(2),
+            &mut contribution,
+            &mut context,
+        )
+        .await
+        .unwrap();
+
+        // Items 2 and 4 were committed by the previous run. Re-reading them
+        // here would double-write 4 and 8 — the exact failure restart exists
+        // to prevent.
+        assert_eq!(writer.written, vec![12, 16]);
+        assert_eq!(contribution.read_count(), 2);
+        assert_eq!(context.get_long(POSITION).unwrap(), Some(4));
+    }
+
+    /// Counters and bookmark must always describe the *same* committed work.
+    /// The second chunk's write fails, so neither its items nor its position
+    /// may appear.
+    #[tokio::test]
+    async fn a_failed_chunk_leaves_the_bookmark_at_the_last_committed_chunk() {
+        let mut reader = BookmarkReader::new(vec![2, 4, 6, 8]);
+        let mut processor = EvenDoubler;
+        let mut writer = FlakyWriter::new(1); // first chunk commits, second does not
+        let mut contribution = StepContribution::new();
+        let mut context = ExecutionContext::new();
+
+        let result = run_step(
+            &mut reader,
+            &mut processor,
+            &mut writer,
+            nz(2),
+            &mut contribution,
+            &mut context,
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert_eq!(writer.written, vec![4, 8]);
+        assert_eq!(contribution.read_count(), 2);
+        assert_eq!(context.get_long(POSITION).unwrap(), Some(2));
     }
 }
