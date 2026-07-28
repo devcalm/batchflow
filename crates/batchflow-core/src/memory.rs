@@ -217,7 +217,6 @@ mod tests {
         repo.create_execution(instance.id()).await.unwrap()
     }
 
-
     #[tokio::test]
     async fn identical_parameters_resolve_to_the_same_instance() {
         let repo = InMemoryJobRepository::default();

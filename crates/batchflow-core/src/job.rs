@@ -1,5 +1,6 @@
 use crate::BatchError;
 use crate::{BatchStatus, JobExecutionId, JobRepository, Step, StepContribution};
+use std::marker::PhantomData;
 
 pub struct Job {
     name: String,
@@ -7,6 +8,14 @@ pub struct Job {
 }
 
 impl Job {
+    pub fn builder(name: impl Into<String>) -> JobBuilder<NoSteps> {
+        JobBuilder {
+            name: name.into(),
+            steps: Vec::new(),
+            _state: PhantomData,
+        }
+    }
+
     pub fn new(name: impl Into<String>, steps: Vec<Box<dyn Step>>) -> Self {
         Self {
             name: name.into(),
@@ -14,15 +23,6 @@ impl Job {
         }
     }
 
-    /// Run every step in order under `job_execution_id`, persisting a
-    /// [`StepExecution`](crate::StepExecution) for each.
-    ///
-    /// Takes the id rather than the whole `JobExecution`: this is all the step
-    /// loop needs, and a parameter is easier to widen later than to narrow.
-    ///
-    /// The first failing step stops the job — but only *after* its own record
-    /// is persisted as `Failed`, so the metadata never claims a step is still
-    /// running. Same shape as the launcher one level up, for the same reason.
     pub async fn run<R: JobRepository>(
         &mut self,
         job_execution_id: JobExecutionId,
@@ -56,6 +56,41 @@ impl Job {
 
     pub fn name(&self) -> &str {
         &self.name
+    }
+}
+
+/// Typestate marker: no step has been added yet, so there is nothing to build.
+#[derive(Debug)]
+pub struct NoSteps;
+
+/// Typestate marker: at least one step has been added.
+#[derive(Debug)]
+pub struct HasSteps;
+
+pub struct JobBuilder<State = NoSteps> {
+    name: String,
+    steps: Vec<Box<dyn Step>>,
+    _state: PhantomData<State>,
+}
+
+impl<State> JobBuilder<State> {
+    pub fn step<S: Step + 'static>(mut self, step: S) -> JobBuilder<HasSteps> {
+        self.steps.push(Box::new(step));
+
+        JobBuilder {
+            name: self.name,
+            steps: self.steps,
+            _state: PhantomData,
+        }
+    }
+}
+
+impl JobBuilder<HasSteps> {
+    pub fn build(self) -> Job {
+        Job {
+            name: self.name,
+            steps: self.steps,
+        }
     }
 }
 
@@ -122,6 +157,50 @@ mod tests {
         assert_eq!(steps.len(), 1, "the step after a failure must not run");
         assert_eq!(steps[0].step_name(), "failing");
         assert_eq!(steps[0].status(), BatchStatus::Failed);
+    }
+
+    #[tokio::test]
+    async fn builder_produces_a_runnable_job_preserving_step_order() {
+        let repository = InMemoryJobRepository::default();
+        let execution = open_execution(&repository).await;
+
+        let chunk_step = ChunkStep::new(
+            "double-evens",
+            VecReader::new(vec![1, 2, 3, 4]),
+            EvenDoubler,
+            CollectingWriter::new(),
+            nz(2),
+        );
+
+        // No `Box::new` at the call site — that is the ergonomic win over
+        // `Job::new`, and it is why `step` takes `S: Step + 'static` by value.
+        let mut job = Job::builder("test-name")
+            .step(chunk_step)
+            .step(LogStep)
+            .build();
+
+        assert_eq!(job.name(), "test-name");
+
+        job.run(execution.id(), &repository).await.unwrap();
+
+        let steps = repository.step_executions(execution.id()).await.unwrap();
+        let names: Vec<&str> = steps.iter().map(|s| s.step_name()).collect();
+
+        assert_eq!(names, ["double-evens", "log"]);
+        assert_eq!(steps[0].read_count(), 4);
+    }
+
+    /// The positive control for the `compile_fail` doctest on [`Job::builder`].
+    ///
+    /// A `compile_fail` doctest passes when its snippet fails to compile for
+    /// *any* reason — a typo would satisfy it just as well as the typestate. So
+    /// this asserts the same chain compiles once a step is added; the doctest
+    /// then only has one remaining explanation for failing.
+    #[test]
+    fn build_is_reachable_once_a_step_has_been_added() {
+        let job = Job::builder("test-name").step(LogStep).build();
+
+        assert_eq!(job.name(), "test-name");
     }
 
     #[test]

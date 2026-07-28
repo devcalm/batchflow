@@ -23,7 +23,7 @@ pub use execution::{
     JobParameters, StepExecution, StepExecutionId,
 };
 pub use item::{ItemProcessor, ItemReader, ItemWriter};
-pub use job::Job;
+pub use job::{HasSteps, Job, JobBuilder, NoSteps};
 pub use launcher::JobLauncher;
 pub use memory::InMemoryJobRepository;
 pub use repository::JobRepository;

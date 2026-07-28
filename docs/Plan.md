@@ -30,11 +30,14 @@
 - **Acceptance:** compiles; `clippy -D warnings` clean; user can defend the assoc-type-vs-generic call.
 - **Testing:** unit test `read_chunk` (full chunk, partial/EOF, error short-circuit). **Docs:** trait rustdoc + doctest.
 
-## Phase 3 — Job Model ☑ (basic: `Job` holds `Vec<Box<dyn Step>>`, runs in order, fail-fast; builders/DAG deferred)
+## Phase 3 — Job Model ☑ (DAG/conditional flow out of scope for 0.1)
 - **Goals:** `Job`, `Step` definitions + builders; linear step ordering.
 - **Learning:** builder pattern in Rust; typestate for build-time validation; DAG deferred.
-- **Tasks:** `Job`/`Step` types; `JobBuilder`/`StepBuilder`; heterogeneous step list (trait objects, ADR-002).
-- **Acceptance:** define a 2-step job in code. **Testing:** builder unit tests. **Docs:** example.
+- **Tasks:** ☑ `Job`/`Step` types · ☑ heterogeneous step list (trait objects, ADR-002) · ☑ `JobBuilder` with typestate · ☐ `StepBuilder` (`ChunkStep::new` takes five arguments and is not yet painful; revisit if it grows).
+- **Acceptance:** ☑ define a 2-step job in code. **Testing:** ☑ builder unit tests + a `compile_fail` doctest. **Docs:** ☑ rustdoc; ☐ runnable example (Phase 16).
+
+**`JobBuilder` typestate (2026-07-28).** `Job::builder("nightly").step(a).step(b).build()`. `build` is defined only on `JobBuilder<HasSteps>`, so an empty job — one that runs, reports success and processes nothing — is a *compile* error, the same class of silent no-op `NonZeroUsize` rules out for chunk sizes. Consequence: `build` returns `Job`, not `Result<Job, _>`, because the only failure it could report is unrepresentable. `step` takes `S: Step + 'static` by value and boxes internally, so callers never write `Box::new`.
+**Cost, documented not hidden:** a typestate builder changes type on the first `.step(..)`, so it cannot be driven from a loop. `Job::new(name, Vec<Box<dyn Step>>)` stays public as the dynamic escape hatch.
 
 ## Phase 4 — Step Model ◐ (`StepContribution` + `StepExecution` done in 7c-2; dedicated tasklet trait pending)
 - **Goals:** Chunk-step vs tasklet-step; `StepContribution`; `StepExecution` counters.
@@ -42,11 +45,11 @@
 - **Tasks:** ☑ `StepExecution` (id/job_execution_id/step_name/status/counters) · ☑ `StepContribution` (private fields, `increment_*` only, `apply` folds) · ☑ status lifecycle (`Starting`→`Started`→`Completed`/`Failed`) · ☐ tasklet trait (today a tasklet is a hand-written `Step` impl that ignores its contribution).
 - **Acceptance:** ☑ counters fold in correctly. Rollback-discards-deltas is structural today (an errored chunk yields no contribution to fold) and becomes a real transaction in Phase 11. **Testing:** unit. **Docs:** rustdoc.
 
-## Phase 5 — Execution Engine ☑ (basic: `run_step` chunk loop + `Step`/`ChunkStep`; no TX/persistence yet)
-- **Goals:** Drive a Job through its Steps; the chunk loop (no persistence/TX yet).
-- **Learning:** ownership of reader/processor/writer during a run; where `?` triggers failure.
-- **Tasks:** step executor running `read_chunk` → process → write with in-memory counters.
-- **Acceptance:** end-to-end in-memory job runs to completion. **Testing:** integration w/ fakes. **Docs:** flow diagram.
+## Phase 5 — Execution Engine ☑ (chunk loop + per-step persistence; **real transactions** in Phase 11)
+- **Goals:** Drive a Job through its Steps; the chunk loop.
+- **Learning:** ownership of reader/processor/writer during a run; where `?` triggers failure — and where it must *not* be used, because it skips the status write that follows (see Phase 7).
+- **Tasks:** ☑ step executor running `read_chunk` → process → write · ☑ counters via `StepContribution`, folded per chunk · ☑ `Job::run` persisting a `StepExecution` per step (added in 7c-2; this phase's original "no persistence yet" caveat no longer applies).
+- **Acceptance:** ☑ end-to-end job runs to completion and is fully reconstructible from the repository. **Testing:** integration w/ fakes. **Docs:** ☐ flow diagram.
 
 ## Phase 6 — Chunk Processing (full) ◐ (semantics + `StepContribution` integration done; property tests + tuning guide pending)
 - **Goals:** commit interval, filtering, empty-chunk termination, chunk-oriented writer semantics.
@@ -129,7 +132,7 @@
 `cargo fmt` · `cargo clippy -- -D warnings` · `cargo test` (+ doctests) · examples compile · no dead code · no needless clone/alloc.
 
 ## Current position (2026-07-28)
-Phase 0 ◐ docs (tech-eval open items) · 1 ☑ workspace · 2 ☑ traits · 3 ☑ Job · 4 ◐ step model (tasklet trait pending) · 5 ☑ engine · 6 ◐ chunk processing (property tests/tuning guide pending) · **7 ☑ JobRepository — complete**.
+Phase 0 ◐ docs (tech-eval open items) · 1 ☑ workspace · 2 ☑ traits · 3 ☑ Job + typestate `JobBuilder` · 4 ◐ step model (tasklet trait pending) · 5 ☑ engine · 6 ◐ chunk processing (property tests/tuning guide pending) · **7 ☑ JobRepository — complete**.
 `batchflow-core` modules: `chunk`/`error`/`execution`/`item`/`job`/`launcher`/`memory`/`repository`/`step` + `#[cfg(test)] testing`, with `lib.rs` as a pure re-export surface (private `mod` + flat `pub use`, so module layout stays refactorable). **42 tests green**, clippy `-D warnings` clean, `cargo fmt` clean.
 
 A job now runs end to end through metadata: `JobLauncher::run` resolves a `JobInstance` from `(job_name, JobParameters)`, refuses a completed one (FR-4.4), opens a `JobExecution`, and `Job::run` persists a counted `StepExecution` per step — all reloadable from the repository alone.
@@ -142,7 +145,8 @@ A job now runs end to end through metadata: `JobLauncher::run` resolves a `JobIn
 1. `Starting`/`Started` still passes the FR-4.4 gate. Rejecting it needs `JobRepository::abandon_execution` **in the same change** — a guard with no escape hatch turns a recoverable crash into a permanently unlaunchable instance. Both in Phase 9.
 2. `JobLauncher::run` resolves the instance and reads its last execution under **separate lock acquisitions**, so two processes can both pass the gate. Closed by a real transaction in Phase 11.
 3. A failing `update_execution` masks the job's original error (`launcher.rs`). Real systems log the cause before propagating — Phase 13.
-4. Library-craft gap: no `#![warn(missing_docs)]`, zero doctests, `Job`/`ChunkStep` lack `Debug` (API guideline C-DEBUG).
+4. Library-craft gap: no `#![warn(missing_docs)]`, `Job`/`ChunkStep` lack `Debug` (API guideline C-DEBUG). (Doctests are no longer zero — `Job::builder` has two, one of them `compile_fail`.)
+   Related: implementing `Step` requires the caller to depend on `async-trait` directly, since the trait is `#[async_trait]`. Either re-export the macro or document the dependency before 0.1.0.
 5. `read_chunk`/`process_chunk`/`run_step` are `pub` without a deliberate SemVer decision — and `run_step`'s signature changed in 7c-2, which is exactly the kind of break that decision governs. Settle it before 0.1.0.
 
 **Next milestone: Phase 8 — `ExecutionContext`.** Phase 7 gives restart its identity and its per-step status; Phase 8 gives it the bookmark, and Phase 9 joins them. Phase 10 (retry/skip via a `Classifier`) is the alternative branch, but restart is the deeper capability and everything for it is now in place.
