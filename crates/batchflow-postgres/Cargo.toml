@@ -1,0 +1,27 @@
+[package]
+name = "batchflow-postgres"
+description = "Postgres metadata store for BatchFlow, a Spring Batch-inspired batch processing framework for Rust."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+documentation = "https://docs.rs/batchflow-postgres"
+keywords = ["batch", "etl", "postgres", "sqlx", "orchestration"]
+categories = ["asynchronous", "database"]
+
+[dependencies]
+batchflow-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sqlx = { workspace = true, features = [
+    "runtime-tokio",
+    "postgres",
+    "json",
+    "macros",
+    "migrate",
+] }
+
+[dev-dependencies]
+tokio.workspace = true
+testcontainers-modules = { workspace = true, features = ["postgres"] }

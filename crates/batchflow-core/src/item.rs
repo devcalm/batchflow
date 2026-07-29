@@ -37,6 +37,48 @@ pub trait ItemWriter {
     ) -> impl Future<Output = Result<(), BatchError>> + Send;
 }
 
+/// An [`ItemWriter`] that enlists in the step's transaction, so its writes
+/// commit with the counters and the bookmark (FR-2.4).
+///
+/// Writers that cannot enlist — CSV, S3, stdout — keep implementing plain
+/// [`ItemWriter`] and are adapted with [`Unmanaged`], which is an explicit
+/// acceptance of at-least-once for that step.
+pub trait TransactionalWriter<Tx>: Send {
+    type Item;
+
+    fn write(
+        &mut self,
+        tx: &mut Tx,
+        items: &[Self::Item],
+    ) -> impl Future<Output = Result<(), BatchError>> + Send;
+}
+
+/// Adapts a plain [`ItemWriter`] to any transaction by ignoring it.
+///
+/// A blanket `impl<W: ItemWriter, Tx> TransactionalWriter<Tx> for W` is not
+/// possible: it would overlap every direct impl, and Rust cannot prove a type
+/// is *not* an `ItemWriter`. A distinct `Self` type is the way out, and making
+/// it explicit at the call site is the point — non-transactional writing should
+/// be visible, not inferred.
+pub struct Unmanaged<W>(pub W);
+
+impl<W, Tx> TransactionalWriter<Tx> for Unmanaged<W>
+where
+    W: ItemWriter + Send,
+    W::Item: Sync,
+    Tx: Send,
+{
+    type Item = W::Item;
+
+    fn write(
+        &mut self,
+        _tx: &mut Tx,
+        items: &[Self::Item],
+    ) -> impl Future<Output = Result<(), BatchError>> + Send {
+        self.0.write(items)
+    }
+}
+
 pub trait ItemProcessor {
     type In;
     type Out;

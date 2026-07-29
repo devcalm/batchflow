@@ -5,8 +5,9 @@
 //! same fakes, and duplicating them is how test suites drift apart.
 
 use crate::{
-    BatchError, ContextValue, ExecutionContext, ItemProcessor, ItemReader, ItemWriter, Step,
-    StepContribution,
+    BatchError, ContextValue, ExecutionContext, InMemoryJobRepository, ItemProcessor, ItemReader,
+    ItemWriter, JobExecution, JobExecutionId, JobInstance, JobInstanceId, JobParameters,
+    JobRepository, Step, StepCommit, StepContribution, StepExecution,
 };
 use async_trait::async_trait;
 use std::num::NonZeroUsize;
@@ -236,6 +237,113 @@ impl ItemWriter for SharedWriter {
     }
 }
 
+/// An [`InMemoryJobRepository`] whose `commit` always fails.
+///
+/// It cannot roll anything back — no fake can — but it does let a test observe
+/// what the engine does *around* a failed commit, which is our logic rather
+/// than the backend's.
+pub(crate) struct CommitFails(InMemoryJobRepository);
+
+impl CommitFails {
+    pub(crate) fn new() -> Self {
+        Self(InMemoryJobRepository::default())
+    }
+}
+
+impl JobRepository for CommitFails {
+    type Tx = ();
+
+    async fn begin(&self) -> Result<(), BatchError> {
+        Ok(())
+    }
+
+    async fn commit(&self, _tx: ()) -> Result<(), BatchError> {
+        Err(BatchError::Repository("commit failed".into()))
+    }
+
+    async fn rollback(&self, tx: ()) -> Result<(), BatchError> {
+        self.0.rollback(tx).await
+    }
+
+    async fn update_step_execution_in(
+        &self,
+        tx: &mut (),
+        step_execution: &StepExecution,
+    ) -> Result<(), BatchError> {
+        self.0.update_step_execution_in(tx, step_execution).await
+    }
+
+    async fn find_or_create_instance(
+        &self,
+        job_name: &str,
+        parameters: &JobParameters,
+    ) -> Result<JobInstance, BatchError> {
+        self.0.find_or_create_instance(job_name, parameters).await
+    }
+
+    async fn find_instance(
+        &self,
+        job_name: &str,
+        parameters: &JobParameters,
+    ) -> Result<Option<JobInstance>, BatchError> {
+        self.0.find_instance(job_name, parameters).await
+    }
+
+    async fn create_execution(
+        &self,
+        instance_id: JobInstanceId,
+    ) -> Result<JobExecution, BatchError> {
+        self.0.create_execution(instance_id).await
+    }
+
+    async fn update_execution(&self, execution: &JobExecution) -> Result<(), BatchError> {
+        self.0.update_execution(execution).await
+    }
+
+    async fn last_execution(
+        &self,
+        instance_id: JobInstanceId,
+    ) -> Result<Option<JobExecution>, BatchError> {
+        self.0.last_execution(instance_id).await
+    }
+
+    async fn abandon_execution(&self, execution_id: JobExecutionId) -> Result<(), BatchError> {
+        self.0.abandon_execution(execution_id).await
+    }
+
+    async fn create_step_execution(
+        &self,
+        job_execution_id: JobExecutionId,
+        step_name: &str,
+    ) -> Result<StepExecution, BatchError> {
+        self.0
+            .create_step_execution(job_execution_id, step_name)
+            .await
+    }
+
+    async fn update_step_execution(
+        &self,
+        step_execution: &StepExecution,
+    ) -> Result<(), BatchError> {
+        self.0.update_step_execution(step_execution).await
+    }
+
+    async fn last_step_execution(
+        &self,
+        instance_id: JobInstanceId,
+        step_name: &str,
+    ) -> Result<Option<StepExecution>, BatchError> {
+        self.0.last_step_execution(instance_id, step_name).await
+    }
+
+    async fn step_executions(
+        &self,
+        job_execution_id: JobExecutionId,
+    ) -> Result<Vec<StepExecution>, BatchError> {
+        self.0.step_executions(job_execution_id).await
+    }
+}
+
 /// A tasklet-style step that does no item I/O — stands in for "delete temp files,
 /// send a report". Proves a `Job` can hold heterogeneous step types.
 pub(crate) struct LogStep;
@@ -246,12 +354,11 @@ impl Step for LogStep {
         "log"
     }
 
-    // A tasklet reads and writes nothing, so it has neither counters to report
-    // nor a position to bookmark.
+    // A tasklet reads and writes nothing, so it has nothing to commit.
     async fn run(
         &mut self,
-        _contribution: &mut StepContribution,
         _context: &mut ExecutionContext,
+        _commit: &mut dyn StepCommit<()>,
     ) -> Result<(), BatchError> {
         Ok(())
     }
@@ -269,9 +376,51 @@ impl Step for FailingStep {
 
     async fn run(
         &mut self,
-        _contribution: &mut StepContribution,
         _context: &mut ExecutionContext,
+        _commit: &mut dyn StepCommit<()>,
     ) -> Result<(), BatchError> {
         Err(BatchError::Process("boom".into()))
+    }
+}
+
+/// Accumulates what a step commits, so tests can assert on totals and on the
+/// *number* of commit points without needing a repository.
+#[derive(Default)]
+pub(crate) struct RecordingCommit {
+    pub total: StepContribution,
+    pub begins: usize,
+    pub commits: usize,
+    pub rollbacks: usize,
+    pub context: ExecutionContext,
+}
+
+impl RecordingCommit {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+}
+
+#[async_trait]
+impl StepCommit<()> for RecordingCommit {
+    async fn begin(&mut self) -> Result<(), BatchError> {
+        self.begins += 1;
+        Ok(())
+    }
+
+    async fn commit(
+        &mut self,
+        _tx: (),
+        contribution: &StepContribution,
+        context: &ExecutionContext,
+    ) -> Result<(), BatchError> {
+        self.total.apply(contribution);
+        self.commits += 1;
+        self.context = context.clone();
+        Ok(())
+    }
+
+    async fn rollback(&mut self, _tx: ()) -> Result<(), BatchError> {
+        self.rollbacks += 1;
+        Ok(())
     }
 }

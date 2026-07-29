@@ -5,6 +5,24 @@ use crate::{
 use std::future::Future;
 
 pub trait JobRepository: Send + Sync {
+    /// The backend's transaction. `()` for stores that have none — those
+    /// degrade to at-least-once, which is honest rather than hidden.
+    type Tx: Send;
+
+    fn begin(&self) -> impl Future<Output = Result<Self::Tx, BatchError>> + Send;
+
+    fn commit(&self, tx: Self::Tx) -> impl Future<Output = Result<(), BatchError>> + Send;
+
+    fn rollback(&self, tx: Self::Tx) -> impl Future<Output = Result<(), BatchError>> + Send;
+
+    /// Update inside `tx`, so the counters and bookmark become durable with the
+    /// chunk's data rather than after it.
+    fn update_step_execution_in(
+        &self,
+        tx: &mut Self::Tx,
+        step_execution: &StepExecution,
+    ) -> impl Future<Output = Result<(), BatchError>> + Send;
+
     fn find_or_create_instance(
         &self,
         job_name: &str,

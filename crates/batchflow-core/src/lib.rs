@@ -27,9 +27,9 @@ pub use execution::{
     BatchStatus, JobExecution, JobExecutionId, JobInstance, JobInstanceId, JobParameter,
     JobParameters, StepExecution, StepExecutionId,
 };
-pub use item::{ItemProcessor, ItemReader, ItemWriter};
+pub use item::{ItemProcessor, ItemReader, ItemWriter, TransactionalWriter, Unmanaged};
 pub use job::{HasSteps, Job, JobBuilder, NoSteps};
 pub use launcher::JobLauncher;
 pub use memory::InMemoryJobRepository;
 pub use repository::JobRepository;
-pub use step::{ChunkStep, Step, StepContribution};
+pub use step::{ChunkStep, Step, StepCommit, StepContribution};

@@ -1,0 +1,32 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "WITH locked AS (\n                   SELECT id, status FROM job_execution WHERE id = $1 FOR UPDATE\n               ), updated AS (\n                   UPDATE job_execution SET status = $2\n                    WHERE id = (SELECT id FROM locked WHERE status <> $3)\n                RETURNING id\n               )\n               SELECT (SELECT status FROM locked)  AS \"status?\",\n                      (SELECT id     FROM updated) AS \"updated?\"",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "status?",
+        "type_info": "Text",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 1,
+        "name": "updated?",
+        "type_info": "Int8",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": [
+      null,
+      null
+    ]
+  },
+  "hash": "a30859d8bddbf63d432ff7a1eea7435a7fb540bfe6bd50c5e5a65552fc444d21"
+}

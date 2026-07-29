@@ -1,4 +1,5 @@
 use crate::{ExecutionContext, StepContribution};
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -12,7 +13,7 @@ pub enum BatchStatus {
     Abandoned,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum JobParameter {
     String(String),
@@ -21,7 +22,10 @@ pub enum JobParameter {
 }
 
 /// Identity key of a `JobInstance` (FR-4.2).
-#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
+///
+/// Serializes transparently as its inner map, and `BTreeMap` orders keys — so a
+/// backend can use the serialized form directly as the identity key.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct JobParameters(BTreeMap<String, JobParameter>);
 
 impl JobParameters {

@@ -18,6 +18,24 @@ impl<R: JobRepository> JobLauncher<R> {
         &self.repository
     }
 
+    /// A job may only run against a repository whose transaction type it was
+    /// built for, so a writer enlisted in one backend's transaction cannot be
+    /// paired with another backend's metadata store.
+    ///
+    /// **The block below is a test** — it is the only check on that guarantee.
+    /// `InMemoryJobRepository::Tx` is `()`, so a `Job<String>` must not compile
+    /// here. The positive control is every other test in this module, which
+    /// runs a plain `Job` against the same launcher.
+    ///
+    /// ```compile_fail
+    /// use batchflow_core::{InMemoryJobRepository, Job, JobLauncher, JobParameters};
+    ///
+    /// let launcher = JobLauncher::new(InMemoryJobRepository::default());
+    /// let mut job: Job<String> = Job::new("nightly", vec![]);
+    ///
+    /// let _ = launcher.run(&mut job, &JobParameters::new());
+    /// ```
+    ///
     /// # Errors
     ///
     /// - [`BatchError::JobInstanceAlreadyComplete`] if this instance has already
@@ -30,7 +48,7 @@ impl<R: JobRepository> JobLauncher<R> {
     ///   persisted as `Failed` *before* that error propagates.
     pub async fn run(
         &self,
-        job: &mut Job,
+        job: &mut Job<R::Tx>,
         parameters: &JobParameters,
     ) -> Result<JobExecution, BatchError> {
         let instance = self
@@ -87,7 +105,7 @@ mod tests {
         BookmarkReader, CollectingWriter, EvenDoubler, FailingStep, LogStep, SharedSink, VecReader,
         nz,
     };
-    use crate::{ChunkStep, InMemoryJobRepository, JobExecutionId, JobParameter};
+    use crate::{ChunkStep, InMemoryJobRepository, JobExecutionId, JobParameter, Unmanaged};
 
     fn params(date: &str) -> JobParameters {
         JobParameters::new().with("date", JobParameter::String(date.into()))
@@ -178,7 +196,7 @@ mod tests {
             "double-evens",
             VecReader::new(vec![1, 2, 3, 4]),
             EvenDoubler,
-            CollectingWriter::new(),
+            Unmanaged(CollectingWriter::new()),
             nz(2),
         );
         let mut job = Job::new("nightly", vec![Box::new(chunk_step)]);
@@ -411,7 +429,7 @@ mod tests {
                 "load",
                 BookmarkReader::new(vec![2, 4, 6, 8]),
                 EvenDoubler,
-                sink.writer(ok_writes),
+                Unmanaged(sink.writer(ok_writes)),
                 nz(2),
             ))],
         )
@@ -466,7 +484,7 @@ mod tests {
                 "load",
                 VecReader::new(vec![2, 4]),
                 EvenDoubler,
-                sink.writer(usize::MAX),
+                Unmanaged(sink.writer(usize::MAX)),
                 nz(2),
             )
         };

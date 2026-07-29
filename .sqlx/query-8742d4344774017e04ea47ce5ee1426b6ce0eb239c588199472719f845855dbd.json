@@ -1,0 +1,112 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT id, job_execution_id, step_name, status,\n                    read_count, write_count, filter_count, execution_context\n               FROM step_execution\n              WHERE job_execution_id = $1\n              ORDER BY id",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "step_execution",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "job_execution_id",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "step_execution",
+            "name": "job_execution_id"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "step_name",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "step_execution",
+            "name": "step_name"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "status",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "step_execution",
+            "name": "status"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "read_count",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "step_execution",
+            "name": "read_count"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "write_count",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "step_execution",
+            "name": "write_count"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "filter_count",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "step_execution",
+            "name": "filter_count"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "execution_context",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "step_execution",
+            "name": "execution_context"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "8742d4344774017e04ea47ce5ee1426b6ce0eb239c588199472719f845855dbd"
+}

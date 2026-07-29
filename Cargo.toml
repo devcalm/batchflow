@@ -20,3 +20,5 @@ thiserror = "2"
 tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sqlx = { version = "0.9", default-features = false }
+testcontainers-modules = "0.13"

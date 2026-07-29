@@ -1,0 +1,53 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT id, job_name, parameters\n               FROM job_instance\n              WHERE job_name = $1 AND parameters = $2",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "job_instance",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "job_name",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "job_instance",
+            "name": "job_name"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "parameters",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "job_instance",
+            "name": "parameters"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Jsonb"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "397ca0f8a631f6082d29681e1fee3d02fc2f11cc52363be74ce3d416d431b227"
+}

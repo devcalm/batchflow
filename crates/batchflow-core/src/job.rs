@@ -1,19 +1,68 @@
 use crate::BatchError;
-use crate::{BatchStatus, JobExecution, JobRepository, Step, StepContribution};
+use crate::{
+    BatchStatus, ExecutionContext, JobExecution, JobRepository, Step, StepCommit, StepContribution,
+    StepExecution,
+};
+use async_trait::async_trait;
 use std::marker::PhantomData;
 
-pub struct Job {
-    name: String,
-    steps: Vec<Box<dyn Step>>,
+/// Persists a step's committed work: folds the counters into its
+/// [`StepExecution`] and stores the bookmark, then writes the row.
+///
+/// Phase 11b makes this the owner of the step's transaction, so the items, the
+/// counters and the bookmark commit as one.
+struct RepositoryCommit<'a, R> {
+    repository: &'a R,
+    step_execution: &'a mut StepExecution,
 }
 
-impl Job {
+#[async_trait]
+impl<R: JobRepository> StepCommit<R::Tx> for RepositoryCommit<'_, R> {
+    async fn begin(&mut self) -> Result<R::Tx, BatchError> {
+        self.repository.begin().await
+    }
+
+    async fn commit(
+        &mut self,
+        mut tx: R::Tx,
+        contribution: &StepContribution,
+        context: &ExecutionContext,
+    ) -> Result<(), BatchError> {
+        // Folded into a copy, and only swapped in once the transaction has
+        // actually committed — so the in-memory counters can never claim work
+        // that rolled back.
+        let mut candidate = self.step_execution.clone();
+        candidate.apply(contribution);
+        candidate.set_execution_context(context.clone());
+
+        self.repository
+            .update_step_execution_in(&mut tx, &candidate)
+            .await?;
+        self.repository.commit(tx).await?;
+
+        *self.step_execution = candidate;
+        Ok(())
+    }
+
+    async fn rollback(&mut self, tx: R::Tx) -> Result<(), BatchError> {
+        self.repository.rollback(tx).await
+    }
+}
+
+/// `Tx` is the transaction type of the repository this job will run against,
+/// defaulting to `()` for jobs whose writers do not enlist.
+pub struct Job<Tx = ()> {
+    name: String,
+    steps: Vec<Box<dyn Step<Tx>>>,
+}
+
+impl<Tx> Job<Tx> {
     /// Start building a [`Job`] called `name`. Steps are boxed internally, so
     /// callers never write `Box::new`.
     ///
     /// ```
     /// use batchflow_core::async_trait;
-    /// use batchflow_core::{BatchError, ExecutionContext, Job, Step, StepContribution};
+    /// use batchflow_core::{BatchError, ExecutionContext, Job, Step, StepCommit};
     ///
     /// struct Cleanup;
     ///
@@ -23,10 +72,11 @@ impl Job {
     ///         "cleanup"
     ///     }
     ///
+    ///     // A tasklet has no chunks, so nothing to commit.
     ///     async fn run(
     ///         &mut self,
-    ///         _contribution: &mut StepContribution,
     ///         _context: &mut ExecutionContext,
+    ///         _commit: &mut dyn StepCommit,
     ///     ) -> Result<(), BatchError> {
     ///         Ok(())
     ///     }
@@ -48,7 +98,7 @@ impl Job {
     ///
     /// let job = Job::builder("nightly").build();
     /// ```
-    pub fn builder(name: impl Into<String>) -> JobBuilder<NoSteps> {
+    pub fn builder(name: impl Into<String>) -> JobBuilder<NoSteps, Tx> {
         JobBuilder {
             name: name.into(),
             steps: Vec::new(),
@@ -56,7 +106,7 @@ impl Job {
         }
     }
 
-    pub fn new(name: impl Into<String>, steps: Vec<Box<dyn Step>>) -> Self {
+    pub fn new(name: impl Into<String>, steps: Vec<Box<dyn Step<Tx>>>) -> Self {
         Self {
             name: name.into(),
             steps,
@@ -75,11 +125,15 @@ impl Job {
     ///
     /// The first failing step stops the job, after its own record is persisted
     /// as `Failed`.
-    pub async fn run<R: JobRepository>(
+    pub async fn run<R>(
         &mut self,
         job_execution: &JobExecution,
         repository: &R,
-    ) -> Result<(), BatchError> {
+    ) -> Result<(), BatchError>
+    where
+        R: JobRepository<Tx = Tx>,
+        Tx: Send,
+    {
         for step in &mut self.steps {
             // Must precede `create_step_execution`: mint first and this returns
             // *this* attempt's own record, so nothing is ever skipped and every
@@ -104,11 +158,17 @@ impl Job {
             step_execution.set_status(BatchStatus::Started);
             repository.update_step_execution(&step_execution).await?;
 
-            let mut contribution = StepContribution::new();
-            let outcome = step.run(&mut contribution, &mut context).await;
+            // Counters and bookmark are now persisted by the step at each of
+            // its commit points, not here — so a crash mid-step leaves the work
+            // that did commit recorded.
+            let outcome = {
+                let mut commit = RepositoryCommit {
+                    repository,
+                    step_execution: &mut step_execution,
+                };
+                step.run(&mut context, &mut commit).await
+            };
 
-            step_execution.apply(&contribution);
-            step_execution.set_execution_context(context);
             step_execution.set_status(if outcome.is_ok() {
                 BatchStatus::Completed
             } else {
@@ -135,14 +195,14 @@ pub struct NoSteps;
 #[derive(Debug)]
 pub struct HasSteps;
 
-pub struct JobBuilder<State = NoSteps> {
+pub struct JobBuilder<State = NoSteps, Tx = ()> {
     name: String,
-    steps: Vec<Box<dyn Step>>,
+    steps: Vec<Box<dyn Step<Tx>>>,
     _state: PhantomData<State>,
 }
 
-impl<State> JobBuilder<State> {
-    pub fn step<S: Step + 'static>(mut self, step: S) -> JobBuilder<HasSteps> {
+impl<State, Tx> JobBuilder<State, Tx> {
+    pub fn step<S: Step<Tx> + 'static>(mut self, step: S) -> JobBuilder<HasSteps, Tx> {
         self.steps.push(Box::new(step));
 
         JobBuilder {
@@ -153,8 +213,8 @@ impl<State> JobBuilder<State> {
     }
 }
 
-impl JobBuilder<HasSteps> {
-    pub fn build(self) -> Job {
+impl<Tx> JobBuilder<HasSteps, Tx> {
+    pub fn build(self) -> Job<Tx> {
         Job {
             name: self.name,
             steps: self.steps,
@@ -166,13 +226,14 @@ impl JobBuilder<HasSteps> {
 mod tests {
     use super::*;
     use crate::testing::{
-        BookmarkReader, CollectingWriter, EvenDoubler, FailingStep, FlakyWriter, LogStep, POSITION,
-        VecReader, nz,
+        BookmarkReader, CollectingWriter, CommitFails, EvenDoubler, FailingStep, FlakyWriter,
+        LogStep, POSITION, VecReader, nz,
     };
     use crate::{
         ChunkStep, InMemoryJobRepository, JobExecutionId, JobInstanceId, JobParameters,
-        JobRepository,
+        JobRepository, Unmanaged,
     };
+    use std::sync::{Arc, Mutex};
 
     /// A job execution to hang step executions off. Steps are stored by
     /// foreign key, so the parent row has to exist first.
@@ -194,7 +255,7 @@ mod tests {
             "double-evens",
             VecReader::new(vec![1, 2, 3, 4]),
             EvenDoubler,
-            CollectingWriter::new(),
+            Unmanaged(CollectingWriter::new()),
             nz(2),
         );
         let mut job = Job::new("test-name", vec![Box::new(chunk_step), Box::new(LogStep)]);
@@ -242,7 +303,7 @@ mod tests {
             "bookmarked",
             BookmarkReader::new(vec![2, 4, 6, 8]),
             EvenDoubler,
-            CollectingWriter::new(),
+            Unmanaged(CollectingWriter::new()),
             nz(2),
         );
         let mut job = Job::new("test-name", vec![Box::new(chunk_step)]);
@@ -267,7 +328,7 @@ mod tests {
             "bookmarked",
             BookmarkReader::new(vec![2, 4, 6, 8]),
             EvenDoubler,
-            FlakyWriter::new(1), // first chunk commits, second does not
+            Unmanaged(FlakyWriter::new(1)), // first chunk commits, second does not
             nz(2),
         );
         let mut job = Job::new("test-name", vec![Box::new(chunk_step)]);
@@ -294,7 +355,7 @@ mod tests {
             "bookmarked",
             BookmarkReader::new(vec![2, 4]),
             EvenDoubler,
-            CollectingWriter::new(),
+            Unmanaged(CollectingWriter::new()),
             nz(2),
         );
         let mut job = Job::new("test-name", vec![Box::new(chunk_step)]);
@@ -318,7 +379,7 @@ mod tests {
             "double-evens",
             VecReader::new(vec![1, 2, 3, 4]),
             EvenDoubler,
-            CollectingWriter::new(),
+            Unmanaged(CollectingWriter::new()),
             nz(2),
         );
 
@@ -336,6 +397,109 @@ mod tests {
 
         assert_eq!(names, ["double-evens", "log"]);
         assert_eq!(steps[0].read_count(), 4);
+    }
+
+    /// `(read_count, bookmark)` as persisted at some instant during a step.
+    type Snapshot = Option<(usize, Option<i64>)>;
+
+    /// Reports what the repository held while the second chunk was being
+    /// written — i.e. after the first chunk had fully committed, and before the
+    /// step returned.
+    struct ProbingWriter {
+        repository: Arc<InMemoryJobRepository>,
+        execution_id: JobExecutionId,
+        writes: usize,
+        seen: Arc<Mutex<Snapshot>>,
+    }
+
+    impl crate::ItemWriter for ProbingWriter {
+        type Item = u32;
+
+        async fn write(&mut self, _items: &[u32]) -> Result<(), BatchError> {
+            self.writes += 1;
+            if self.writes == 2 {
+                let steps = self.repository.step_executions(self.execution_id).await?;
+                *self.seen.lock().expect("probe poisoned") = steps.first().map(|step| {
+                    (
+                        step.read_count(),
+                        step.execution_context().get_long(POSITION).unwrap(),
+                    )
+                });
+            }
+            Ok(())
+        }
+    }
+
+    /// The crash case, and the reason persistence moved into the chunk loop:
+    /// a process killed mid-step never returns from `step.run`, so anything
+    /// persisted only afterwards is lost and the restart re-writes every item.
+    #[tokio::test]
+    async fn committed_work_is_durable_before_the_step_finishes() {
+        let repository = Arc::new(InMemoryJobRepository::default());
+        let instance = repository
+            .find_or_create_instance("test-name", &JobParameters::new())
+            .await
+            .unwrap();
+        let execution = repository.create_execution(instance.id()).await.unwrap();
+
+        let seen = Arc::new(Mutex::new(None));
+        let step = ChunkStep::new(
+            "load",
+            BookmarkReader::new(vec![2, 4, 6, 8]),
+            EvenDoubler,
+            Unmanaged(ProbingWriter {
+                repository: Arc::clone(&repository),
+                execution_id: execution.id(),
+                writes: 0,
+                seen: Arc::clone(&seen),
+            }),
+            nz(2),
+        );
+        let mut job = Job::new("test-name", vec![Box::new(step)]);
+
+        job.run(&execution, &*repository).await.unwrap();
+
+        // Two items read and a bookmark at 2 — the first chunk, already durable.
+        // Before this change the snapshot was `(0, None)`.
+        assert_eq!(*seen.lock().unwrap(), Some((2, Some(2))));
+    }
+
+    /// Counters and bookmark advance only once the transaction has committed.
+    /// Reversing those two lines in `RepositoryCommit::commit` is invisible to
+    /// every other test, because `InMemoryJobRepository` cannot fail a commit —
+    /// exactly the blind spot ADR-007 warned about.
+    #[tokio::test]
+    async fn a_failed_commit_does_not_advance_the_counters() {
+        let repository = CommitFails::new();
+        let instance = repository
+            .find_or_create_instance("test-name", &JobParameters::new())
+            .await
+            .unwrap();
+        let execution = repository.create_execution(instance.id()).await.unwrap();
+
+        let step = ChunkStep::new(
+            "load",
+            BookmarkReader::new(vec![2, 4]),
+            EvenDoubler,
+            Unmanaged(CollectingWriter::new()),
+            nz(2),
+        );
+        let mut job = Job::new("test-name", vec![Box::new(step)]);
+
+        assert!(job.run(&execution, &repository).await.is_err());
+
+        let steps = repository.step_executions(execution.id()).await.unwrap();
+
+        assert_eq!(steps[0].status(), BatchStatus::Failed);
+        assert_eq!(
+            steps[0].read_count(),
+            0,
+            "work whose commit failed must not be counted"
+        );
+        assert_eq!(
+            steps[0].execution_context().get_long(POSITION).unwrap(),
+            None
+        );
     }
 
     /// Positive control for the `compile_fail` doctest on [`Job::builder`],

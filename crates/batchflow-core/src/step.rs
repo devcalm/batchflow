@@ -1,5 +1,5 @@
 use crate::run_step;
-use crate::{BatchError, ExecutionContext, ItemProcessor, ItemReader, ItemWriter};
+use crate::{BatchError, ExecutionContext, ItemProcessor, ItemReader, TransactionalWriter};
 use async_trait::async_trait;
 use std::num::NonZeroUsize;
 
@@ -50,14 +50,37 @@ impl StepContribution {
     }
 }
 
+/// The step's transaction boundary. `commit` folds `contribution` into the
+/// persisted counters, stores `context` as the bookmark, and commits `tx` —
+/// so the chunk's data and its metadata become durable together.
+///
+/// A [`Step`] holds one of these instead of a repository: it is object-safe,
+/// which `JobRepository` is not, and it keeps persistence out of step code.
 #[async_trait]
-pub trait Step: Send {
+pub trait StepCommit<Tx = ()>: Send {
+    async fn begin(&mut self) -> Result<Tx, BatchError>;
+
+    async fn commit(
+        &mut self,
+        tx: Tx,
+        contribution: &StepContribution,
+        context: &ExecutionContext,
+    ) -> Result<(), BatchError>;
+
+    async fn rollback(&mut self, tx: Tx) -> Result<(), BatchError>;
+}
+
+#[async_trait]
+pub trait Step<Tx = ()>: Send {
     fn name(&self) -> &str;
 
+    /// Commit once per unit of work that has become durable. Anything not
+    /// committed before the process dies is lost, so a step that commits only
+    /// at the end is not restartable from a crash.
     async fn run(
         &mut self,
-        contribution: &mut StepContribution,
         context: &mut ExecutionContext,
+        commit: &mut dyn StepCommit<Tx>,
     ) -> Result<(), BatchError>;
 }
 
@@ -85,16 +108,23 @@ impl<R, P, W> ChunkStep<R, P, W> {
             chunk_size,
         }
     }
+
+    /// Inherent, so `step.name()` resolves without inferring `Tx` — the trait
+    /// method alone is ambiguous now that `Step` is generic.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
 }
 
 #[async_trait]
-impl<R, P, W> Step for ChunkStep<R, P, W>
+impl<R, P, W, Tx> Step<Tx> for ChunkStep<R, P, W>
 where
     R: ItemReader + Send,
     P: ItemProcessor<In = R::Item> + Send,
-    W: ItemWriter<Item = P::Out> + Send,
+    W: TransactionalWriter<Tx, Item = P::Out> + Send,
     R::Item: Send,
     P::Out: Send,
+    Tx: Send,
 {
     fn name(&self) -> &str {
         &self.name
@@ -102,16 +132,16 @@ where
 
     async fn run(
         &mut self,
-        contribution: &mut StepContribution,
         context: &mut ExecutionContext,
+        commit: &mut dyn StepCommit<Tx>,
     ) -> Result<(), BatchError> {
         run_step(
             &mut self.reader,
             &mut self.processor,
             &mut self.writer,
             self.chunk_size,
-            contribution,
             context,
+            commit,
         )
         .await
     }
@@ -120,7 +150,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::{CollectingWriter, EvenDoubler, VecReader, nz};
+    use crate::Unmanaged;
+    use crate::testing::{CollectingWriter, EvenDoubler, RecordingCommit, VecReader, nz};
 
     #[test]
     fn increments_accumulate() {
@@ -163,18 +194,21 @@ mod tests {
             "double-evens",
             VecReader::new(vec![1, 2, 3, 4, 5, 6]),
             EvenDoubler,
-            CollectingWriter::new(),
+            Unmanaged(CollectingWriter::new()),
             nz(2),
         );
 
         assert_eq!(step.name(), "double-evens");
 
-        let mut contribution = StepContribution::new();
         let mut context = ExecutionContext::new();
-        step.run(&mut contribution, &mut context).await.unwrap();
+        let mut commit = RecordingCommit::new();
+        step.run(&mut context, &mut commit).await.unwrap();
 
-        assert_eq!(contribution.read_count(), 6);
-        assert_eq!(contribution.write_count(), 3);
-        assert_eq!(contribution.filter_count(), 3);
+        assert_eq!(commit.total.read_count(), 6);
+        assert_eq!(commit.total.write_count(), 3);
+        assert_eq!(commit.total.filter_count(), 3);
+
+        // chunk_size 2 over 6 items: the step commits three times, not once.
+        assert_eq!(commit.commits, 3);
     }
 }

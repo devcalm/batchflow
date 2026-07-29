@@ -1,0 +1,53 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO job_instance (job_name, parameters)\n                  VALUES ($1, $2)\n             ON CONFLICT ON CONSTRAINT job_instance_identity\n             DO UPDATE SET job_name = EXCLUDED.job_name\n               RETURNING id, job_name, parameters",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "job_instance",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "job_name",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "job_instance",
+            "name": "job_name"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "parameters",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "job_instance",
+            "name": "parameters"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Jsonb"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "23bf4d934bf70cfc45b3b2ac3c99a51267c58487a5973b9153a80d213485447e"
+}

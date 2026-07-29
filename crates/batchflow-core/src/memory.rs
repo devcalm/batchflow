@@ -22,6 +22,31 @@ struct Inner {
 }
 
 impl JobRepository for InMemoryJobRepository {
+    /// No transactions: this store cannot roll back, so a writer enlisted here
+    /// gets at-least-once. Per ADR-007 the abstraction is validated against
+    /// Postgres, never against this.
+    type Tx = ();
+
+    async fn begin(&self) -> Result<(), BatchError> {
+        Ok(())
+    }
+
+    async fn commit(&self, _tx: ()) -> Result<(), BatchError> {
+        Ok(())
+    }
+
+    async fn rollback(&self, _tx: ()) -> Result<(), BatchError> {
+        Ok(())
+    }
+
+    async fn update_step_execution_in(
+        &self,
+        _tx: &mut (),
+        step_execution: &StepExecution,
+    ) -> Result<(), BatchError> {
+        self.update_step_execution(step_execution).await
+    }
+
     async fn find_or_create_instance(
         &self,
         job_name: &str,
