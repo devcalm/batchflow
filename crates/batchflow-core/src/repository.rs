@@ -32,10 +32,22 @@ pub trait JobRepository: Send + Sync {
         instance_id: JobInstanceId,
     ) -> impl Future<Output = Result<Option<JobExecution>, BatchError>> + Send;
 
-    /// Mint a [`StepExecution`] for `step_name` under `job_execution_id`.
+    /// Mark `execution_id` as [`BatchStatus::Abandoned`](crate::BatchStatus),
+    /// releasing its `JobInstance` so it can be launched again.
     ///
-    /// Only the repository can assign a `StepExecutionId`, which is why a
-    /// `Step` reports a `StepContribution` instead of building one of these.
+    /// An operator action: it asserts the process is dead, which the repository
+    /// cannot verify.
+    ///
+    /// # Errors
+    ///
+    /// - [`BatchError::CannotAbandon`] if the execution is `Completed`.
+    /// - [`BatchError::Repository`] if `execution_id` is unknown.
+    fn abandon_execution(
+        &self,
+        execution_id: JobExecutionId,
+    ) -> impl Future<Output = Result<(), BatchError>> + Send;
+
+    /// Mint a [`StepExecution`] for `step_name` under `job_execution_id`.
     fn create_step_execution(
         &self,
         job_execution_id: JobExecutionId,
@@ -47,9 +59,20 @@ pub trait JobRepository: Send + Sync {
         step_execution: &StepExecution,
     ) -> impl Future<Output = Result<(), BatchError>> + Send;
 
+    /// The most recent execution of `step_name` under any attempt at
+    /// `instance_id`, or `None` if this step has never run for that instance.
+    ///
+    /// Callers must resolve this **before** minting the current attempt's
+    /// record with [`create_step_execution`](Self::create_step_execution), or
+    /// the answer is that record: `Starting`, with an empty context.
+    fn last_step_execution(
+        &self,
+        instance_id: JobInstanceId,
+        step_name: &str,
+    ) -> impl Future<Output = Result<Option<StepExecution>, BatchError>> + Send;
+
     /// Every step execution under `job_execution_id`, in the order the steps
-    /// ran. Phase 9's restart reads this to decide which steps to skip, so the
-    /// ordering is part of the contract, not an accident of storage.
+    /// ran. A restart lists only the steps it did not skip.
     fn step_executions(
         &self,
         job_execution_id: JobExecutionId,

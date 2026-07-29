@@ -17,6 +17,9 @@ mod repository;
 #[cfg(test)]
 mod testing;
 
+/// Re-exported so implementing [`Step`] needs no direct `async-trait` dependency.
+pub use async_trait::async_trait;
+
 pub use chunk::{process_chunk, read_chunk, run_step};
 pub use context::{ContextValue, ExecutionContext};
 pub use error::BatchError;

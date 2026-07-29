@@ -75,10 +75,10 @@ where
             break;
         }
         let read = chunk.len();
-        
+
         let mut chunk_contribution = process_chunk(processor, writer, chunk).await?;
         chunk_contribution.increment_read(read);
-        
+
         contribution.apply(&chunk_contribution);
         reader.update(context);
     }

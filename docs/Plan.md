@@ -89,11 +89,30 @@
 
 **Left for Phase 9:** `Job::run` still passes each step a *fresh* context. Substituting the previous attempt's context is the change that turns a re-run into a resume. Nothing populates `JobExecution::execution_context` yet — the field exists for cross-step data.
 
-## Phase 9 — Restart Support ☐
-- **Goals:** resume a failed JobExecution; skip completed steps; reader seeks from bookmark.
+## Phase 9 — Restart Support ☑
+> **9a ☑** the running-execution gate + its escape hatch. `JobRepository::abandon_execution`; `BatchError::JobExecutionAlreadyRunning` / `CannotAbandon`; the launcher gate is now an exhaustive `match` over `BatchStatus`.
+> **9b ☑** the resume. `JobRepository::last_step_execution(instance_id, step_name)`; `Job::run` takes `&JobExecution` and, per step, skips a previously `Completed` one (FR-5.1) or seeds its context from the last attempt's bookmark (FR-5.2, FR-5.3).
+
+- **Goals:** ☑ resume a failed JobExecution; ☑ skip completed steps; ☑ reader seeks from bookmark.
 - **Learning:** why atomicity (Phase 7) makes restart safe; no duplicate items.
-- **Tasks:** restart path in engine (skip steps whose previous `StepExecution` is `Completed`, read via `JobRepository::step_executions`); status checks; reader open-from-context; **`abandon_execution` on `JobRepository` + the `Starting`/`Started` gate that depends on it** (see debt (1) below — the guard and its escape hatch ship together or a crash becomes unrecoverable).
-- **Acceptance:** kill at row 4000 → restart resumes, no dupes. **Testing:** failure-injection + restart tests. **Docs:** restart guide.
+- **Tasks:** ☑ restart path in engine · ☑ reader open-from-context · ☑ **`abandon_execution` + the `Starting`/`Started` gate**, shipped together.
+- **Acceptance:** ☑ fail mid-step → restart resumes, no dupes (`a_restart_resumes_from_the_bookmark_without_duplicating`). **Testing:** ☑ failure-injection + restart tests. **Docs:** ☐ restart guide (Phase 18).
+
+**9b design decisions (2026-07-29):**
+- **The lookup is keyed on the `JobInstance`, not the `JobExecution`** — `last_step_execution(instance_id, step_name)`. That is the question restart asks ("has this step ever succeeded for this unit of work?"), and the attempt that succeeded is by definition a *different* execution from the one asking. Phase 11 renders it as a two-table join with `ORDER BY id DESC LIMIT 1`. Mutation-tested: dropping the instance predicate fails `a_bookmark_does_not_leak_across_instances`.
+- **`Job::run` widened from `JobExecutionId` to `&JobExecution`.** 7c-2 chose the narrow parameter on the grounds that "a parameter is easier to widen than to narrow" — this is that bill coming due, and it was cheap exactly as predicted. The execution is what knows its instance.
+- **A skipped step gets no `StepExecution` on the new attempt.** The record of that work belongs to the attempt that did it; a second `Completed` row for work that did not happen would make counters lie about where reads and writes occurred. Documented consequence: `step_executions(execution_id)` on a restart lists only the steps that ran, so "what did this job do overall?" is a question about the *instance*.
+- **The lookup must precede `create_step_execution`.** Mint first and the query returns this attempt's own record — `Starting`, empty context — so nothing is ever skipped and every reader silently restarts from zero, while the job still reports success. Mutation-tested: reordering fails both restart tests. The requirement is stated in `last_step_execution`'s rustdoc rather than enforced by types; a stronger design would be a lookup that excludes the current execution id (worth revisiting in Phase 11).
+- **Restart is not a mode.** A fresh run is the same code path with every lookup returning `None`. There is no `if restarting` branch anywhere, which is why `a_first_run_starts_every_step_from_an_empty_context` matters.
+- **`SharedSink` test double.** Restart tests must observe writes across *both* attempts, and each attempt builds a fresh `ChunkStep` (as a restarted process does), so a step-owned writer takes its evidence with it — two runs each writing `[4, 8]` into private buffers look identical to one correct run. Duplicates are only visible in a destination that outlives the step.
+
+**9a design decisions (2026-07-29):**
+- **`Completed` cannot be abandoned; `Starting`/`Started` can.** `abandon_execution` writes to exactly the field the FR-4.4 gate reads, so permitting it on a `Completed` execution would make an already-run instance relaunchable in two calls. **This diverges from Spring deliberately in the other direction:** Spring's `SimpleJobOperator.abandon` refuses anything "less than STOPPING", which includes `STARTED` — so a `SIGKILL`ed Spring job is stranded and the documented remedy is hand-editing `BATCH_JOB_EXECUTION` with SQL. Allowing it here is the whole point of the escape hatch.
+- **The cost of that divergence is honesty in the rustdoc.** With no timestamps and no heartbeat (Phase 12), the repository cannot tell "crashed" from "still running", so `abandon_execution` is documented as an *operator assertion* that the process is dead. A framework that guessed here would run two copies of a billing job.
+- **`abandon_execution` takes an id, not a `&JobExecution`.** Given the struct, it would decide a safety question from a `status` the caller may have read minutes ago. The id forces it to read the current one — and read, check and write all happen under one `lock()`, or the check is not a check.
+- **The gate is an exhaustive `match`, never `_ => {}`.** `BatchStatus` is `#[non_exhaustive]` for *other* crates, but inside the defining crate a new variant now stops the build at that line and forces a decision. Verified: deleting one arm yields `E0004`.
+- **Narrow error variant over a general one.** `CannotAbandon { execution_id, status }` rather than `IllegalStatusTransition { from, to }` — there is exactly one status rule today, and generalising from one example guesses at what Phase 10 needs. Merge when a second real case appears.
+- **The ordering requirement became self-enforcing.** Create-then-check used to merely litter the store; with the `Starting` arm in place the launcher now rejects *its own* freshly-created execution (it is the most recent, and it is `Starting`). Mutation-tested: reordering fails 9 tests, not 1.
 
 ## Phase 10 — Retry ☐
 - **Goals:** retry classified transient errors w/ backoff (backon); optional chunk-scanning.
@@ -138,11 +157,14 @@
 ---
 
 ## Cross-cutting quality gate (every phase)
-`cargo fmt` · `cargo clippy -- -D warnings` · `cargo test` (+ doctests) · examples compile · no dead code · no needless clone/alloc.
+`cargo fmt --check` · `cargo clippy --workspace --all-targets -- -D warnings` · `cargo test --workspace` · examples compile · no dead code · no needless clone/alloc.
+**Read the `Doc-tests batchflow_core` count, do not just read the unit count** — see debt (6). A doctest can disappear without anything going red.
 
-## Current position (2026-07-28)
-Phase 0 ◐ docs (tech-eval open items) · 1 ☑ workspace · 2 ☑ traits · 3 ☑ Job + typestate `JobBuilder` · 4 ◐ step model (tasklet trait pending) · 5 ☑ engine · 6 ◐ chunk processing (property tests/tuning guide pending) · 7 ☑ JobRepository · **8 ☑ ExecutionContext**.
-`batchflow-core` modules: `chunk`/`error`/`execution`/`item`/`job`/`launcher`/`memory`/`repository`/`step` + `#[cfg(test)] testing`, with `lib.rs` as a pure re-export surface (private `mod` + flat `pub use`, so module layout stays refactorable). **42 tests green**, clippy `-D warnings` clean, `cargo fmt` clean.
+## Current position (2026-07-29)
+Phase 0 ◐ docs (tech-eval open items) · 1 ☑ workspace · 2 ☑ traits · 3 ☑ Job + typestate `JobBuilder` · 4 ◐ step model (tasklet trait pending) · 5 ☑ engine · 6 ◐ chunk processing (property tests/tuning guide pending) · 7 ☑ JobRepository · 8 ☑ ExecutionContext · **9 ☑ restart**.
+`batchflow-core` modules: `chunk`/`context`/`error`/`execution`/`item`/`job`/`launcher`/`memory`/`repository`/`step` + `#[cfg(test)] testing`, with `lib.rs` as a pure re-export surface (private `mod` + flat `pub use`, so module layout stays refactorable). **70 unit tests + 2 doctests green**, clippy `--all-targets -D warnings` clean, `cargo fmt --check` clean.
+
+**US-2 now holds end to end:** a job that dies mid-step is relaunched against the same `JobInstance`, skips the steps that completed, opens its reader at the last committed chunk, and writes no item twice.
 
 A job now runs end to end through metadata: `JobLauncher::run` resolves a `JobInstance` from `(job_name, JobParameters)`, refuses a completed one (FR-4.4), opens a `JobExecution`, and `Job::run` persists a counted `StepExecution` per step — all reloadable from the repository alone.
 
@@ -151,11 +173,12 @@ A job now runs end to end through metadata: `JobLauncher::run` resolves a `JobIn
 **Debt closed in Phase 7:** ~~`filter_count` derived as `read - written`~~ — now counted at the processor's `None` arm, so the underflow panic is gone. ~~`Step` has no name/identity~~ — `Step::name()` plus a persisted `StepExecution` per step.
 
 **Known debt, deliberately deferred:**
-1. `Starting`/`Started` still passes the FR-4.4 gate. Rejecting it needs `JobRepository::abandon_execution` **in the same change** — a guard with no escape hatch turns a recoverable crash into a permanently unlaunchable instance. Both in Phase 9.
-2. `JobLauncher::run` resolves the instance and reads its last execution under **separate lock acquisitions**, so two processes can both pass the gate. Closed by a real transaction in Phase 11.
+1. ~~`Starting`/`Started` still passes the FR-4.4 gate.~~ **Closed in 9a** — rejected, with `abandon_execution` shipped in the same change.
+2. `JobLauncher::run` resolves the instance and reads its last execution under **separate lock acquisitions**, so two processes can both pass the gate. Closed by a real transaction in Phase 11. *(9a narrowed the window but did not close it: the gate now rejects a concurrent `Starting`, so the loser of the race is far likelier to be caught — but two callers can still both read "no execution" and both create one.)*
 3. A failing `update_execution` masks the job's original error (`launcher.rs`). Real systems log the cause before propagating — Phase 13.
-4. Library-craft gap: no `#![warn(missing_docs)]`, `Job`/`ChunkStep` lack `Debug` (API guideline C-DEBUG). (Doctests are no longer zero — `Job::builder` has two, one of them `compile_fail`.)
-   Related: implementing `Step` requires the caller to depend on `async-trait` directly, since the trait is `#[async_trait]`. Either re-export the macro or document the dependency before 0.1.0.
+4. Library-craft gap: no `#![warn(missing_docs)]`, `Job`/`ChunkStep` lack `Debug` (API guideline C-DEBUG).
+   ~~Implementing `Step` requires the caller to depend on `async-trait` directly.~~ **Closed in 9a** by `pub use async_trait::async_trait;` in `lib.rs`. Worth recording *how* it was found: the `Job::builder` doctest could not be written without it. Doctests compile as an external crate — they see the crate plus its **dev-dependencies**, not its normal dependencies — so they are the only tests that stand where a user stands. Unit tests structurally cannot feel this class of bug.
 5. `read_chunk`/`process_chunk`/`run_step` are `pub` without a deliberate SemVer decision — and `run_step`'s signature changed in 7c-2, which is exactly the kind of break that decision governs. Settle it before 0.1.0.
+6. **Doc-comment tests have no build-time protection against deletion.** The `Job::builder` `compile_fail` block has now been stripped along with its surrounding rustdoc **twice** (most recently by commit `9659a37`, which also deleted `Job::run`'s docs and left `Plan.md` claiming doctests existed when the count was 0). Nothing fails when it vanishes. Mitigation for now: the block says in its own text that it is a test, and the `Doc-tests` count in `cargo test` output is part of the quality gate below.
 
-**Next milestone: Phase 8 — `ExecutionContext`.** Phase 7 gives restart its identity and its per-step status; Phase 8 gives it the bookmark, and Phase 9 joins them. Phase 10 (retry/skip via a `Classifier`) is the alternative branch, but restart is the deeper capability and everything for it is now in place.
+**Next milestone: Phase 10 — retry/skip via a `Classifier`.** FR-5 is closed, so the remaining fault-tolerance gap is *within* a step rather than between attempts: today any error fails the whole step, and a single poison row costs a full restart cycle. Phase 11 (real transactions) is the alternative branch and is what makes the chunk-loop guarantees real rather than structural — ADR-007's `TransactionalWriter` has been waiting on it since Phase 7, and note that everything restart currently promises is validated only against an in-memory fake.

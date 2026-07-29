@@ -76,7 +76,6 @@ impl StepExecutionId {
     }
 }
 
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JobInstance {
     id: JobInstanceId,

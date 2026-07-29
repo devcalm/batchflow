@@ -1,7 +1,7 @@
 use crate::repository::JobRepository;
 use crate::{
-    BatchError, JobExecution, JobExecutionId, JobInstance, JobInstanceId, JobParameters,
-    StepExecution, StepExecutionId,
+    BatchError, BatchStatus, JobExecution, JobExecutionId, JobInstance, JobInstanceId,
+    JobParameters, StepExecution, StepExecutionId,
 };
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -126,6 +126,30 @@ impl JobRepository for InMemoryJobRepository {
             .cloned())
     }
 
+    async fn abandon_execution(&self, execution_id: JobExecutionId) -> Result<(), BatchError> {
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|e| BatchError::Repository(e.to_string()))?;
+
+        match inner.executions.iter_mut().find(|e| e.id() == execution_id) {
+            Some(slot) => {
+                if slot.status() == BatchStatus::Completed {
+                    return Err(BatchError::CannotAbandon {
+                        execution_id,
+                        status: slot.status(),
+                    });
+                }
+
+                slot.set_status(BatchStatus::Abandoned);
+                Ok(())
+            }
+            None => Err(BatchError::Repository(format!(
+                "unknown execution {execution_id:?}"
+            ))),
+        }
+    }
+
     async fn create_step_execution(
         &self,
         job_execution_id: JobExecutionId,
@@ -175,6 +199,32 @@ impl JobRepository for InMemoryJobRepository {
                 step_execution.id()
             ))),
         }
+    }
+
+    async fn last_step_execution(
+        &self,
+        instance_id: JobInstanceId,
+        step_name: &str,
+    ) -> Result<Option<StepExecution>, BatchError> {
+        let inner = self
+            .inner
+            .lock()
+            .map_err(|e| BatchError::Repository(e.to_string()))?;
+
+        // `.rev()`: step executions are ordered by insertion, so the last match
+        // is the most recent attempt.
+        Ok(inner
+            .step_executions
+            .iter()
+            .rev()
+            .find(|step| {
+                step.step_name() == step_name
+                    && inner.executions.iter().any(|execution| {
+                        execution.id() == step.job_execution_id()
+                            && execution.instance_id() == instance_id
+                    })
+            })
+            .cloned())
     }
 
     async fn step_executions(

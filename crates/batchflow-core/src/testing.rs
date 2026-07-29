@@ -10,6 +10,7 @@ use crate::{
 };
 use async_trait::async_trait;
 use std::num::NonZeroUsize;
+use std::sync::{Arc, Mutex};
 
 /// Shorthand for a chunk-size literal. A zero here is a bug in the test itself,
 /// so panicking is the right response.
@@ -182,6 +183,55 @@ impl ItemWriter for FlakyWriter {
         }
         self.ok_writes -= 1;
         self.written.extend_from_slice(items);
+        Ok(())
+    }
+}
+
+/// A write destination that outlives the step writing to it, so a restart test
+/// can see everything written across both attempts. A step-owned writer would
+/// drop its evidence, making a duplicated item invisible.
+#[derive(Clone, Default)]
+pub(crate) struct SharedSink(Arc<Mutex<Vec<u32>>>);
+
+impl SharedSink {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    /// A writer onto this sink that succeeds `ok_writes` times, then fails.
+    pub(crate) fn writer(&self, ok_writes: usize) -> SharedWriter {
+        SharedWriter {
+            sink: Arc::clone(&self.0),
+            ok_writes,
+        }
+    }
+
+    pub(crate) fn written(&self) -> Vec<u32> {
+        self.0.lock().expect("sink poisoned").clone()
+    }
+}
+
+pub(crate) struct SharedWriter {
+    sink: Arc<Mutex<Vec<u32>>>,
+    ok_writes: usize,
+}
+
+impl ItemWriter for SharedWriter {
+    type Item = u32;
+
+    async fn write(&mut self, items: &[u32]) -> Result<(), BatchError> {
+        if self.ok_writes == 0 {
+            return Err(BatchError::Write("boom".into()));
+        }
+        self.ok_writes -= 1;
+
+        // Guard created and dropped in one statement: holding it across an
+        // `.await` would make the future `!Send`.
+        self.sink
+            .lock()
+            .expect("sink poisoned")
+            .extend_from_slice(items);
+
         Ok(())
     }
 }

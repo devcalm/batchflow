@@ -1,5 +1,5 @@
 use crate::BatchError;
-use crate::{BatchStatus, ExecutionContext, JobExecutionId, JobRepository, Step, StepContribution};
+use crate::{BatchStatus, JobExecution, JobRepository, Step, StepContribution};
 use std::marker::PhantomData;
 
 pub struct Job {
@@ -8,7 +8,46 @@ pub struct Job {
 }
 
 impl Job {
-
+    /// Start building a [`Job`] called `name`. Steps are boxed internally, so
+    /// callers never write `Box::new`.
+    ///
+    /// ```
+    /// use batchflow_core::async_trait;
+    /// use batchflow_core::{BatchError, ExecutionContext, Job, Step, StepContribution};
+    ///
+    /// struct Cleanup;
+    ///
+    /// #[async_trait]
+    /// impl Step for Cleanup {
+    ///     fn name(&self) -> &str {
+    ///         "cleanup"
+    ///     }
+    ///
+    ///     async fn run(
+    ///         &mut self,
+    ///         _contribution: &mut StepContribution,
+    ///         _context: &mut ExecutionContext,
+    ///     ) -> Result<(), BatchError> {
+    ///         Ok(())
+    ///     }
+    /// }
+    ///
+    /// let job = Job::builder("nightly").step(Cleanup).build();
+    /// assert_eq!(job.name(), "nightly");
+    /// ```
+    ///
+    /// [`build`](JobBuilder::build) is defined only on `JobBuilder<HasSteps>`,
+    /// so a job with no steps is a compile error. The builder changes type on
+    /// the first `.step(..)` and so cannot be driven from a loop; [`Job::new`]
+    /// is the dynamic escape hatch.
+    ///
+    /// **The block below is a test** — the only check on the typestate.
+    ///
+    /// ```compile_fail
+    /// use batchflow_core::Job;
+    ///
+    /// let job = Job::builder("nightly").build();
+    /// ```
     pub fn builder(name: impl Into<String>) -> JobBuilder<NoSteps> {
         JobBuilder {
             name: name.into(),
@@ -24,23 +63,50 @@ impl Job {
         }
     }
 
+    /// Run every step in order under `job_execution`, persisting a
+    /// [`StepExecution`](crate::StepExecution) for each one that runs.
+    ///
+    /// Restart (FR-5): each step looks up the previous attempt at this
+    /// *instance* by step name. A `Completed` one is skipped and gets no record
+    /// on this attempt; otherwise this attempt's
+    /// [`ExecutionContext`](crate::ExecutionContext) is seeded from the
+    /// bookmark it left, so the reader resumes at the last committed chunk. On
+    /// a fresh run every lookup returns `None`.
+    ///
+    /// The first failing step stops the job, after its own record is persisted
+    /// as `Failed`.
     pub async fn run<R: JobRepository>(
         &mut self,
-        job_execution_id: JobExecutionId,
+        job_execution: &JobExecution,
         repository: &R,
     ) -> Result<(), BatchError> {
         for step in &mut self.steps {
+            // Must precede `create_step_execution`: mint first and this returns
+            // *this* attempt's own record, so nothing is ever skipped and every
+            // reader restarts from zero.
+            let previous = repository
+                .last_step_execution(job_execution.instance_id(), step.name())
+                .await?;
+
+            if let Some(previous) = &previous
+                && previous.status() == BatchStatus::Completed
+            {
+                continue;
+            }
+
+            let mut context = previous
+                .map(|previous| previous.execution_context().clone())
+                .unwrap_or_default();
+
             let mut step_execution = repository
-                .create_step_execution(job_execution_id, step.name())
+                .create_step_execution(job_execution.id(), step.name())
                 .await?;
             step_execution.set_status(BatchStatus::Started);
             repository.update_step_execution(&step_execution).await?;
 
             let mut contribution = StepContribution::new();
-            
-            let mut context = ExecutionContext::new();
             let outcome = step.run(&mut contribution, &mut context).await;
-            
+
             step_execution.apply(&contribution);
             step_execution.set_execution_context(context);
             step_execution.set_status(if outcome.is_ok() {
@@ -103,7 +169,10 @@ mod tests {
         BookmarkReader, CollectingWriter, EvenDoubler, FailingStep, FlakyWriter, LogStep, POSITION,
         VecReader, nz,
     };
-    use crate::{ChunkStep, InMemoryJobRepository, JobExecution, JobParameters};
+    use crate::{
+        ChunkStep, InMemoryJobRepository, JobExecutionId, JobInstanceId, JobParameters,
+        JobRepository,
+    };
 
     /// A job execution to hang step executions off. Steps are stored by
     /// foreign key, so the parent row has to exist first.
@@ -130,7 +199,7 @@ mod tests {
         );
         let mut job = Job::new("test-name", vec![Box::new(chunk_step), Box::new(LogStep)]);
 
-        job.run(execution.id(), &repository).await.unwrap();
+        job.run(&execution, &repository).await.unwrap();
 
         let steps = repository.step_executions(execution.id()).await.unwrap();
 
@@ -155,7 +224,7 @@ mod tests {
 
         let mut job = Job::new("test-name", vec![Box::new(FailingStep), Box::new(LogStep)]);
 
-        assert!(job.run(execution.id(), &repository).await.is_err());
+        assert!(job.run(&execution, &repository).await.is_err());
 
         let steps = repository.step_executions(execution.id()).await.unwrap();
 
@@ -178,7 +247,7 @@ mod tests {
         );
         let mut job = Job::new("test-name", vec![Box::new(chunk_step)]);
 
-        job.run(execution.id(), &repository).await.unwrap();
+        job.run(&execution, &repository).await.unwrap();
 
         let steps = repository.step_executions(execution.id()).await.unwrap();
 
@@ -188,9 +257,7 @@ mod tests {
         );
     }
 
-    /// The bookmark matters *more* on failure than on success: it is the only
-    /// reason a restart can skip the chunks that did commit. A step recorded as
-    /// `Failed` with an empty context would force a full re-run.
+    /// The bookmark matters more on failure: it is what a restart resumes from.
     #[tokio::test]
     async fn a_failing_step_still_persists_its_bookmark() {
         let repository = InMemoryJobRepository::default();
@@ -205,7 +272,7 @@ mod tests {
         );
         let mut job = Job::new("test-name", vec![Box::new(chunk_step)]);
 
-        assert!(job.run(execution.id(), &repository).await.is_err());
+        assert!(job.run(&execution, &repository).await.is_err());
 
         let steps = repository.step_executions(execution.id()).await.unwrap();
 
@@ -214,6 +281,31 @@ mod tests {
         assert_eq!(
             steps[0].execution_context().get_long(POSITION).unwrap(),
             Some(2)
+        );
+    }
+
+    /// The restart machinery must not change the fresh-run path.
+    #[tokio::test]
+    async fn a_first_run_starts_every_step_from_an_empty_context() {
+        let repository = InMemoryJobRepository::default();
+        let execution = open_execution(&repository).await;
+
+        let chunk_step = ChunkStep::new(
+            "bookmarked",
+            BookmarkReader::new(vec![2, 4]),
+            EvenDoubler,
+            CollectingWriter::new(),
+            nz(2),
+        );
+        let mut job = Job::new("test-name", vec![Box::new(chunk_step)]);
+
+        job.run(&execution, &repository).await.unwrap();
+
+        let steps = repository.step_executions(execution.id()).await.unwrap();
+        assert_eq!(
+            steps[0].read_count(),
+            2,
+            "nothing may be skipped on a first run"
         );
     }
 
@@ -230,8 +322,6 @@ mod tests {
             nz(2),
         );
 
-        // No `Box::new` at the call site — that is the ergonomic win over
-        // `Job::new`, and it is why `step` takes `S: Step + 'static` by value.
         let mut job = Job::builder("test-name")
             .step(chunk_step)
             .step(LogStep)
@@ -239,7 +329,7 @@ mod tests {
 
         assert_eq!(job.name(), "test-name");
 
-        job.run(execution.id(), &repository).await.unwrap();
+        job.run(&execution, &repository).await.unwrap();
 
         let steps = repository.step_executions(execution.id()).await.unwrap();
         let names: Vec<&str> = steps.iter().map(|s| s.step_name()).collect();
@@ -248,12 +338,8 @@ mod tests {
         assert_eq!(steps[0].read_count(), 4);
     }
 
-    /// The positive control for the `compile_fail` doctest on [`Job::builder`].
-    ///
-    /// A `compile_fail` doctest passes when its snippet fails to compile for
-    /// *any* reason — a typo would satisfy it just as well as the typestate. So
-    /// this asserts the same chain compiles once a step is added; the doctest
-    /// then only has one remaining explanation for failing.
+    /// Positive control for the `compile_fail` doctest on [`Job::builder`],
+    /// which would otherwise pass on any compile error, including a typo.
     #[test]
     fn build_is_reachable_once_a_step_has_been_added() {
         let job = Job::builder("test-name").step(LogStep).build();
@@ -267,7 +353,8 @@ mod tests {
 
         let repository = InMemoryJobRepository::default();
         let mut job = Job::new("test-name", vec![]);
+        let execution = JobExecution::new(JobExecutionId::new(1), JobInstanceId::new(1));
 
-        assert_send(job.run(JobExecutionId::new(1), &repository));
+        assert_send(job.run(&execution, &repository));
     }
 }
