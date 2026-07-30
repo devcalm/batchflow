@@ -3,7 +3,8 @@
 
 use batchflow_core::{
     BatchError, BatchStatus, ChunkStep, ContextValue, ExecutionContext, ItemProcessor, ItemReader,
-    Job, JobLauncher, JobParameter, JobParameters, JobRepository, TransactionalWriter,
+    Job, JobLauncher, JobParameter, JobParameters, JobRepository, StepContribution,
+    TransactionalWriter,
 };
 use batchflow_postgres::PostgresJobRepository;
 use sqlx::{PgPool, Postgres, Transaction};
@@ -59,7 +60,7 @@ impl ItemReader for Rows {
     async fn open(&mut self, context: &ExecutionContext) -> Result<(), BatchError> {
         if let Some(position) = context.get_long(POSITION)? {
             self.pos = usize::try_from(position)
-                .map_err(|_| BatchError::Read(format!("negative bookmark {position}")))?;
+                .map_err(|_| BatchError::read(format!("negative bookmark {position}")))?;
         }
         Ok(())
     }
@@ -97,12 +98,12 @@ impl TransactionalWriter<PgTx> for ItemTable {
                 .bind(item)
                 .execute(&mut **tx)
                 .await
-                .map_err(|e| BatchError::Write(e.to_string()))?;
+                .map_err(BatchError::write)?;
         }
 
         self.writes += 1;
         if self.writes > self.ok_writes {
-            return Err(BatchError::Write("boom".into()));
+            return Err(BatchError::write("boom"));
         }
         Ok(())
     }
@@ -355,4 +356,74 @@ async fn step_execution_ordering_and_scoping_match_the_contract() {
 async fn migrations_are_idempotent() {
     let (_container, repository) = start().await;
     repository.migrate().await.unwrap();
+}
+
+/// FR-6.2: `skip_count` survives a round trip through the database.
+///
+/// The column arrived in migration 0002, so this also proves the migration
+/// applies on top of 0001 rather than only in a freshly-created schema.
+#[tokio::test]
+async fn skip_count_round_trips_through_the_database() {
+    let (_container, repository) = start().await;
+
+    let instance = repository
+        .find_or_create_instance("nightly", &params("2026-07-29"))
+        .await
+        .unwrap();
+    let execution = repository.create_execution(instance.id()).await.unwrap();
+    let mut step = repository
+        .create_step_execution(execution.id(), "load")
+        .await
+        .unwrap();
+
+    // A fresh row must read back as zero, not as NULL or a default that the
+    // engine would fold into a wrong total.
+    assert_eq!(step.skip_count(), 0);
+
+    let mut contribution = StepContribution::new();
+    contribution.increment_read(10);
+    contribution.increment_write(7);
+    contribution.increment_filter(1);
+    contribution.increment_skip(2);
+    step.apply(&contribution);
+    repository.update_step_execution(&step).await.unwrap();
+
+    // Read back through both query paths — they are separate SELECTs, and a
+    // column added to one and missed in the other is exactly the bug a single
+    // assertion would hide.
+    let latest = repository
+        .last_step_execution(instance.id(), "load")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(latest.skip_count(), 2);
+    assert_eq!(latest.filter_count(), 1, "skips did not land in filters");
+
+    let listed = repository.step_executions(execution.id()).await.unwrap();
+    assert_eq!(listed[0].skip_count(), 2);
+}
+
+/// The `CHECK` constraint covers the new column too — a negative skip count is
+/// corruption, and the database refuses it rather than the engine discovering
+/// it later as a `usize` the size of the universe.
+#[tokio::test]
+async fn a_negative_skip_count_is_rejected_by_the_database() {
+    let (_container, repository) = start().await;
+
+    let instance = repository
+        .find_or_create_instance("nightly", &params("2026-07-29"))
+        .await
+        .unwrap();
+    let execution = repository.create_execution(instance.id()).await.unwrap();
+    let step = repository
+        .create_step_execution(execution.id(), "load")
+        .await
+        .unwrap();
+
+    let result = sqlx::query("UPDATE step_execution SET skip_count = -1 WHERE id = $1")
+        .bind(step.id().get())
+        .execute(repository.pool())
+        .await;
+
+    assert!(result.is_err(), "the CHECK constraint must reject this");
 }

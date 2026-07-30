@@ -166,6 +166,7 @@ pub struct StepExecution {
     read_count: usize,
     write_count: usize,
     filter_count: usize,
+    skip_count: usize,
     execution_context: ExecutionContext,
 }
 
@@ -185,6 +186,7 @@ impl StepExecution {
             read_count: 0,
             write_count: 0,
             filter_count: 0,
+            skip_count: 0,
             execution_context: ExecutionContext::new(),
         }
     }
@@ -224,6 +226,11 @@ impl StepExecution {
         self.filter_count
     }
 
+    /// Items that failed and were tolerated (FR-6.2).
+    pub fn skip_count(&self) -> usize {
+        self.skip_count
+    }
+
     /// The step's bookmark: where its reader had got to when the last chunk
     /// committed. This is what Phase 9 feeds back in to resume rather than
     /// re-run.
@@ -244,6 +251,7 @@ impl StepExecution {
         self.read_count += contribution.read_count();
         self.write_count += contribution.write_count();
         self.filter_count += contribution.filter_count();
+        self.skip_count += contribution.skip_count();
     }
 }
 

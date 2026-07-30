@@ -1,3 +1,4 @@
+use crate::FaultTolerance;
 use crate::run_step;
 use crate::{BatchError, ExecutionContext, ItemProcessor, ItemReader, TransactionalWriter};
 use async_trait::async_trait;
@@ -8,6 +9,7 @@ pub struct StepContribution {
     read_count: usize,
     write_count: usize,
     filter_count: usize,
+    skip_count: usize,
 }
 
 impl StepContribution {
@@ -27,6 +29,10 @@ impl StepContribution {
         self.filter_count += count;
     }
 
+    pub fn increment_skip(&mut self, count: usize) {
+        self.skip_count += count;
+    }
+
     pub fn read_count(&self) -> usize {
         self.read_count
     }
@@ -39,6 +45,13 @@ impl StepContribution {
         self.filter_count
     }
 
+    /// Items dropped because they failed and the classifier called it
+    /// skippable. Distinct from `filter_count`: a filtered item is one the
+    /// processor deliberately declined, a skipped one is a failure tolerated.
+    pub fn skip_count(&self) -> usize {
+        self.skip_count
+    }
+
     /// Fold another contribution into this one — the commit point.
     ///
     /// Adds rather than replaces: an unapplied contribution is always work not
@@ -47,6 +60,7 @@ impl StepContribution {
         self.read_count += other.read_count;
         self.write_count += other.write_count;
         self.filter_count += other.filter_count;
+        self.skip_count += other.skip_count;
     }
 }
 
@@ -90,6 +104,7 @@ pub struct ChunkStep<R, P, W> {
     processor: P,
     writer: W,
     chunk_size: NonZeroUsize,
+    fault: FaultTolerance,
 }
 
 impl<R, P, W> ChunkStep<R, P, W> {
@@ -106,7 +121,19 @@ impl<R, P, W> ChunkStep<R, P, W> {
             processor,
             writer,
             chunk_size,
+            // Fail on the first error until the caller asks for otherwise.
+            fault: FaultTolerance::default(),
         }
+    }
+
+    /// Opt this step into retry (and, from Phase 10c, skip).
+    ///
+    /// Takes the whole [`FaultTolerance`] rather than a policy and a classifier
+    /// separately: the two are one decision, and 10c widens the struct without
+    /// touching this signature.
+    pub fn with_fault_tolerance(mut self, fault: FaultTolerance) -> Self {
+        self.fault = fault;
+        self
     }
 
     /// Inherent, so `step.name()` resolves without inferring `Tx` — the trait
@@ -142,6 +169,7 @@ where
             self.chunk_size,
             context,
             commit,
+            &self.fault,
         )
         .await
     }
@@ -150,8 +178,11 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Unmanaged;
-    use crate::testing::{CollectingWriter, EvenDoubler, RecordingCommit, VecReader, nz};
+    use crate::testing::{
+        CollectingWriter, EvenDoubler, RecordingCommit, RetryAll, TransientWriter, VecReader, nz,
+        nz32,
+    };
+    use crate::{RetryPolicy, Unmanaged};
 
     #[test]
     fn increments_accumulate() {
@@ -210,5 +241,52 @@ mod tests {
 
         // chunk_size 2 over 6 items: the step commits three times, not once.
         assert_eq!(commit.commits, 3);
+    }
+
+    /// The configured policy must actually reach the chunk loop.
+    #[tokio::test(start_paused = true)]
+    async fn a_configured_retry_policy_reaches_the_chunk_loop() {
+        let mut step = ChunkStep::new(
+            "flaky",
+            VecReader::new(vec![2, 4]),
+            EvenDoubler,
+            Unmanaged(TransientWriter::new(1)), // one deadlock, then fine
+            nz(2),
+        )
+        .with_fault_tolerance(
+            FaultTolerance::new()
+                .classifier(RetryAll)
+                .retry(RetryPolicy::attempts(nz32(3))),
+        );
+
+        let mut context = ExecutionContext::new();
+        let mut commit = RecordingCommit::new();
+
+        step.run(&mut context, &mut commit).await.unwrap();
+
+        assert_eq!(commit.begins, 2, "the retry opened a second transaction");
+        assert_eq!(commit.rollbacks, 1);
+        assert_eq!(commit.total.write_count(), 2);
+    }
+
+    /// Positive control for the test above: the *same* step without
+    /// `with_fault_tolerance` fails. Without this, a `TransientWriter` that
+    /// simply never failed would make that test pass for the wrong reason.
+    #[tokio::test]
+    async fn the_same_step_without_a_policy_fails_on_the_first_error() {
+        let mut step = ChunkStep::new(
+            "flaky",
+            VecReader::new(vec![2, 4]),
+            EvenDoubler,
+            Unmanaged(TransientWriter::new(1)),
+            nz(2),
+        );
+
+        let mut context = ExecutionContext::new();
+        let mut commit = RecordingCommit::new();
+
+        assert!(step.run(&mut context, &mut commit).await.is_err());
+        assert_eq!(commit.begins, 1);
+        assert_eq!(commit.commits, 0);
     }
 }

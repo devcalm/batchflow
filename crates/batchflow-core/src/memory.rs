@@ -55,7 +55,7 @@ impl JobRepository for InMemoryJobRepository {
         let mut inner = self
             .inner
             .lock()
-            .map_err(|e| BatchError::Repository(e.to_string()))?;
+            .map_err(|e| BatchError::repository(e.to_string()))?;
         let key = (job_name.to_string(), parameters.clone());
 
         if let Some(existing) = inner.instances.get(&key) {
@@ -79,7 +79,7 @@ impl JobRepository for InMemoryJobRepository {
         let inner = self
             .inner
             .lock()
-            .map_err(|e| BatchError::Repository(e.to_string()))?;
+            .map_err(|e| BatchError::repository(e.to_string()))?;
 
         let key = (job_name.to_string(), parameters.clone());
 
@@ -97,10 +97,10 @@ impl JobRepository for InMemoryJobRepository {
         let mut inner = self
             .inner
             .lock()
-            .map_err(|e| BatchError::Repository(e.to_string()))?;
+            .map_err(|e| BatchError::repository(e.to_string()))?;
 
         if !inner.instances.values().any(|i| i.id() == instance_id) {
-            return Err(BatchError::Repository(format!(
+            return Err(BatchError::repository(format!(
                 "Instance {:?} not found",
                 instance_id
             )));
@@ -116,7 +116,7 @@ impl JobRepository for InMemoryJobRepository {
         let mut inner = self
             .inner
             .lock()
-            .map_err(|e| BatchError::Repository(e.to_string()))?;
+            .map_err(|e| BatchError::repository(e.to_string()))?;
 
         match inner
             .executions
@@ -127,7 +127,7 @@ impl JobRepository for InMemoryJobRepository {
                 *slot = execution.clone();
                 Ok(())
             }
-            None => Err(BatchError::Repository(format!(
+            None => Err(BatchError::repository(format!(
                 "unknown execution {:?}",
                 execution.id()
             ))),
@@ -141,7 +141,7 @@ impl JobRepository for InMemoryJobRepository {
         let inner = self
             .inner
             .lock()
-            .map_err(|e| BatchError::Repository(e.to_string()))?;
+            .map_err(|e| BatchError::repository(e.to_string()))?;
 
         Ok(inner
             .executions
@@ -155,7 +155,7 @@ impl JobRepository for InMemoryJobRepository {
         let mut inner = self
             .inner
             .lock()
-            .map_err(|e| BatchError::Repository(e.to_string()))?;
+            .map_err(|e| BatchError::repository(e.to_string()))?;
 
         match inner.executions.iter_mut().find(|e| e.id() == execution_id) {
             Some(slot) => {
@@ -169,7 +169,7 @@ impl JobRepository for InMemoryJobRepository {
                 slot.set_status(BatchStatus::Abandoned);
                 Ok(())
             }
-            None => Err(BatchError::Repository(format!(
+            None => Err(BatchError::repository(format!(
                 "unknown execution {execution_id:?}"
             ))),
         }
@@ -183,10 +183,10 @@ impl JobRepository for InMemoryJobRepository {
         let mut inner = self
             .inner
             .lock()
-            .map_err(|e| BatchError::Repository(e.to_string()))?;
+            .map_err(|e| BatchError::repository(e.to_string()))?;
 
         if !inner.executions.iter().any(|e| e.id() == job_execution_id) {
-            return Err(BatchError::Repository(format!(
+            return Err(BatchError::repository(format!(
                 "unknown job execution {job_execution_id:?}"
             )));
         }
@@ -208,7 +208,7 @@ impl JobRepository for InMemoryJobRepository {
         let mut inner = self
             .inner
             .lock()
-            .map_err(|e| BatchError::Repository(e.to_string()))?;
+            .map_err(|e| BatchError::repository(e.to_string()))?;
 
         match inner
             .step_executions
@@ -219,7 +219,7 @@ impl JobRepository for InMemoryJobRepository {
                 *slot = step_execution.clone();
                 Ok(())
             }
-            None => Err(BatchError::Repository(format!(
+            None => Err(BatchError::repository(format!(
                 "unknown step execution {:?}",
                 step_execution.id()
             ))),
@@ -234,7 +234,7 @@ impl JobRepository for InMemoryJobRepository {
         let inner = self
             .inner
             .lock()
-            .map_err(|e| BatchError::Repository(e.to_string()))?;
+            .map_err(|e| BatchError::repository(e.to_string()))?;
 
         // `.rev()`: step executions are ordered by insertion, so the last match
         // is the most recent attempt.
@@ -259,7 +259,7 @@ impl JobRepository for InMemoryJobRepository {
         let inner = self
             .inner
             .lock()
-            .map_err(|e| BatchError::Repository(e.to_string()))?;
+            .map_err(|e| BatchError::repository(e.to_string()))?;
 
         Ok(inner
             .step_executions

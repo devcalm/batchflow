@@ -2,7 +2,7 @@
 
 > Status: **Living roadmap.** Phased. Each phase: goals · learning objectives · tasks · rationale · acceptance · testing · docs.
 > Mentoring cadence per phase: **concept → Rust lens → minimal sketch → you implement → I review → improve.**
-> Last updated: 2026-07-28
+> Last updated: 2026-07-30
 
 **Legend:** ☐ not started · ◐ in progress · ☑ done
 
@@ -114,11 +114,121 @@
 - **Narrow error variant over a general one.** `CannotAbandon { execution_id, status }` rather than `IllegalStatusTransition { from, to }` — there is exactly one status rule today, and generalising from one example guesses at what Phase 10 needs. Merge when a second real case appears.
 - **The ordering requirement became self-enforcing.** Create-then-check used to merely litter the store; with the `Starting` arm in place the launcher now rejects *its own* freshly-created execution (it is the most recent, and it is `Starting`). Mutation-tested: reordering fails 9 tests, not 1.
 
-## Phase 10 — Retry ☐
-- **Goals:** retry classified transient errors w/ backoff (backon); optional chunk-scanning.
-- **Learning:** classifier trait; item vs chunk retry; poison-item isolation (FR-6.4).
-- **Tasks:** `Classifier`; retry wrapper around process/write; backon integration.
-- **Acceptance:** transient errors retried, fatal fail fast. **Testing:** injected transient failures. **Docs:** policy guide.
+## Phase 10 — Retry & Skip ☑ (10d chunk-scanning still `[OPEN]`)
+> **10a ☑** `Classifier` / `ErrorAction{Retry,Skip,Fail}` / `FailFast`; `BatchError`'s wrapping variants carry a `Cause` instead of a `String`.
+> **10b ☑** retry. Processing split from writing; the retry loop wraps `begin → write → commit`; `backon` supplies the backoff schedule; `ChunkStep::with_fault_tolerance` exposes it.
+> **10c ☑** skip. `skip_limit` + `ItemDisposition`; `skip_count` on `StepContribution`/`StepExecution`, persisted by migration `0002_skip_count.sql`.
+> **10e ☑** `PostgresClassifier` (SQLSTATE) + whole jobs through retry and skip against a real Postgres.
+> **10d ☐** chunk-scanning to isolate a poison item on write failure (FR-6.4) — a decision, not a task. See below.
+
+- **Goals:** retry classified transient errors with backoff; tolerate classified bad items up to a limit.
+- **Acceptance:** transient errors retried, bad items skipped and counted, fatal errors fail fast. **Testing:** injected failures in core; real SQLSTATEs and whole jobs in `batchflow-postgres`.
+
+**10a — a classifier is only as good as what the error carries.** FR-6.3 replaces Spring's exception-class
+hierarchy (`.retry(DeadlockLoserDataAccessException.class)`) with a function: `Classifier::classify(&self, &BatchError) -> ErrorAction`.
+Scoping it exposed a blocker of our own making — `batchflow-postgres` mapped every `sqlx::Error` through
+`BatchError::Repository(error.to_string())`, so a deadlock (retryable), a `NOT NULL` violation (skippable) and a
+refused connection (fatal) all arrived as indistinguishable prose. **A `String` error payload is a tombstone: it
+proves an error happened and destroys what you need to decide about it.** The four wrapping variants now hold
+`pub type Cause = Box<dyn Error + Send + Sync + 'static>` with `#[source]`.
+- **Constructors, not raw variants.** `BatchError::read/write/process/repository(impl Into<Cause>)` — because Rust
+  never applies `Into` implicitly at an argument position, so making the variants take a box would otherwise have
+  broken every `format!(..)` call site. The `impl Into` constructor is also what lets `db()` pass the live
+  `sqlx::Error` through rather than stringifying it.
+- **`PoisonError<MutexGuard<'_, T>>` cannot be a `Cause`** — it *contains* the guard, so it is neither `Send` nor
+  `'static`. `InMemoryJobRepository` keeps `.to_string()` there, and that is now correct rather than lazy: nothing
+  about "a thread panicked holding this mutex" is classifiable. The `Send + Sync + 'static` bound rejected the
+  category at compile time without anyone reasoning about it.
+- **`classify` takes `&self`.** A classifier whose verdict depends on call history is untestable and unshareable.
+- **The default is `Fail`.** Fault tolerance is opt-in per step, as in Spring before `faultTolerant()`.
+
+**10b — ownership decides where the retry boundary goes.** Read the two signatures:
+`process(&mut self, item: Self::In)` **consumes**; `write(&mut self, tx, items: &[Self::Item])` **borrows**.
+So a chunk can be re-written as often as you like and cannot be re-processed at all — the inputs were moved into
+`process` on the first attempt. Retrying the processor would need `P::In: Clone` threaded virally through
+`ChunkStep`, `Step` and `Job` to buy retryability for a case that barely exists; every transient error we care
+about (deadlock, serialization failure, connection blip) is on the write side. **Spring re-runs the processor on
+retry and therefore documents "your processor must be idempotent" as a user obligation. Ours does not need that
+sentence, because ownership made the alternative unwritable.**
+- Consequence: `process_chunk` lost its writer and its `tx` (three type parameters down to one) and now runs
+  *outside* the transaction. Independent win: a processor doing a 200 ms enrichment call per item no longer holds
+  row locks for 200 seconds a chunk.
+- **The transaction rule Phase 11 created is enforced by the type system.** `StepCommit::rollback(tx)` and
+  `commit(tx)` take `Tx` **by value**, so hoisting `begin` out of the retry loop is `E0382: borrow of moved value`.
+  A retry *cannot* reuse a rolled-back transaction. (In Java `tx.rollback()` leaves the variable in scope and still
+  callable, which is why Spring documents what Rust rejects.) Without this, Postgres would answer every statement
+  on the aborted transaction with `25P02` and the retry would report a failure about transaction state rather than
+  the original deadlock.
+- **What is *not* type-enforced: rollback before backing off.** Dropping the transaction instead compiles fine.
+  Sleeping on an open transaction holds its row locks and its pooled connection for the whole delay — backoff
+  amplifying the contention it exists to relieve. Caught only by asserting the *sequence* `Begin, Rollback, Begin,
+  Commit`; counters cannot distinguish "rolled back then re-opened" from "opened twice".
+- **A failed commit retries too, with nothing to roll back.** `commit` consumed the `tx`. Postgres raises `40001`
+  *at* `COMMIT`, so this path is real, and the signature already said what the shape had to be.
+- **`backon` supplies the schedule, not the retry.** Its combinator wants a re-callable future factory; our loop
+  body needs `&mut` writer, `&mut` committer and a freshly *owned* `Tx` per attempt. We take
+  `BackoffBuilder → Iterator<Item = Duration>` and keep the control flow.
+- **The schedule is deliberately unbounded** (`with_max_times(usize::MAX)`), because `should_retry` is the single
+  authority on how many attempts there are. Both could encode "3 attempts", but they fail *differently*: exceeding
+  `should_retry` stops the retry (loud, correct); exhausting the iterator skips the *sleep* and keeps retrying
+  (silent hot loop). Two encodings of one rule, where disagreement degrades quietly, is worse than one.
+- **`tokio` (feature `time`) is now a real dependency of core.** There is no runtime-agnostic async sleep, and
+  `std::thread::sleep` in an `async fn` blocks the whole worker thread — stalling every unrelated task on it,
+  including other steps of a spawned job. NFR-4's concern is tokio in core *traits*; a sleep is not a trait.
+
+**10c — skip granularity is decided by trait signatures too.** `read` and `process` are per-item, so the failing
+item is known and can be dropped. `write(&[Item])` names a *chunk*: a write error says N items failed, not which.
+Skipping there would discard 1000 rows because one was bad — that is not skip, it is data loss. So FR-6.2 covers
+read and process, and write-level skip is exactly what FR-6.4 is for.
+- **`disposition(error: BatchError, skipped) -> ItemDisposition` takes the error by value.** It is either dropped
+  with its item or handed back inside `Fail`. There is no third path where a caller consults the classifier and
+  forgets the limit — which a `should_skip(&error) -> bool` would have made a one-line oversight. (`should_retry`
+  is the older, weaker shape: two `&&` conditions a caller could get half-right.)
+- **`SkipLimitExceeded { limit, #[source] cause }`** rather than the bare item error: one bad row is a
+  data-quality nit, five hundred means the input is wrong and re-running will not help. This is the *second*
+  domain error the debt list said to generalise from — and it argues the opposite. A status-transition rule
+  (`CannotAbandon`) and a tolerance breach share no fields and no handling. They stay separate.
+- **A skipped read must not consume a chunk slot** (`while chunk.len() < chunk_size`, not `for _ in 0..`), or
+  dirty input silently shrinks the transaction the commit interval promised.
+- **The limit is step-wide**, not per chunk: one bad row in each of a thousand chunks is a broken input file, and
+  a per-chunk counter would call it healthy. It is *not* rolled back with a failed chunk — the items really were
+  seen — and a restart is a new step execution with a fresh count.
+- **The step-wide limit is also what bounds the read loop.** A reader that errors without advancing past the bad
+  item would be handed it forever; each spin costs a skip, so the limit turns an infinite loop into a step failure.
+  Readers still owe the advance, and the test double documents why.
+
+**10e — the classifier that makes it usable, and the first end-to-end proof.** `PostgresClassifier` lives in
+`batchflow-postgres`; core never learns a SQLSTATE.
+- **Retry is enumerated** (`40001`, `40P01`, `55P03`), *not* matched on class `40`, because that class also holds
+  `40003 statement_completion_unknown` — the database saying it does not know whether the statement took effect.
+  Retrying that may double-write. A tidier prefix match would have silently made it retryable.
+- **Skip is matched by class** (`22` data exception, `23` integrity constraint violation). The SQL standard drew
+  that boundary deliberately and it is exactly the one we need: both classes say *this row is wrong*, never *the
+  system is unwell*. Enumerating codes would be an incomplete copy of the standard's own grouping.
+- **Everything else fails**, including connection failures (class 08) — US-3 asks for fast failure on
+  infrastructure errors, and retrying a dead database only spends the budget before failing anyway.
+- **`sqlstate()` walks the whole `Error::source()` chain** rather than matching `BatchError` variants. Matching
+  sees only the outermost error, so `SkipLimitExceeded → Write → sqlx::Error` would classify as `Fail`, as would
+  a user's writer wrapping `sqlx::Error` in its own type. It also sidesteps needing a wildcard arm for
+  `#[non_exhaustive]`.
+- **Classifier tests must provoke real SQLSTATEs.** A hand-built `sqlx::Error` proves the match arms exist, not
+  that the codes are the ones Postgres sends. `SELECT ... FOR UPDATE NOWAIT` against a row another connection
+  holds gives a deterministic `55P03`; a genuine `40P01` would need two transactions racing in opposite orders,
+  i.e. a race inside the test suite.
+
+**Mutation testing rewrote one of the end-to-end tests, and that is the transferable lesson.** The retry test's
+writer originally probed the contended lock *before* inserting, so the doomed transaction held no rows and there
+was nothing for a rollback to undo — the test looked right, asserted the right thing, and was structurally
+incapable of observing it. Reordering to insert-then-fail makes `items == [1,2,3,4]` load-bearing: a retry that
+kept the failed transaction's work yields `[1,1,2,2,3,4]`. Verified by mutating `run_step` to *commit* the failed
+chunk before retrying. **The order of operations inside a test double decides whether a test is real or
+decorative, and only mutation testing tells you which one you wrote.**
+
+**10d is a decision, not a task `[OPEN]`.** Chunk-scanning means: on a write failure, re-run the chunk one item at
+a time to find the poison row. It buys write-level skip — the only way `ErrorAction::Skip` can ever apply to a
+write — and costs a second pass, N transactions instead of one, and a hard question about writers that are not
+idempotent (an `Unmanaged` writer has already sent its rows somewhere). Spring inherits it. Decide deliberately
+before writing any of it.
 
 ## Phase 11 — Transactions ☑
 > **11a ☑** the commit point exists. `StepCommit` trait; `run_step` commits per chunk; `Job::run` supplies a `RepositoryCommit` owning the `StepExecution`.
@@ -187,11 +297,16 @@
 
 ## Cross-cutting quality gate (every phase)
 `cargo fmt --check` · `cargo clippy --workspace --all-targets -- -D warnings` · `cargo test --workspace` · examples compile · no dead code · no needless clone/alloc.
-**Read the `Doc-tests batchflow_core` count, do not just read the unit count** — see debt (6). A doctest can disappear without anything going red.
+**Read the `Doc-tests` counts, do not just read the unit count** — see debt (6). A doctest can disappear without anything going red. Note there are now doctests in three crates (`batchflow_core`, `batchflow`, `batchflow_postgres`); the facade's is the one that guards user-facing re-exports.
+Postgres integration tests need Docker running. They are part of the gate, not an optional extra — `cargo test --workspace` silently covers less without it.
 
-## Current position (2026-07-29)
-Phase 0 ◐ docs (tech-eval open items) · 1 ☑ workspace · 2 ☑ traits · 3 ☑ Job + typestate `JobBuilder` · 4 ◐ step model (tasklet trait pending) · 5 ☑ engine · 6 ◐ chunk processing (property tests/tuning guide pending) · 7 ☑ JobRepository · 8 ☑ ExecutionContext · 9 ☑ restart · 10 ☐ retry · **11 ☑ transactions**.
-`batchflow-core` modules: `chunk`/`context`/`error`/`execution`/`item`/`job`/`launcher`/`memory`/`repository`/`step` + `#[cfg(test)] testing`, with `lib.rs` as a pure re-export surface (private `mod` + flat `pub use`, so module layout stays refactorable). **74 core unit tests + 3 doctests + 7 Postgres integration tests green**, clippy `--all-targets -D warnings` clean, `cargo fmt --check` clean.
+## Current position (2026-07-30)
+Phase 0 ◐ docs (tech-eval open items) · 1 ☑ workspace · 2 ☑ traits · 3 ☑ Job + typestate `JobBuilder` · 4 ◐ step model (tasklet trait pending) · 5 ☑ engine · 6 ◐ chunk processing (property tests/tuning guide pending) · 7 ☑ JobRepository · 8 ☑ ExecutionContext · 9 ☑ restart · **10 ☑ retry & skip** (10d chunk-scanning `[OPEN]`) · 11 ☑ transactions.
+`batchflow-core` modules: `chunk`/`classifier`/`context`/`error`/`execution`/`fault`/`item`/`job`/`launcher`/`memory`/`repository`/`step` + `#[cfg(test)] testing`, with `lib.rs` as a pure re-export surface (private `mod` + flat `pub use`, so module layout stays refactorable). **120 tests green: 95 core unit · 5 doctests (core, facade, postgres) · 20 Postgres integration across `repository`/`classifier`/`fault_tolerance`.** clippy `--all-targets -D warnings` clean, `cargo fmt --check` clean.
+
+**US-3 and US-4 now hold end to end.** A malformed staging row raises a real `22P02`, is skipped, and the job completes with `skip_count` durable in `step_execution`. A writer that loses a lock race raises a real `55P03`, the chunk is rolled back and re-attempted in a *fresh* transaction, and every row lands exactly once.
+
+**Core's dependency set grew in 10b:** `backon` (schedule only, `default-features = false`) and `tokio` (feature `time`, for the backoff sleep). Both are argued in the Phase 10 notes; `tokio` in particular is a deliberate reading of NFR-4.
 
 **US-2 now holds end to end:** a job that dies mid-step is relaunched against the same `JobInstance`, skips the steps that completed, opens its reader at the last committed chunk, and writes no item twice.
 
@@ -205,9 +320,15 @@ A job now runs end to end through metadata: `JobLauncher::run` resolves a `JobIn
 1. ~~`Starting`/`Started` still passes the FR-4.4 gate.~~ **Closed in 9a** — rejected, with `abandon_execution` shipped in the same change.
 2. ~~`JobLauncher::run` resolves the instance and reads its last execution under separate lock acquisitions.~~ **Closed for Postgres in 11d** — `UNIQUE (job_name, parameters)` plus a single `INSERT .. ON CONFLICT` makes instance identity the database's job. The launcher's *gate* (read last execution, then create) is still two statements outside a transaction; two processes racing an instance with no prior execution can still both launch. Narrow, and it needs a `SELECT .. FOR UPDATE` around the gate to close — deferred, and recorded here rather than claimed fixed.
 3. A failing `update_execution` masks the job's original error (`launcher.rs`). Real systems log the cause before propagating — Phase 13.
-4. Library-craft gap: no `#![warn(missing_docs)]`, `Job`/`ChunkStep` lack `Debug` (API guideline C-DEBUG).
-   ~~Implementing `Step` requires the caller to depend on `async-trait` directly.~~ **Closed in 9a** by `pub use async_trait::async_trait;` in `lib.rs`. Worth recording *how* it was found: the `Job::builder` doctest could not be written without it. Doctests compile as an external crate — they see the crate plus its **dev-dependencies**, not its normal dependencies — so they are the only tests that stand where a user stands. Unit tests structurally cannot feel this class of bug.
-5. `read_chunk`/`process_chunk`/`run_step` are `pub` without a deliberate SemVer decision — and `run_step`'s signature changed in 7c-2, which is exactly the kind of break that decision governs. Settle it before 0.1.0.
+4. Library-craft gap: no `#![warn(missing_docs)]`, `Job`/`ChunkStep` lack `Debug` (API guideline C-DEBUG) — `ChunkStep` now has a second reason, since `FaultTolerance` holds a `Box<dyn Classifier>`; see ADR-008 for the intended fix.
+   ~~Implementing `Step` requires the caller to depend on `async-trait` directly.~~ **Closed in 9a** by `pub use async_trait::async_trait;` in `lib.rs`.
+   **Correction (2026-07-30): the reasoning recorded here was wrong.** This entry claimed doctests "see the crate plus its dev-dependencies, not its normal dependencies", and therefore stand where a user stands. Both halves are false, verified by probe: a doctest in `batchflow-core` compiles `use serde::Serialize;` even though `serde` is a normal dependency that core does not re-export. rustdoc passes `--extern` for *all* direct dependencies. **A doctest is therefore more permissive than a real user's crate and can give a false green** — it will compile code a downstream crate cannot. The re-export is still correct and necessary; only the diagnosis was.
+   The structural fix is the **facade crate**: `batchflow` depends on exactly one thing, `batchflow-core`, which is the graph a user actually has. A doctest there implementing `Step` via `batchflow::batchflow_core::async_trait` now guards the re-export, and deleting it fails that doctest. Core's own `Job::builder` doctest happens to catch this particular deletion because it imports *through* the re-export — but a core doctest written `use async_trait::async_trait;` would pass while every user broke. In the facade that mistake is unavailable. **User-facing API examples belong in `crates/batchflow/src/lib.rs`.**
+5. `read_chunk`/`process_chunk`/`run_step` are `pub` without a deliberate SemVer decision — and every one of them changed signature again in Phase 10 (`process_chunk` lost its writer and `tx`; all three gained a `&FaultTolerance` and a skip counter), on top of `run_step`'s 7c-2 break. That is four breaking changes to functions nobody decided were public. `ProcessedChunk` also shipped in 10b-1 **unexported**, reachable only as an inferred type — and nothing warned, because `dead_code` sees it used one module over. Settle the whole surface before 0.1.0.
 6. **Doc-comment tests have no build-time protection against deletion.** The `Job::builder` `compile_fail` block has now been stripped along with its surrounding rustdoc **twice** (most recently by commit `9659a37`, which also deleted `Job::run`'s docs and left `Plan.md` claiming doctests existed when the count was 0). Nothing fails when it vanishes. Mitigation for now: the block says in its own text that it is a test, and the `Doc-tests` count in `cargo test` output is part of the quality gate below.
 
-**Next milestone: Phase 10 — retry/skip via a `Classifier`.** FR-2.4 and FR-5 are now guarantees enforced by a real database, so the remaining fault-tolerance gap is *within* a chunk: today any error fails the whole step, and one poison row costs a full restart cycle. Phase 10 adds a `Classifier` mapping errors to {Retryable, Skippable, Fatal}, retry via `backon`, and chunk-scanning to isolate the poison item (FR-6.4). Note the new interaction Phase 11 creates: a retry must re-open the transaction, not reuse the rolled-back one.
+**Next milestone: Phase 12 — metrics, or Phase 10d — chunk-scanning.** FR-6.1/6.2/6.3 are closed and proven against a real database, so the remaining fault-tolerance gap is narrow and specific: a *write* failure names a chunk, not an item, so `ErrorAction::Skip` cannot apply there. Closing it means chunk-scanning (FR-6.4) — a second one-at-a-time pass, N transactions instead of one, and an unresolved question about non-idempotent writers. That is a design decision to take deliberately, not the obvious next increment.
+
+Phase 12 is the better default next step: retry and skip now happen *silently*. A job that skipped 400 rows and retried 30 chunks reports exactly the same thing as one that sailed through, and `skip_count` in the metadata store is the only evidence. Fault tolerance without observability converts loud failures into quiet data loss.
+
+**One thing Phase 10 did not close:** the explicit `commit.rollback(tx)` before a retry remains **unverified, and is now known to be unverifiable through sqlx** — `Transaction::drop` queues its own rollback, so removing our call changes nothing observable. The call stays right (`Tx` is generic; no other backend guarantees a `Drop`; sqlx's is deferred to the connection's next use and swallows its own errors) but only a backend without drop-rollback could prove it. Recorded here rather than claimed as covered.

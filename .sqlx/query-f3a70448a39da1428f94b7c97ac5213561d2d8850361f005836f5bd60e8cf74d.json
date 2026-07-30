@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT id, job_execution_id, step_name, status,\n                    read_count, write_count, filter_count, execution_context\n               FROM step_execution\n              WHERE job_execution_id = $1\n              ORDER BY id",
+  "query": "SELECT s.id, s.job_execution_id, s.step_name, s.status,\n                    s.read_count, s.write_count, s.filter_count, s.skip_count,\n                    s.execution_context\n               FROM step_execution s\n               JOIN job_execution e ON e.id = s.job_execution_id\n              WHERE e.instance_id = $1 AND s.step_name = $2\n              ORDER BY s.id DESC\n              LIMIT 1",
   "describe": {
     "columns": [
       {
@@ -82,6 +82,17 @@
       },
       {
         "ordinal": 7,
+        "name": "skip_count",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "step_execution",
+            "name": "skip_count"
+          }
+        }
+      },
+      {
+        "ordinal": 8,
         "name": "execution_context",
         "type_info": "Jsonb",
         "origin": {
@@ -94,7 +105,8 @@
     ],
     "parameters": {
       "Left": [
-        "Int8"
+        "Int8",
+        "Text"
       ]
     },
     "nullable": [
@@ -105,8 +117,9 @@
       false,
       false,
       false,
+      false,
       false
     ]
   },
-  "hash": "8742d4344774017e04ea47ce5ee1426b6ce0eb239c588199472719f845855dbd"
+  "hash": "f3a70448a39da1428f94b7c97ac5213561d2d8850361f005836f5bd60e8cf74d"
 }

@@ -5,6 +5,10 @@
 //! rows, its counters and its bookmark commit together or not at all.
 #![forbid(unsafe_code)]
 
+mod classifier;
+
+pub use classifier::PostgresClassifier;
+
 use batchflow_core::{
     BatchError, BatchStatus, ExecutionContext, JobExecution, JobExecutionId, JobInstance,
     JobInstanceId, JobParameters, JobRepository, StepContribution, StepExecution, StepExecutionId,
@@ -41,12 +45,12 @@ impl PostgresJobRepository {
         sqlx::migrate!("./migrations")
             .run(&self.pool)
             .await
-            .map_err(|e| BatchError::Repository(format!("migration failed: {e}")))
+            .map_err(|e| BatchError::repository(format!("migration failed: {e}")))
     }
 }
 
 fn db(error: sqlx::Error) -> BatchError {
-    BatchError::Repository(error.to_string())
+    BatchError::repository(error)
 }
 
 fn status_name(status: BatchStatus) -> Result<&'static str, BatchError> {
@@ -60,7 +64,7 @@ fn status_name(status: BatchStatus) -> Result<&'static str, BatchError> {
         // `BatchStatus` is `#[non_exhaustive]`, so unlike inside the core crate a
         // new variant compiles here and has to be caught at runtime.
         other => {
-            return Err(BatchError::Repository(format!(
+            return Err(BatchError::repository(format!(
                 "status {other:?} has no stored representation"
             )));
         }
@@ -75,21 +79,21 @@ fn status_from(name: &str) -> Result<BatchStatus, BatchError> {
         FAILED => BatchStatus::Failed,
         STOPPED => BatchStatus::Stopped,
         ABANDONED => BatchStatus::Abandoned,
-        other => return Err(BatchError::Repository(format!("unknown status '{other}'"))),
+        other => return Err(BatchError::repository(format!("unknown status '{other}'"))),
     })
 }
 
 fn count(value: i64) -> Result<usize, BatchError> {
     usize::try_from(value)
-        .map_err(|_| BatchError::Repository(format!("negative counter {value} in step_execution")))
+        .map_err(|_| BatchError::repository(format!("negative counter {value} in step_execution")))
 }
 
 fn json<T: serde::Serialize>(value: &T) -> Result<serde_json::Value, BatchError> {
-    serde_json::to_value(value).map_err(|e| BatchError::Repository(e.to_string()))
+    serde_json::to_value(value).map_err(BatchError::repository)
 }
 
 fn from_json<T: serde::de::DeserializeOwned>(value: serde_json::Value) -> Result<T, BatchError> {
-    serde_json::from_value(value).map_err(|e| BatchError::Repository(e.to_string()))
+    serde_json::from_value(value).map_err(BatchError::repository)
 }
 
 fn execution(
@@ -104,15 +108,25 @@ fn execution(
     Ok(execution)
 }
 
-#[allow(clippy::too_many_arguments)]
+/// Rebuilds the counters from a row.
+///
+/// They are private and fold-only on `StepExecution`, so they are restored
+/// through a contribution rather than assigned.
+fn counters(read: i64, write: i64, filter: i64, skip: i64) -> Result<StepContribution, BatchError> {
+    let mut counters = StepContribution::new();
+    counters.increment_read(count(read)?);
+    counters.increment_write(count(write)?);
+    counters.increment_filter(count(filter)?);
+    counters.increment_skip(count(skip)?);
+    Ok(counters)
+}
+
 fn step(
     id: i64,
     job_execution_id: i64,
     step_name: String,
     status: &str,
-    read: i64,
-    write: i64,
-    filter: i64,
+    counters: StepContribution,
     context: serde_json::Value,
 ) -> Result<StepExecution, BatchError> {
     let mut step = StepExecution::new(
@@ -122,13 +136,6 @@ fn step(
     );
     step.set_status(status_from(status)?);
     step.set_execution_context(from_json::<ExecutionContext>(context)?);
-
-    // Counters are private and only foldable, so they are restored through a
-    // contribution rather than assigned.
-    let mut counters = StepContribution::new();
-    counters.increment_read(count(read)?);
-    counters.increment_write(count(write)?);
-    counters.increment_filter(count(filter)?);
     step.apply(&counters);
 
     Ok(step)
@@ -157,13 +164,14 @@ impl JobRepository for PostgresJobRepository {
         let affected = sqlx::query!(
             "UPDATE step_execution
                 SET status = $2, read_count = $3, write_count = $4,
-                    filter_count = $5, execution_context = $6
+                    filter_count = $5, skip_count = $6, execution_context = $7
               WHERE id = $1",
             step_execution.id().get(),
             status_name(step_execution.status())?,
             step_execution.read_count() as i64,
             step_execution.write_count() as i64,
             step_execution.filter_count() as i64,
+            step_execution.skip_count() as i64,
             json(step_execution.execution_context())?,
         )
         .execute(&mut **tx)
@@ -172,7 +180,7 @@ impl JobRepository for PostgresJobRepository {
         .rows_affected();
 
         if affected == 0 {
-            return Err(BatchError::Repository(format!(
+            return Err(BatchError::repository(format!(
                 "unknown step execution {:?}",
                 step_execution.id()
             )));
@@ -265,7 +273,7 @@ impl JobRepository for PostgresJobRepository {
         .rows_affected();
 
         if affected == 0 {
-            return Err(BatchError::Repository(format!(
+            return Err(BatchError::repository(format!(
                 "unknown execution {:?}",
                 execution.id()
             )));
@@ -316,7 +324,7 @@ impl JobRepository for PostgresJobRepository {
         .map_err(db)?;
 
         match (row.status, row.updated) {
-            (None, _) => Err(BatchError::Repository(format!(
+            (None, _) => Err(BatchError::repository(format!(
                 "unknown execution {execution_id:?}"
             ))),
             (Some(status), None) => Err(BatchError::CannotAbandon {
@@ -335,8 +343,9 @@ impl JobRepository for PostgresJobRepository {
         let row = sqlx::query!(
             "INSERT INTO step_execution
                     (job_execution_id, step_name, status,
-                     read_count, write_count, filter_count, execution_context)
-                  VALUES ($1, $2, $3, 0, 0, 0, $4)
+                     read_count, write_count, filter_count, skip_count,
+                     execution_context)
+                  VALUES ($1, $2, $3, 0, 0, 0, 0, $4)
                RETURNING id",
             job_execution_id.get(),
             step_name,
@@ -361,13 +370,14 @@ impl JobRepository for PostgresJobRepository {
         let affected = sqlx::query!(
             "UPDATE step_execution
                 SET status = $2, read_count = $3, write_count = $4,
-                    filter_count = $5, execution_context = $6
+                    filter_count = $5, skip_count = $6, execution_context = $7
               WHERE id = $1",
             step_execution.id().get(),
             status_name(step_execution.status())?,
             step_execution.read_count() as i64,
             step_execution.write_count() as i64,
             step_execution.filter_count() as i64,
+            step_execution.skip_count() as i64,
             json(step_execution.execution_context())?,
         )
         .execute(&self.pool)
@@ -376,7 +386,7 @@ impl JobRepository for PostgresJobRepository {
         .rows_affected();
 
         if affected == 0 {
-            return Err(BatchError::Repository(format!(
+            return Err(BatchError::repository(format!(
                 "unknown step execution {:?}",
                 step_execution.id()
             )));
@@ -391,7 +401,8 @@ impl JobRepository for PostgresJobRepository {
     ) -> Result<Option<StepExecution>, BatchError> {
         let row = sqlx::query!(
             "SELECT s.id, s.job_execution_id, s.step_name, s.status,
-                    s.read_count, s.write_count, s.filter_count, s.execution_context
+                    s.read_count, s.write_count, s.filter_count, s.skip_count,
+                    s.execution_context
                FROM step_execution s
                JOIN job_execution e ON e.id = s.job_execution_id
               WHERE e.instance_id = $1 AND s.step_name = $2
@@ -410,9 +421,12 @@ impl JobRepository for PostgresJobRepository {
                 row.job_execution_id,
                 row.step_name,
                 &row.status,
-                row.read_count,
-                row.write_count,
-                row.filter_count,
+                counters(
+                    row.read_count,
+                    row.write_count,
+                    row.filter_count,
+                    row.skip_count,
+                )?,
                 row.execution_context,
             )
         })
@@ -425,7 +439,8 @@ impl JobRepository for PostgresJobRepository {
     ) -> Result<Vec<StepExecution>, BatchError> {
         let rows = sqlx::query!(
             "SELECT id, job_execution_id, step_name, status,
-                    read_count, write_count, filter_count, execution_context
+                    read_count, write_count, filter_count, skip_count,
+                    execution_context
                FROM step_execution
               WHERE job_execution_id = $1
               ORDER BY id",
@@ -442,9 +457,12 @@ impl JobRepository for PostgresJobRepository {
                     row.job_execution_id,
                     row.step_name,
                     &row.status,
-                    row.read_count,
-                    row.write_count,
-                    row.filter_count,
+                    counters(
+                        row.read_count,
+                        row.write_count,
+                        row.filter_count,
+                        row.skip_count,
+                    )?,
                     row.execution_context,
                 )
             })

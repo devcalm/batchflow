@@ -12,9 +12,13 @@ categories = ["asynchronous", "concurrency"]
 
 [dependencies]
 async-trait.workspace = true
+backon.workspace = true
 thiserror.workspace = true
 serde.workspace = true
+# Backoff has to sleep, and there is no runtime-agnostic async sleep in std.
+# `std::thread::sleep` here would block the whole worker thread.
+tokio = { workspace = true, features = ["time"] }
 
 [dev-dependencies]
-tokio.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
 serde_json.workspace = true

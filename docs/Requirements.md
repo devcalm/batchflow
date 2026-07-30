@@ -1,7 +1,8 @@
 # BatchFlow — Requirements
 
-> Status: **Living document.** Phase 0 (research). Decisions marked `[DECIDED]`, `[OPEN]`, or `[FUTURE]`.
-> Last updated: 2026-07-24
+> Status: **Living document.** Decisions marked `[DECIDED]`, `[BUILT]`, `[OPEN]`, or `[FUTURE]`.
+> `[BUILT]` means implemented *and* covered by a test that fails when the behaviour is removed.
+> Last updated: 2026-07-30
 
 BatchFlow is an idiomatic, production-grade batch-processing framework for Rust,
 inspired by Spring Batch. It owns the **orchestration layer** (execution engine,
@@ -42,11 +43,31 @@ everything else (async runtime, DB, serialization, tracing, metrics).
 - FR-5.3 Restart must not duplicate already-committed items (guaranteed by FR-2.4 atomicity).
 
 ### FR-6 — Fault tolerance
-- FR-6.1 **Retry policy**: re-attempt process/write on classified *transient* errors, up to a limit, with backoff.
-- FR-6.2 **Skip policy**: tolerate classified *bad-item* errors up to a skip limit; increment `skipCount`.
-- FR-6.3 **Error classification** via a trait (Rust replacement for exception hierarchies). `[DECIDED]`
+- FR-6.1 **Retry policy**: re-attempt the **write and commit** on classified *transient* errors, up to a limit, with backoff. `[BUILT]`
+  Scope narrowed during Phase 10b, and the narrowing is forced rather than chosen: `ItemProcessor::process` takes its
+  item **by value**, so a second attempt has no input left to re-process, whereas `ItemWriter::write` borrows a slice
+  and can be re-issued freely. Retrying the processor would require `P::In: Clone` threaded through `ChunkStep`,
+  `Step` and `Job`. Spring re-runs the processor and pays for it with a documented idempotency obligation on the user.
+  **Each attempt opens a fresh transaction** — a rolled-back one cannot be reused, which the type system enforces
+  because `StepCommit::rollback`/`commit` take `Tx` by value. The commit itself is inside the retry scope
+  (Postgres raises `40001` *at* `COMMIT`).
+- FR-6.2 **Skip policy**: tolerate classified *bad-item* errors on **read and process** up to a step-wide skip limit;
+  increment `skip_count`. `[BUILT]`
+  Read and process are per-item, so the failing item is known. A **write** error names a whole chunk, not an item —
+  see FR-6.4. Exceeding the limit fails the step with `BatchError::SkipLimitExceeded`, carrying the item error as its
+  source: "one odd row" and "this input file is wrong" are different pages for an operator.
+- FR-6.3 **Error classification** via a trait (Rust replacement for exception hierarchies). `[BUILT]`
+  `Classifier::classify(&self, &BatchError) -> ErrorAction{Retry, Skip, Fail}`; default `FailFast`, so fault tolerance
+  is opt-in per step. Requires errors to *carry* their cause: the wrapping `BatchError` variants hold a boxed
+  `Cause`, since a stringified `sqlx::Error` cannot be classified. `PostgresClassifier` maps SQLSTATE and lives in
+  `batchflow-postgres` — core never learns a SQLSTATE.
 - FR-6.4 Chunk-scanning on write failure to isolate a poison item. `[OPEN]` — decide whether to inherit.
+  Now the *only* gap in FR-6: a write error names N items, so `ErrorAction::Skip` cannot apply to one. Isolating the
+  poison row means a second one-at-a-time pass — N transactions instead of one, and an unresolved question about
+  writers that are not idempotent (an `Unmanaged` writer has already sent its rows somewhere).
 - FR-6.5 Dead-letter routing for skipped items. `[FUTURE]`
+  Note the gap this leaves today: a skipped item is counted and then **gone**. `skip_count` says how many rows were
+  discarded and nothing says which.
 
 ### FR-7 — Listeners / lifecycle hooks
 - FR-7.1 Hooks: before/after job, step, chunk, read, process, write, on-error, on-skip.

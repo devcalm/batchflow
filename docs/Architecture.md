@@ -1,7 +1,7 @@
 # BatchFlow — Architecture
 
 > Status: **Living document.** Phase 0. Records the model, the crate layout, technology choices, and ADRs.
-> Last updated: 2026-07-24
+> Last updated: 2026-07-30
 
 ---
 
@@ -43,41 +43,83 @@ Step (owns the transaction + StepExecution):
     tx = repository.begin()                       # BEGIN
     // ---- read side (ChunkProvider) ----
     chunk = []
-    for _ in 0..commit_interval:
-        match reader.read().await? {              # None → exhausted; Err → rollback
-            Some(i) => chunk.push(i),
-            None    => break,
+    while chunk.len() < commit_interval:           # NOT `for _ in 0..N`: a skipped
+        match reader.read().await {                # read must not consume a slot,
+            Ok(Some(i)) => chunk.push(i),          # or dirty input silently shrinks
+            Ok(None)    => break,                  # the transaction
+            Err(e)      => match fault.disposition(e, skipped) {
+                Skip    => skipped += 1,           # FR-6.2; the limit also bounds
+                Fail(e) => return Err(e),          # this loop against a reader
+            },                                     # that never advances
         }
-    if chunk.is_empty(): tx.commit(); return DONE
-    // ---- process + write side (ChunkProcessor) ----
+    if chunk.is_empty(): return DONE               # no transaction is open yet
+    // ---- process side: ONCE, and OUTSIDE any transaction ----
     out = []
     for item in chunk:
-        if let Some(o) = processor.process(item).await? { out.push(o) }  # None → filtered
-    writer.write(&out).await?                      # ONE call, whole chunk
-    // ---- persist, atomically with data ----
-    let contribution = StepContribution { read, write, filter, ... }  # pending deltas
-    step_execution.apply(contribution)
-    reader.update(&mut step_execution.execution_context)  # bookmark
-    repository.update(&step_execution, &tx).await?
-    tx.commit().await?                             # COMMIT: data + metadata together
-    # on any `?` error → tx.rollback(); apply skip/retry policy or fail the step
+        match processor.process(item).await {
+            Ok(Some(o)) => out.push(o),            # None → filtered
+            Ok(None)    => filtered += 1,
+            Err(e)      => match fault.disposition(e, skipped) {
+                Skip    => skipped += 1,           # FR-6.2, item dropped
+                Fail(e) => return Err(e),
+            },
+        }
+    let contribution = StepContribution { read, write, filter, skip }  # pending deltas
+    // ---- write + commit: the retry scope (FR-6.1) ----
+    loop {
+        tx = commit.begin().await?                 # FRESH per attempt, never reused
+        if let Err(e) = writer.write(&mut tx, &out).await {
+            commit.rollback(tx).await?             # BEFORE the backoff, not after
+            if fault.should_retry(&e, attempt) { sleep(backoff.next()); attempt += 1; continue }
+            return Err(e)
+        }
+        reader.update(&mut context)                # bookmark, always before the commit
+        match commit.commit(tx, &contribution, &context).await {
+            Ok(())  => break,                      # COMMIT: data + metadata together
+            Err(e)  => {                           # `commit` consumed tx — nothing to roll back
+                if fault.should_retry(&e, attempt) { sleep(backoff.next()); attempt += 1; continue }
+                return Err(e)
+            }
+        }
+    }
 ```
 
 **Load-bearing invariants:**
 - **TX boundary = commit interval.** Bigger N ⇒ fewer commits, faster, but more re-done on crash + more memory/chunk.
 - **StepContribution = pending deltas.** Counters fold in only just before commit, so rollback discards them cleanly. In Rust this is a plain owned struct — no shared mutable state.
 - **Atomic bookmark.** Reader position is snapshotted into `ExecutionContext` in the *same* transaction as data + counters ⇒ restart cannot duplicate committed items.
+- **Processing happens once, outside the transaction.** `process` consumes its item, so it *cannot* be re-run; the transaction therefore spans only write-and-commit. Side benefit: a processor making a 200 ms enrichment call per item no longer holds row locks for 200 seconds a chunk.
+- **A retry opens a new transaction.** Enforced by the type system — `rollback(tx)`/`commit(tx)` take `Tx` by value, so the rolled-back one is gone. Reusing it would meet Postgres' `25P02` on every subsequent statement.
 
 ### Restart
 Not special code. Load prior `JobExecution`; skip `COMPLETED` steps; hand the failed step's persisted
 `ExecutionContext` back to its reader; resume the same loop. Engine can't distinguish "fresh at row 4000"
 from "restart at row 4000" — the goal property.
 
-### Fault tolerance as loop perturbations
-- **Retry**: wrap process/write; re-attempt on classified transient error up to a limit + backoff.
-  Write-failure of a chunk can't tell which item is poison ⇒ optional **chunk scanning** (one-at-a-time). `[OPEN]`
-- **Skip**: catch classified bad-item error, `skip_count += 1`, continue up to skip limit.
-- Both are **error-classification policies** — driven by `Result<T,E>` + a classifier trait, not exceptions.
+### Fault tolerance as loop perturbations `[BUILT — Phase 10]`
+Both policies are **error classification** — `Result<T, E>` plus a `Classifier`, never exceptions — and both are
+opt-in per step through `ChunkStep::with_fault_tolerance(FaultTolerance)`. The default is `FailFast`.
+
+**The signatures decide where each policy can attach**, and this is the single most useful thing Phase 10 taught:
+
+| operation | signature | granularity | policy it can support |
+|---|---|---|---|
+| `read()` | `-> Result<Option<Item>, _>` | one item | **skip** |
+| `process(item)` | takes `Self::In` **by value** | one item | **skip** (not retry — the input is consumed) |
+| `write(tx, &[Item])` | **borrows** a slice | N items | **retry** (not skip — it names a chunk, not an item) |
+
+- **Retry** wraps `begin → write → commit`, with `backon` supplying an exponential, jittered, capped schedule.
+  The rollback happens *before* the sleep: waiting on an open transaction holds its row locks and its pooled
+  connection for the whole delay, so backoff would amplify exactly the contention it exists to relieve.
+- **Skip** applies to read and process, bounded by a **step-wide** limit — one bad row in each of a thousand chunks
+  is a broken input file, which a per-chunk counter would call healthy. Past the limit the step fails with
+  `SkipLimitExceeded`, carrying the item error as its source.
+- **A write failure still cannot be skipped**, because it does not name an item ⇒ optional **chunk scanning**
+  (one-at-a-time) remains `[OPEN]`, FR-6.4. This is now the only gap in FR-6.
+- **Classification needs the cause, not the message.** The wrapping `BatchError` variants carry
+  `Cause = Box<dyn Error + Send + Sync>`; stringifying a `sqlx::Error` at the boundary makes a deadlock and a
+  `NOT NULL` violation indistinguishable. Backends supply their own `Classifier` (`PostgresClassifier` reads
+  SQLSTATE); core never learns a SQLSTATE.
 
 ---
 
@@ -189,6 +231,13 @@ Principle: **own orchestration, integrate everything else.** Selections and one-
 **Context:** Need retry/skip classification without exceptions.
 **Decision:** `BatchError` enum, `#[non_exhaustive]`, derived with thiserror; classification via a trait mapping errors → {Retryable, Skippable, Fatal}.
 **Consequences:** Explicit, SemVer-safe growth. Classification is user-overridable.
+**Amended 2026-07-30 (Phase 10a):** the wrapping variants (`Read`/`Write`/`Process`/`Repository`) carry
+`pub type Cause = Box<dyn Error + Send + Sync + 'static>` under `#[source]`, not a `String`. A stringified error is
+a tombstone — it proves a failure happened and destroys everything a classifier needs. Construction goes through
+`BatchError::read/write/process/repository(impl Into<Cause>)`, which accepts a `&str`, a `String` or any concrete
+error, so callers never spell the box and backends can pass the real error through. Domain variants
+(`JobInstanceAlreadyComplete`, `CannotAbandon`, `SkipLimitExceeded`, …) stay structured: they exist for callers who
+branch, and a `String` payload is only ever for wrapping a foreign error.
 
 ### ADR-005 — Storage is trait-first; InMemory is the reference impl
 **Context:** Must not couple to Postgres.
@@ -224,3 +273,26 @@ BatchFlow exposes a launch API; external schedulers trigger it. No home-grown cr
 Users/extenders implement: `ItemReader`, `ItemProcessor`, `ItemWriter`, `JobRepository` (+ stores),
 error `Classifier`, listeners. Everything else is internal orchestration. New backends/readers = new crates,
 no core changes. This is the "own the orchestration, not every component" principle in practice.
+
+### ADR-008 — Fault tolerance is configured per step, as one value `[DECIDED 2026-07-30]`
+**Context:** Phase 10 needed somewhere to hang a classifier, a retry policy and a skip limit. Spring puts them on a
+fault-tolerant step builder; the question was the Rust shape.
+
+**Decision:** one `FaultTolerance` struct (`Box<dyn Classifier>` + `RetryPolicy` + `skip_limit`), held by
+`ChunkStep`, set with `with_fault_tolerance(FaultTolerance)`.
+
+**Consequences:**
+- **`Box<dyn Classifier>`, not a generic parameter.** The `dyn`-vs-generic rule in this codebase is call frequency:
+  boxing once per *error* is free, boxing once per *item* would be millions of allocations. It also keeps
+  `ChunkStep<R, P, W>` from growing a fourth parameter that `new()` could not infer.
+- **The setter takes the whole struct, not `(policy, classifier)`.** Skip arrived after retry and both need the
+  classifier; two setters each owning it would mean calling the second silently resets the first. When two
+  parameters are one decision, pass the decision.
+- **Cost:** `FaultTolerance` has no `Debug` (a trait object cannot derive one), which keeps `ChunkStep` from
+  satisfying API guideline C-DEBUG. The fix when it matters is a manual impl printing the policy and `<classifier>`,
+  not a `Debug` supertrait on `Classifier` — that would tax every user impl for a diagnostic.
+- **`RetryPolicy::attempts` takes `NonZeroU32`**, for the same reason `chunk_size` is `NonZeroUsize`: zero attempts
+  would skip the write and report the chunk done.
+- **The backoff schedule is unbounded**, leaving `should_retry` as the only authority on attempt count. Encoding the
+  limit twice is worse than once, because the two fail differently — exceeding `should_retry` stops the retry, while
+  exhausting the schedule would skip the *sleep* and keep going.

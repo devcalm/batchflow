@@ -16,6 +16,10 @@ authors = ["Oleksii Tsvietaiev <o.tsvietaiev92@gmail.com>"]
 [workspace.dependencies]
 batchflow-core = { path = "crates/batchflow-core", version = "0.0.0" }
 async-trait = "0.1"
+# Backoff *schedules* only. The retry loop is hand-written: its body needs
+# `&mut` access to the writer and committer and must own a fresh `Tx` per
+# attempt, which backon's retry combinator cannot express.
+backon = { version = "1", default-features = false, features = ["std"] }
 thiserror = "2"
 tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread"] }
 serde = { version = "1", features = ["derive"] }

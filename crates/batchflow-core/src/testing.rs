@@ -5,18 +5,100 @@
 //! same fakes, and duplicating them is how test suites drift apart.
 
 use crate::{
-    BatchError, ContextValue, ExecutionContext, InMemoryJobRepository, ItemProcessor, ItemReader,
-    ItemWriter, JobExecution, JobExecutionId, JobInstance, JobInstanceId, JobParameters,
-    JobRepository, Step, StepCommit, StepContribution, StepExecution,
+    BatchError, Classifier, ContextValue, ErrorAction, ExecutionContext, InMemoryJobRepository,
+    ItemProcessor, ItemReader, ItemWriter, JobExecution, JobExecutionId, JobInstance,
+    JobInstanceId, JobParameters, JobRepository, Step, StepCommit, StepContribution, StepExecution,
 };
 use async_trait::async_trait;
-use std::num::NonZeroUsize;
+use std::num::{NonZeroU32, NonZeroUsize};
 use std::sync::{Arc, Mutex};
 
 /// Shorthand for a chunk-size literal. A zero here is a bug in the test itself,
 /// so panicking is the right response.
 pub(crate) fn nz(n: usize) -> NonZeroUsize {
     NonZeroUsize::new(n).expect("test chunk size must be non-zero")
+}
+
+/// Shorthand for a retry-attempt literal.
+pub(crate) fn nz32(n: u32) -> NonZeroU32 {
+    NonZeroU32::new(n).expect("test attempt count must be non-zero")
+}
+
+/// Classifies every error as transient.
+///
+/// No real policy looks like this — it exists so a test can drive the retry
+/// path without needing a backend whose errors carry SQLSTATE codes.
+pub(crate) struct RetryAll;
+
+impl Classifier for RetryAll {
+    fn classify(&self, _error: &BatchError) -> ErrorAction {
+        ErrorAction::Retry
+    }
+}
+
+/// Classifies every error as a bad item.
+pub(crate) struct SkipAll;
+
+impl Classifier for SkipAll {
+    fn classify(&self, _error: &BatchError) -> ErrorAction {
+        ErrorAction::Skip
+    }
+}
+
+/// Errors on any item equal to `poison`, *having already advanced past it*.
+///
+/// The advance is what makes a read error skippable at all: a reader that
+/// errors without moving on would be handed the same item forever.
+pub(crate) struct PoisonReader {
+    pub items: Vec<u32>,
+    pub pos: usize,
+    pub poison: u32,
+}
+
+impl PoisonReader {
+    pub(crate) fn new(items: Vec<u32>, poison: u32) -> Self {
+        Self {
+            items,
+            pos: 0,
+            poison,
+        }
+    }
+}
+
+impl ItemReader for PoisonReader {
+    type Item = u32;
+
+    async fn read(&mut self) -> Result<Option<Self::Item>, BatchError> {
+        let Some(item) = self.items.get(self.pos).copied() else {
+            return Ok(None);
+        };
+        self.pos += 1;
+
+        if item == self.poison {
+            return Err(BatchError::read(format!("malformed row {item}")));
+        }
+        Ok(Some(item))
+    }
+}
+
+/// Doubles every item except `poison`, which fails.
+///
+/// Never returns `None`, so a test can tell a skip from a filter without the
+/// two counters shadowing each other.
+pub(crate) struct PoisonProcessor {
+    pub poison: u32,
+}
+
+impl ItemProcessor for PoisonProcessor {
+    type In = u32;
+    type Out = u32;
+
+    async fn process(&mut self, item: u32) -> Result<Option<u32>, BatchError> {
+        if item == self.poison {
+            return Err(BatchError::process(format!("bad item {item}")));
+        }
+        Ok(Some(item * 2))
+    }
 }
 
 /// Reads a fixed list of items, then reports exhaustion.
@@ -80,7 +162,7 @@ impl ItemReader for BookmarkReader {
             // `try_from`, not `as`: a negative position is corrupt data, and
             // `as` would wrap it into a huge number instead of complaining.
             self.pos = usize::try_from(position)
-                .map_err(|_| BatchError::Read(format!("negative bookmark {position}")))?;
+                .map_err(|_| BatchError::read(format!("negative bookmark {position}")))?;
         }
 
         Ok(())
@@ -102,7 +184,7 @@ impl ItemReader for FailingReader {
 
     async fn read(&mut self) -> Result<Option<u32>, BatchError> {
         if self.remaining_ok == 0 {
-            return Err(BatchError::Read("boom".into()));
+            return Err(BatchError::read("boom"));
         }
         self.remaining_ok -= 1;
         Ok(Some(7))
@@ -155,7 +237,7 @@ impl ItemWriter for FailingWriter {
     type Item = u32;
 
     async fn write(&mut self, _items: &[u32]) -> Result<(), BatchError> {
-        Err(BatchError::Write("boom".into()))
+        Err(BatchError::write("boom"))
     }
 }
 
@@ -180,9 +262,40 @@ impl ItemWriter for FlakyWriter {
 
     async fn write(&mut self, items: &[u32]) -> Result<(), BatchError> {
         if self.ok_writes == 0 {
-            return Err(BatchError::Write("boom".into()));
+            return Err(BatchError::write("boom"));
         }
         self.ok_writes -= 1;
+        self.written.extend_from_slice(items);
+        Ok(())
+    }
+}
+
+/// Fails its first `failures` writes, then succeeds.
+///
+/// The inverse of [`FlakyWriter`], which succeeds first: this one exercises
+/// recovery, that one exercises partial progress.
+pub(crate) struct TransientWriter {
+    pub written: Vec<u32>,
+    pub failures: usize,
+}
+
+impl TransientWriter {
+    pub(crate) fn new(failures: usize) -> Self {
+        Self {
+            written: Vec::new(),
+            failures,
+        }
+    }
+}
+
+impl ItemWriter for TransientWriter {
+    type Item = u32;
+
+    async fn write(&mut self, items: &[u32]) -> Result<(), BatchError> {
+        if self.failures > 0 {
+            self.failures -= 1;
+            return Err(BatchError::write("deadlock"));
+        }
         self.written.extend_from_slice(items);
         Ok(())
     }
@@ -222,7 +335,7 @@ impl ItemWriter for SharedWriter {
 
     async fn write(&mut self, items: &[u32]) -> Result<(), BatchError> {
         if self.ok_writes == 0 {
-            return Err(BatchError::Write("boom".into()));
+            return Err(BatchError::write("boom"));
         }
         self.ok_writes -= 1;
 
@@ -258,7 +371,7 @@ impl JobRepository for CommitFails {
     }
 
     async fn commit(&self, _tx: ()) -> Result<(), BatchError> {
-        Err(BatchError::Repository("commit failed".into()))
+        Err(BatchError::repository("commit failed"))
     }
 
     async fn rollback(&self, tx: ()) -> Result<(), BatchError> {
@@ -379,8 +492,20 @@ impl Step for FailingStep {
         _context: &mut ExecutionContext,
         _commit: &mut dyn StepCommit<()>,
     ) -> Result<(), BatchError> {
-        Err(BatchError::Process("boom".into()))
+        Err(BatchError::process("boom"))
     }
+}
+
+/// What happened at a transaction boundary, in order.
+///
+/// Counters alone cannot tell "rolled back, then opened a fresh transaction"
+/// from "opened two transactions and rolled one back at the end" — only the
+/// sequence can.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CommitEvent {
+    Begin,
+    Commit,
+    Rollback,
 }
 
 /// Accumulates what a step commits, so tests can assert on totals and on the
@@ -392,11 +517,21 @@ pub(crate) struct RecordingCommit {
     pub commits: usize,
     pub rollbacks: usize,
     pub context: ExecutionContext,
+    pub events: Vec<CommitEvent>,
+    /// Fail this many `commit` calls before the first success.
+    pub commit_failures: usize,
 }
 
 impl RecordingCommit {
     pub(crate) fn new() -> Self {
         Self::default()
+    }
+
+    pub(crate) fn failing_commits(commit_failures: usize) -> Self {
+        Self {
+            commit_failures,
+            ..Self::default()
+        }
     }
 }
 
@@ -404,6 +539,7 @@ impl RecordingCommit {
 impl StepCommit<()> for RecordingCommit {
     async fn begin(&mut self) -> Result<(), BatchError> {
         self.begins += 1;
+        self.events.push(CommitEvent::Begin);
         Ok(())
     }
 
@@ -413,6 +549,15 @@ impl StepCommit<()> for RecordingCommit {
         contribution: &StepContribution,
         context: &ExecutionContext,
     ) -> Result<(), BatchError> {
+        // Recorded on entry, so a *failed* commit still shows in the sequence —
+        // otherwise a test cannot see that no rollback followed it.
+        self.events.push(CommitEvent::Commit);
+
+        if self.commit_failures > 0 {
+            self.commit_failures -= 1;
+            return Err(BatchError::repository("serialization failure at commit"));
+        }
+
         self.total.apply(contribution);
         self.commits += 1;
         self.context = context.clone();
@@ -421,6 +566,7 @@ impl StepCommit<()> for RecordingCommit {
 
     async fn rollback(&mut self, _tx: ()) -> Result<(), BatchError> {
         self.rollbacks += 1;
+        self.events.push(CommitEvent::Rollback);
         Ok(())
     }
 }

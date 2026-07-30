@@ -6,11 +6,13 @@
 mod chunk;
 mod error;
 mod execution;
+mod fault;
 mod item;
 mod job;
 mod launcher;
 mod step;
 
+mod classifier;
 mod context;
 mod memory;
 mod repository;
@@ -19,14 +21,15 @@ mod testing;
 
 /// Re-exported so implementing [`Step`] needs no direct `async-trait` dependency.
 pub use async_trait::async_trait;
-
-pub use chunk::{process_chunk, read_chunk, run_step};
+pub use chunk::{ProcessedChunk, process_chunk, read_chunk, run_step};
+pub use classifier::{Classifier, ErrorAction, FailFast};
 pub use context::{ContextValue, ExecutionContext};
-pub use error::BatchError;
+pub use error::{BatchError, Cause};
 pub use execution::{
     BatchStatus, JobExecution, JobExecutionId, JobInstance, JobInstanceId, JobParameter,
     JobParameters, StepExecution, StepExecutionId,
 };
+pub use fault::{FaultTolerance, ItemDisposition, RetryPolicy};
 pub use item::{ItemProcessor, ItemReader, ItemWriter, TransactionalWriter, Unmanaged};
 pub use job::{HasSteps, Job, JobBuilder, NoSteps};
 pub use launcher::JobLauncher;
