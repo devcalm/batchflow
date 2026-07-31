@@ -231,7 +231,13 @@ where
                 // the whole delay, which is how one deadlock becomes a pile-up
                 // of them — backoff amplifying the contention it exists to
                 // relieve.
-                commit.rollback(tx).await?;
+                // A rollback that itself failed leaves the transaction in an
+                // unknown state, so this does not retry — and it reports the
+                // write error, not the rollback error, because the write is why
+                // there was a rollback at all.
+                if let Err(rollback_error) = commit.rollback(tx).await {
+                    return Err(error.with_cleanup(Err(rollback_error)));
+                }
 
                 if fault.should_retry(&error, attempt) {
                     metrics.retries.increment(1);
@@ -299,6 +305,7 @@ mod tests {
         TransientWriter, VecReader, block_on, counter, labels_of, nz, nz32, recorded,
     };
     use crate::{ContextValue, RetryPolicy, Unmanaged};
+    use std::error::Error;
     use tokio::time::Instant;
 
     #[tokio::test]
@@ -1036,5 +1043,49 @@ mod tests {
 
         assert_eq!(counter(&snapshot, ITEMS_SKIPPED, Some("read")), Some(1));
         assert_eq!(counter(&snapshot, ITEMS_SKIPPED, Some("process")), Some(0));
+    }
+
+    /// A rollback that fails must not become the error the caller sees: the
+    /// write is *why* there was a rollback, and reporting only the rollback
+    /// leaves nobody able to say what the step was actually doing wrong.
+    #[tokio::test]
+    async fn a_failed_rollback_does_not_hide_the_write_error() {
+        let mut reader = VecReader::new(vec![2, 4]);
+        let mut processor = EvenDoubler;
+        let mut writer = Unmanaged(FailingWriter);
+        let mut commit = RecordingCommit::failing_rollback();
+        let mut context = ExecutionContext::new();
+
+        let error = run_step(
+            &mut reader,
+            &mut processor,
+            &mut writer,
+            &ChunkConfig::new(nz(2), &FaultTolerance::default(), "nightly", "load"),
+            &mut context,
+            &mut commit,
+        )
+        .await
+        .unwrap_err();
+
+        let BatchError::CleanupFailed {
+            cause,
+            during_cleanup,
+        } = &error
+        else {
+            panic!("expected both failures to survive, got {error:?}");
+        };
+        assert!(matches!(**cause, BatchError::Write(_)));
+        assert!(matches!(**during_cleanup, BatchError::Repository(_)));
+
+        // A `Classifier` walks `source()` looking for a concrete backend error
+        // (`PostgresClassifier` downcasts to `sqlx::Error`). Wrapping must not
+        // break that walk, so assert the innermost cause is still reachable.
+        let mut node: Option<&(dyn Error + 'static)> = error.source();
+        let mut depth = 0;
+        while let Some(current) = node {
+            depth += 1;
+            node = current.source();
+        }
+        assert_eq!(depth, 2, "chain: Box<BatchError::Write> -> its Cause");
     }
 }

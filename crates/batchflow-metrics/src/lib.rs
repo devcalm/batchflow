@@ -24,6 +24,7 @@
 //! Prometheus integration that coupling is deliberate; it is worth being
 //! explicit that a breaking release there is a breaking release here.
 #![forbid(unsafe_code)]
+#![warn(missing_docs)]
 
 use batchflow_core::metrics::{CHUNK_DURATION, STEP_DURATION};
 

@@ -4,6 +4,7 @@
 //! chunk-loop transaction is real: `Tx` is a `sqlx` transaction, so a chunk's
 //! rows, its counters and its bookmark commit together or not at all.
 #![forbid(unsafe_code)]
+#![warn(missing_docs)]
 
 mod classifier;
 
@@ -22,15 +23,24 @@ const FAILED: &str = "FAILED";
 const STOPPED: &str = "STOPPED";
 const ABANDONED: &str = "ABANDONED";
 
+/// A durable [`JobRepository`] backed by Postgres.
+///
+/// `Tx` is a real `sqlx::Transaction`, so a step's rows, counters and bookmark
+/// commit together (FR-2.4). Instance identity is enforced by a
+/// `UNIQUE (job_name, parameters)` constraint rather than by the launcher, so
+/// two schedulers cannot both win the check-then-act race.
+#[derive(Debug, Clone)]
 pub struct PostgresJobRepository {
     pool: PgPool,
 }
 
 impl PostgresJobRepository {
+    /// Wraps an existing pool. Call [`migrate`](Self::migrate) before first use.
     pub fn new(pool: PgPool) -> Self {
         Self { pool }
     }
 
+    /// The underlying pool, so a writer can enlist against the same database.
     pub fn pool(&self) -> &PgPool {
         &self.pool
     }

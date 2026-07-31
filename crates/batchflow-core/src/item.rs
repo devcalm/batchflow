@@ -1,9 +1,19 @@
 use crate::{BatchError, ExecutionContext};
 use std::future::Future;
 
+/// Produces items one at a time, and remembers where it got to.
+///
+/// `&mut self` means a reader cannot be shared, so parallelism comes from
+/// partitioning rather than from sharing one reader.
+///
+/// The return type is written out rather than declared `async fn` so it can
+/// carry `+ Send`: an `async fn` in a trait produces an unnameable future type
+/// that no bound can constrain. Implementors still write a plain `async fn`.
 pub trait ItemReader {
+    /// What this reader produces.
     type Item;
 
+    /// Reads the next item, or `Ok(None)` at end of input.
     fn read(&mut self) -> impl Future<Output = Result<Option<Self::Item>, BatchError>> + Send;
 
     /// Restore position from a previous run.
@@ -28,9 +38,16 @@ pub trait ItemReader {
     fn update(&self, _context: &mut ExecutionContext) {}
 }
 
+/// Writes a whole chunk at once.
+///
+/// Chunk-oriented rather than per-item so a backend can batch its I/O: one
+/// `COPY` or one multi-row `INSERT` per commit interval, not one round trip per
+/// row.
 pub trait ItemWriter {
+    /// What this writer accepts.
     type Item;
 
+    /// Writes one chunk. Called once per commit interval.
     fn write(
         &mut self,
         items: &[Self::Item],
@@ -44,8 +61,10 @@ pub trait ItemWriter {
 /// [`ItemWriter`] and are adapted with [`Unmanaged`], which is an explicit
 /// acceptance of at-least-once for that step.
 pub trait TransactionalWriter<Tx>: Send {
+    /// What this writer accepts.
     type Item;
 
+    /// Writes one chunk inside the step's transaction.
     fn write(
         &mut self,
         tx: &mut Tx,
@@ -60,6 +79,7 @@ pub trait TransactionalWriter<Tx>: Send {
 /// is *not* an `ItemWriter`. A distinct `Self` type is the way out, and making
 /// it explicit at the call site is the point — non-transactional writing should
 /// be visible, not inferred.
+#[derive(Debug, Clone, Copy, Default)]
 pub struct Unmanaged<W>(pub W);
 
 impl<W, Tx> TransactionalWriter<Tx> for Unmanaged<W>
@@ -79,10 +99,16 @@ where
     }
 }
 
+/// Transforms one item, or drops it.
 pub trait ItemProcessor {
+    /// What this processor consumes.
     type In;
+    /// What it produces.
     type Out;
 
+    /// Transforms one item. `Ok(None)` filters it out, which is counted
+    /// separately from a skip: a filter is a deliberate decision, a skip is a
+    /// tolerated failure.
     fn process(
         &mut self,
         item: Self::In,

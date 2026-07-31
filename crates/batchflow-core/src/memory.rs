@@ -6,6 +6,12 @@ use crate::{
 use std::collections::HashMap;
 use std::sync::Mutex;
 
+/// A [`JobRepository`] held in memory, for tests and for trying things out.
+///
+/// Has no transactions, so `Tx = ()` and every writer is effectively
+/// unmanaged - which is why a transaction abstraction must never be validated
+/// against it. Not durable: everything is lost when the process exits, so a
+/// restart across processes needs a real backend.
 #[derive(Debug, Default)]
 pub struct InMemoryJobRepository {
     inner: Mutex<Inner>,

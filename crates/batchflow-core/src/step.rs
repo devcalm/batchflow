@@ -4,6 +4,15 @@ use crate::{BatchError, ExecutionContext, ItemProcessor, ItemReader, Transaction
 use async_trait::async_trait;
 use std::num::NonZeroUsize;
 
+/// A chunk's pending counter deltas, folded into a [`StepExecution`] only at
+/// the commit point.
+///
+/// Separate from `StepExecution` because the owners differ: a step reports
+/// deltas, the repository owns the persisted totals and the id. A step cannot
+/// return a `StepExecution` at all - it has no repository to mint one.
+///
+/// Fields are private with increment-only setters, so a step can add work it
+/// did but never assert a total.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct StepContribution {
     read_count: usize,
@@ -13,34 +22,42 @@ pub struct StepContribution {
 }
 
 impl StepContribution {
+    /// A contribution with every counter at zero.
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Records `count` items read.
     pub fn increment_read(&mut self, count: usize) {
         self.read_count += count;
     }
 
+    /// Records `count` items written.
     pub fn increment_write(&mut self, count: usize) {
         self.write_count += count;
     }
 
+    /// Records `count` items filtered out by the processor.
     pub fn increment_filter(&mut self, count: usize) {
         self.filter_count += count;
     }
 
+    /// Records `count` items skipped after a tolerated failure.
     pub fn increment_skip(&mut self, count: usize) {
         self.skip_count += count;
     }
 
+    /// Items read.
     pub fn read_count(&self) -> usize {
         self.read_count
     }
 
+    /// Items written.
     pub fn write_count(&self) -> usize {
         self.write_count
     }
 
+    /// Items filtered out.
     pub fn filter_count(&self) -> usize {
         self.filter_count
     }
@@ -80,8 +97,10 @@ pub trait StepCommit<Tx = ()>: Send {
     /// unlabelled metrics for the lifetime of the process.
     fn job_name(&self) -> &str;
 
+    /// Opens the transaction for one chunk.
     async fn begin(&mut self) -> Result<Tx, BatchError>;
 
+    /// Folds `contribution`, stores `context` as the bookmark, and commits.
     async fn commit(
         &mut self,
         tx: Tx,
@@ -89,11 +108,21 @@ pub trait StepCommit<Tx = ()>: Send {
         context: &ExecutionContext,
     ) -> Result<(), BatchError>;
 
+    /// Discards the chunk's work. Taking `tx` by value is what makes reusing a
+    /// rolled-back transaction fail to compile.
     async fn rollback(&mut self, tx: Tx) -> Result<(), BatchError>;
 }
 
+/// One unit of work in a [`Job`](crate::Job).
+///
+/// `Send`, and boxed as `Box<dyn Step<Tx>>` so a job can hold steps of
+/// different concrete types - which is why this uses `#[async_trait]` rather
+/// than the native async-fn-in-trait the item traits use: RPITIT is not
+/// `dyn`-compatible.
 #[async_trait]
 pub trait Step<Tx = ()>: Send {
+    /// The step's name. Stable across restarts, since it is the key a resume
+    /// looks the previous attempt up by.
     fn name(&self) -> &str;
 
     /// Commit once per unit of work that has become durable. Anything not
@@ -106,6 +135,11 @@ pub trait Step<Tx = ()>: Send {
     ) -> Result<(), BatchError>;
 }
 
+/// The chunk-oriented [`Step`]: read, process, write, commit, repeat.
+///
+/// Owns its reader, processor and writer, and drives them in commit-interval
+/// sized chunks. Fault tolerance is off by default - see
+/// [`with_fault_tolerance`](ChunkStep::with_fault_tolerance).
 pub struct ChunkStep<R, P, W> {
     name: String,
     reader: R,
@@ -116,6 +150,11 @@ pub struct ChunkStep<R, P, W> {
 }
 
 impl<R, P, W> ChunkStep<R, P, W> {
+    /// Wires a pipeline together with `chunk_size` as its commit interval.
+    ///
+    /// `NonZeroUsize` because a zero interval would write nothing and report
+    /// success - a failure mode worth making unrepresentable rather than
+    /// checking for.
     pub fn new(
         name: impl Into<String>,
         reader: R,
@@ -148,6 +187,19 @@ impl<R, P, W> ChunkStep<R, P, W> {
     /// method alone is ambiguous now that `Step` is generic.
     pub fn name(&self) -> &str {
         &self.name
+    }
+}
+
+/// Hand-written so the reader, processor and writer need no `Debug` bound of
+/// their own - a step is identified by its wiring, not by its collaborators'
+/// internals.
+impl<R, P, W> std::fmt::Debug for ChunkStep<R, P, W> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ChunkStep")
+            .field("name", &self.name)
+            .field("chunk_size", &self.chunk_size)
+            .field("fault", &self.fault)
+            .finish_non_exhaustive()
     }
 }
 

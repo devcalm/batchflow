@@ -29,8 +29,11 @@ use std::collections::BTreeMap;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum ContextValue {
+    /// A text value.
     String(String),
+    /// A 64-bit integer value.
     Long(i64),
+    /// A boolean value.
     Bool(bool),
 }
 
@@ -59,18 +62,23 @@ impl ContextValue {
 pub struct ExecutionContext(BTreeMap<String, ContextValue>);
 
 impl ExecutionContext {
+    /// An empty context - what a step starts with on a fresh run.
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Stores a value, replacing any previous one under `key`.
     pub fn put(&mut self, key: impl Into<String>, value: ContextValue) {
         self.0.insert(key.into(), value);
     }
 
+    /// The raw value under `key`, if any. Prefer the typed getters, which tell
+    /// "absent" apart from "wrong type".
     pub fn get(&self, key: &str) -> Option<&ContextValue> {
         self.0.get(key)
     }
 
+    /// Whether anything has been recorded.
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
@@ -102,6 +110,7 @@ impl ExecutionContext {
         }
     }
 
+    /// Reads `key` as a string. `Ok(None)` is absent; `Err` is the wrong type.
     pub fn get_string(&self, key: &str) -> Result<Option<&str>, BatchError> {
         match self.0.get(key) {
             None => Ok(None),
@@ -114,6 +123,7 @@ impl ExecutionContext {
         }
     }
 
+    /// Reads `key` as a bool. `Ok(None)` is absent; `Err` is the wrong type.
     pub fn get_bool(&self, key: &str) -> Result<Option<bool>, BatchError> {
         match self.0.get(key) {
             None => Ok(None),

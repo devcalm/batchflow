@@ -2,6 +2,7 @@
 //!
 //! Core traits and execution engine for BatchFlow.
 #![forbid(unsafe_code)]
+#![warn(missing_docs)]
 
 mod chunk;
 mod error;

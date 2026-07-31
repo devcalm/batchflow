@@ -6,9 +6,10 @@
 
 use crate::metrics::LABEL_PHASE;
 use crate::{
-    BatchError, Classifier, ContextValue, ErrorAction, ExecutionContext, InMemoryJobRepository,
-    ItemProcessor, ItemReader, ItemWriter, JobExecution, JobExecutionId, JobInstance,
-    JobInstanceId, JobParameters, JobRepository, Step, StepCommit, StepContribution, StepExecution,
+    BatchError, BatchStatus, Classifier, ContextValue, ErrorAction, ExecutionContext,
+    InMemoryJobRepository, ItemProcessor, ItemReader, ItemWriter, JobExecution, JobExecutionId,
+    JobInstance, JobInstanceId, JobParameters, JobRepository, Step, StepCommit, StepContribution,
+    StepExecution,
 };
 use ::metrics::{Key, SharedString, Unit};
 use async_trait::async_trait;
@@ -525,6 +526,8 @@ pub(crate) struct RecordingCommit {
     pub events: Vec<CommitEvent>,
     /// Fail this many `commit` calls before the first success.
     pub commit_failures: usize,
+    /// Fail every `rollback`.
+    pub rollback_fails: bool,
 }
 
 impl RecordingCommit {
@@ -535,6 +538,13 @@ impl RecordingCommit {
     pub(crate) fn failing_commits(commit_failures: usize) -> Self {
         Self {
             commit_failures,
+            ..Self::default()
+        }
+    }
+
+    pub(crate) fn failing_rollback() -> Self {
+        Self {
+            rollback_fails: true,
             ..Self::default()
         }
     }
@@ -576,7 +586,131 @@ impl StepCommit<()> for RecordingCommit {
     async fn rollback(&mut self, _tx: ()) -> Result<(), BatchError> {
         self.rollbacks += 1;
         self.events.push(CommitEvent::Rollback);
+
+        if self.rollback_fails {
+            return Err(BatchError::repository("rollback failed"));
+        }
         Ok(())
+    }
+}
+
+/// Accepts everything except a *terminal failure* status write, which it
+/// rejects.
+///
+/// Narrow on purpose: failing every write would stop a job before it ever
+/// produced an outcome to mask, so the test could not reach the case it exists
+/// for.
+pub(crate) struct StatusWriteFails(InMemoryJobRepository);
+
+impl StatusWriteFails {
+    pub(crate) fn new() -> Self {
+        Self(InMemoryJobRepository::default())
+    }
+}
+
+impl JobRepository for StatusWriteFails {
+    type Tx = ();
+
+    async fn begin(&self) -> Result<(), BatchError> {
+        Ok(())
+    }
+
+    async fn commit(&self, tx: ()) -> Result<(), BatchError> {
+        self.0.commit(tx).await
+    }
+
+    async fn rollback(&self, tx: ()) -> Result<(), BatchError> {
+        self.0.rollback(tx).await
+    }
+
+    async fn update_step_execution_in(
+        &self,
+        tx: &mut (),
+        step_execution: &StepExecution,
+    ) -> Result<(), BatchError> {
+        self.0.update_step_execution_in(tx, step_execution).await
+    }
+
+    async fn find_or_create_instance(
+        &self,
+        job_name: &str,
+        parameters: &JobParameters,
+    ) -> Result<JobInstance, BatchError> {
+        self.0.find_or_create_instance(job_name, parameters).await
+    }
+
+    async fn find_instance(
+        &self,
+        job_name: &str,
+        parameters: &JobParameters,
+    ) -> Result<Option<JobInstance>, BatchError> {
+        self.0.find_instance(job_name, parameters).await
+    }
+
+    async fn create_execution(
+        &self,
+        instance_id: JobInstanceId,
+    ) -> Result<JobExecution, BatchError> {
+        self.0.create_execution(instance_id).await
+    }
+
+    async fn update_execution(&self, execution: &JobExecution) -> Result<(), BatchError> {
+        // The record still lands, so the store is not left inconsistent - only
+        // the caller's report of it fails, which is the case under test.
+        self.0.update_execution(execution).await?;
+
+        if execution.status() == BatchStatus::Failed {
+            return Err(BatchError::repository("status write failed"));
+        }
+        Ok(())
+    }
+
+    async fn last_execution(
+        &self,
+        instance_id: JobInstanceId,
+    ) -> Result<Option<JobExecution>, BatchError> {
+        self.0.last_execution(instance_id).await
+    }
+
+    async fn abandon_execution(&self, execution_id: JobExecutionId) -> Result<(), BatchError> {
+        self.0.abandon_execution(execution_id).await
+    }
+
+    async fn create_step_execution(
+        &self,
+        job_execution_id: JobExecutionId,
+        step_name: &str,
+    ) -> Result<StepExecution, BatchError> {
+        self.0
+            .create_step_execution(job_execution_id, step_name)
+            .await
+    }
+
+    async fn update_step_execution(
+        &self,
+        step_execution: &StepExecution,
+    ) -> Result<(), BatchError> {
+        self.0.update_step_execution(step_execution).await?;
+
+        if step_execution.status() == BatchStatus::Failed {
+            return Err(BatchError::repository("status write failed"));
+        }
+        Ok(())
+    }
+
+    async fn last_step_execution(
+        &self,
+        instance_id: JobInstanceId,
+        step_name: &str,
+    ) -> Result<Option<StepExecution>, BatchError> {
+        self.0.last_step_execution(instance_id, step_name).await
+    }
+
+    async fn step_executions(
+        &self,
+        job_execution_id: JobExecutionId,
+    ) -> Result<Vec<StepExecution>, BatchError> {
+        self.0.step_executions(job_execution_id).await
     }
 }
 

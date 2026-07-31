@@ -47,6 +47,7 @@ impl RetryPolicy {
         self
     }
 
+    /// Total attempts allowed, including the first.
     pub fn max_attempts(&self) -> u32 {
         self.max_attempts.get()
     }
@@ -110,16 +111,33 @@ impl Default for FaultTolerance {
     }
 }
 
+/// Hand-written because [`Classifier`] is a trait object, and per ADR-008 a
+/// `Debug` supertrait would tax every user's impl for the sake of a diagnostic.
+/// The classifier prints as a placeholder; the settings that get tuned print in
+/// full.
+impl std::fmt::Debug for FaultTolerance {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FaultTolerance")
+            .field("classifier", &format_args!("<dyn Classifier>"))
+            .field("retry", &self.retry)
+            .field("skip_limit", &self.skip_limit)
+            .finish()
+    }
+}
+
 impl FaultTolerance {
+    /// A fail-fast policy: no retries, no skips.
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Sets the classifier that decides retry vs. skip vs. fail.
     pub fn classifier(mut self, classifier: impl Classifier + 'static) -> Self {
         self.classifier = Box::new(classifier);
         self
     }
 
+    /// Sets how many attempts a retryable chunk gets, and how long it waits.
     pub fn retry(mut self, retry: RetryPolicy) -> Self {
         self.retry = retry;
         self

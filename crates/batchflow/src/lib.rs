@@ -57,6 +57,7 @@
 //! }
 //! ```
 #![forbid(unsafe_code)]
+#![warn(missing_docs)]
 
 #[doc(inline)]
 pub use batchflow_core;

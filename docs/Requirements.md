@@ -74,7 +74,7 @@ everything else (async runtime, DB, serialization, tracing, metrics).
 - FR-7.2 Idiomatic form `[OPEN]`: trait objects vs. typed callbacks vs. an event stream.
 
 ### FR-8 — Observability
-- FR-8.1 **Metrics**: jobs/steps started/completed/failed, throughput, chunk duration, retries, skips.
+- FR-8.1 **Metrics** `[DONE 2026-07-31]`: jobs/steps started/finished by status, items read/written/filtered/skipped (by phase), chunks committed, retries, chunk and step duration. Emitted through the `metrics` facade from `batchflow-core`; Prometheus exporter in `batchflow-metrics`. Throughput is deliberately *not* a metric — it is `rate(batchflow_items_written_total[5m])`, a question for the query language rather than a pre-averaged number the library computes at one window it chose.
 - FR-8.2 **Tracing**: spans per job/step/chunk; correlation IDs; OpenTelemetry export.
 
 ### FR-9 — Scheduling (integration, not engine)

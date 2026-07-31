@@ -7,15 +7,18 @@ use ::metrics::counter;
 ///
 /// The launcher decides *whether* a job may run; the [`Job`] drives its steps.
 /// Both reach the repository — a step never does.
+#[derive(Debug)]
 pub struct JobLauncher<R> {
     repository: R,
 }
 
 impl<R: JobRepository> JobLauncher<R> {
+    /// Takes ownership of the metadata store every launch will record into.
     pub fn new(repository: R) -> Self {
         Self { repository }
     }
 
+    /// The repository, for callers that need to query metadata directly.
     pub fn repository(&self) -> &R {
         &self.repository
     }
@@ -98,16 +101,26 @@ impl<R: JobRepository> JobLauncher<R> {
         };
 
         execution.set_status(status);
-        self.repository.update_execution(&execution).await?;
+        let recorded = self.repository.update_execution(&execution).await;
 
-        counter!(
-            JOBS_FINISHED,
-            LABEL_JOB => job.name().to_owned(),
-            LABEL_STATUS => status_label(status),
-        )
-        .increment(1);
+        if recorded.is_ok() {
+            counter!(
+                JOBS_FINISHED,
+                LABEL_JOB => job.name().to_owned(),
+                LABEL_STATUS => status_label(status),
+            )
+            .increment(1);
+        }
 
-        outcome?;
+        // The job's own failure is the cause; failing to record it is a
+        // consequence, so the cause is what the caller sees. A bare `recorded?`
+        // here would report the store's error and throw the job's away —
+        // leaving the caller unable to say why the run failed at all.
+        if let Err(error) = outcome {
+            return Err(error.with_cleanup(recorded));
+        }
+
+        recorded?;
         Ok(execution)
     }
 }
@@ -118,7 +131,7 @@ mod tests {
     use crate::metrics::{LABEL_STEP, STEP_DURATION, STEPS_FINISHED, STEPS_STARTED};
     use crate::testing::{
         BookmarkReader, CollectingWriter, EvenDoubler, FailingStep, LogStep, Recorded, SharedSink,
-        VecReader, block_on, counter, labels_of, nz, recorded,
+        StatusWriteFails, VecReader, block_on, counter, labels_of, nz, recorded,
     };
     use crate::{ChunkStep, InMemoryJobRepository, JobExecutionId, JobParameter, Unmanaged};
     use metrics_util::debugging::DebugValue;
@@ -766,5 +779,57 @@ mod tests {
                 _ => 0,
             })
             .unwrap_or(0)
+    }
+
+    /// Debt 3. A store that rejects the terminal status write must not become
+    /// the only thing the caller hears about.
+    ///
+    /// Both failures matter and they call for different responses: the step
+    /// error says what to fix, while the failed status write means the metadata
+    /// is stale and the instance may need abandoning before it can run again.
+    #[tokio::test]
+    async fn a_failed_status_write_does_not_hide_the_job_error() {
+        let launcher = JobLauncher::new(StatusWriteFails::new());
+        let mut job = failing_job();
+
+        let error = launcher
+            .run(&mut job, &params("2026-07-31"))
+            .await
+            .unwrap_err();
+
+        let BatchError::CleanupFailed {
+            cause,
+            during_cleanup,
+        } = &error
+        else {
+            panic!("expected both failures to survive, got {error:?}");
+        };
+
+        // Both status writes failed - the step's and the job's - so each layer
+        // records its own, and the innermost cause is still the step's error.
+        assert!(matches!(**during_cleanup, BatchError::Repository(_)));
+
+        let BatchError::CleanupFailed { cause: step, .. } = &**cause else {
+            panic!("expected the step layer to record its own failure, got {cause:?}");
+        };
+        assert!(matches!(**step, BatchError::Process(_)), "got {step:?}");
+
+        // Everything is in one message, so nothing has to be recovered from a
+        // log line.
+        let rendered = error.to_string();
+        assert!(rendered.contains("boom"), "{rendered}");
+        assert!(rendered.contains("cleanup also failed"), "{rendered}");
+    }
+
+    /// The mirror case: a healthy job whose status write fails still reports the
+    /// store's error, because there is nothing else to report.
+    #[tokio::test]
+    async fn a_successful_job_still_reports_a_failed_status_write() {
+        let launcher = JobLauncher::new(StatusWriteFails::new());
+        let mut job = ok_job();
+
+        // `StatusWriteFails` only rejects a *failed* status, so a successful run
+        // is unaffected - the control that keeps the test above honest.
+        launcher.run(&mut job, &params("2026-07-31")).await.unwrap();
     }
 }

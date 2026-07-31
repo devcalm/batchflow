@@ -2,22 +2,41 @@ use crate::{ExecutionContext, StepContribution};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
+/// Where an execution is in its lifecycle.
+///
+/// `Completed` is the only status that blocks a relaunch (FR-4.4); the three
+/// terminal-but-unsuccessful ones are the restart door.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum BatchStatus {
+    /// Created, not yet running.
     Starting,
+    /// Running - or the process died without recording anything else.
     Started,
+    /// Finished successfully. Terminal, and refuses a relaunch.
     Completed,
+    /// Finished unsuccessfully. Terminal, and may be restarted.
     Failed,
+    /// Halted on request. Terminal, and may be restarted.
     Stopped,
+    /// Declared dead by an operator, unblocking its instance. Terminal.
     Abandoned,
 }
 
+/// One typed value in a [`JobParameters`] set.
+///
+/// There is deliberately **no `Double(f64)`**: `f64` implements neither `Eq`
+/// nor `Hash` (NaN, negative zero), and since these values *are* the identity
+/// key, the missing impls are the compiler refusing to let identity be
+/// float-keyed.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum JobParameter {
+    /// A text value.
     String(String),
+    /// A 64-bit integer value.
     Long(i64),
+    /// A boolean value.
     Bool(bool),
 }
 
@@ -29,57 +48,80 @@ pub enum JobParameter {
 pub struct JobParameters(BTreeMap<String, JobParameter>);
 
 impl JobParameters {
+    /// An empty set.
     pub fn new() -> Self {
         Self(BTreeMap::new())
     }
 
+    /// Adds or replaces one parameter. Changing any value selects a *different*
+    /// [`JobInstance`].
     pub fn with(mut self, key: impl Into<String>, value: JobParameter) -> Self {
         self.0.insert(key.into(), value);
         self
     }
 
+    /// Looks one parameter up.
     pub fn get(&self, key: &str) -> Option<&JobParameter> {
         self.0.get(key)
     }
 }
 
+/// Identifies a [`JobInstance`].
+///
+/// Separate newtypes rather than a shared alias, so passing an execution id
+/// where an instance id belongs is a compile error rather than a lookup that
+/// quietly finds the wrong row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct JobInstanceId(i64);
+/// Identifies a [`JobExecution`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct JobExecutionId(i64);
+/// Identifies a [`StepExecution`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct StepExecutionId(i64);
 
 impl JobInstanceId {
+    /// Wraps a raw id. Minted by the repository, not by application code.
     pub fn new(id: i64) -> Self {
         Self(id)
     }
 
+    /// The raw id, for a backend that has to store it.
     pub fn get(&self) -> i64 {
         self.0
     }
 }
 
 impl JobExecutionId {
+    /// Wraps a raw id. Minted by the repository, not by application code.
     pub fn new(id: i64) -> Self {
         Self(id)
     }
 
+    /// The raw id, for a backend that has to store it.
     pub fn get(&self) -> i64 {
         self.0
     }
 }
 
 impl StepExecutionId {
+    /// Wraps a raw id. Minted by the repository, not by application code.
     pub fn new(id: i64) -> Self {
         Self(id)
     }
 
+    /// The raw id, for a backend that has to store it.
     pub fn get(&self) -> i64 {
         self.0
     }
 }
 
+/// A logical run of a job, identified by its name plus its [`JobParameters`]
+/// (FR-4.2).
+///
+/// "the nightly ETL for 2026-07-31" is one instance however many times it is
+/// attempted. This is what makes restart meaningful: the attempts are
+/// [`JobExecution`]s hanging off it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JobInstance {
     id: JobInstanceId,
@@ -97,14 +139,17 @@ impl JobInstance {
         }
     }
 
+    /// This instance's id.
     pub fn id(&self) -> JobInstanceId {
         self.id
     }
 
+    /// The job this instance belongs to.
     pub fn job_name(&self) -> &str {
         &self.job_name
     }
 
+    /// The parameters that identify it.
     pub fn parameters(&self) -> &JobParameters {
         &self.parameters
     }
@@ -120,6 +165,8 @@ pub struct JobExecution {
 }
 
 impl JobExecution {
+    /// Opens an attempt in [`BatchStatus::Starting`]. The `id` is assigned by
+    /// the [`JobRepository`](crate::JobRepository).
     pub fn new(id: JobExecutionId, instance_id: JobInstanceId) -> Self {
         Self {
             id,
@@ -129,18 +176,22 @@ impl JobExecution {
         }
     }
 
+    /// This attempt's id.
     pub fn id(&self) -> JobExecutionId {
         self.id
     }
 
+    /// The instance being attempted.
     pub fn instance_id(&self) -> JobInstanceId {
         self.instance_id
     }
 
+    /// Where this attempt is in its lifecycle.
     pub fn status(&self) -> BatchStatus {
         self.status
     }
 
+    /// Records a status transition. Persisting it is the caller's job.
     pub fn set_status(&mut self, status: BatchStatus) {
         self.status = status;
     }
@@ -152,11 +203,18 @@ impl JobExecution {
         &self.execution_context
     }
 
+    /// Replaces the job-scoped context.
     pub fn set_execution_context(&mut self, context: ExecutionContext) {
         self.execution_context = context;
     }
 }
 
+/// One step's run within a [`JobExecution`]: its status, its counters and its
+/// bookmark.
+///
+/// Stored flat and joined by `job_execution_id` rather than nested inside
+/// [`JobExecution`], because that is the shape a SQL backend has - and
+/// persisting the same fact twice lets the copies drift.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StepExecution {
     id: StepExecutionId,
@@ -191,22 +249,27 @@ impl StepExecution {
         }
     }
 
+    /// This record's id.
     pub fn id(&self) -> StepExecutionId {
         self.id
     }
 
+    /// The attempt this step ran under.
     pub fn job_execution_id(&self) -> JobExecutionId {
         self.job_execution_id
     }
 
+    /// The step's name, as reported by [`Step::name`](crate::Step::name).
     pub fn step_name(&self) -> &str {
         &self.step_name
     }
 
+    /// Where this step is in its lifecycle.
     pub fn status(&self) -> BatchStatus {
         self.status
     }
 
+    /// Records a status transition. Persisting it is the caller's job.
     pub fn set_status(&mut self, status: BatchStatus) {
         self.status = status;
     }
@@ -238,6 +301,7 @@ impl StepExecution {
         &self.execution_context
     }
 
+    /// Replaces the bookmark.
     pub fn set_execution_context(&mut self, context: ExecutionContext) {
         self.execution_context = context;
     }

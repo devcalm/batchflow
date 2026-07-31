@@ -158,7 +158,7 @@ Cargo workspace; core stays dependency-light, backends/observability are separat
 | `batchflow-memory` | InMemory `JobRepository` etc. | Zero-dep testing + reference impl |
 | `batchflow-postgres` | Postgres backend (sqlx) | Heavy dep (sqlx) must be opt-in |
 | `batchflow-redis` | Redis backend | Opt-in |
-| `batchflow-metrics` | `metrics`/Prometheus exporter | Optional observability |
+| `batchflow-metrics` ☑ | Prometheus exporter + buckets + `install()` | Heavy dep must be opt-in. Note the *facade* (`metrics`) is a dependency of `batchflow-core` — instrumentation points are inside the private chunk loop, so no external crate can reach them; it costs core one runtime dep. |
 | `batchflow-tracing` | `tracing`/OpenTelemetry wiring | Optional observability |
 | `batchflow-scheduler` | Adapters to external schedulers | Integration, not engine |
 | `batchflow-io` | CSV/JSON/SQL readers & writers | Keeps I/O deps out of core |
@@ -296,3 +296,35 @@ fault-tolerant step builder; the question was the Rust shape.
 - **The backoff schedule is unbounded**, leaving `should_retry` as the only authority on attempt count. Encoding the
   limit twice is worse than once, because the two fail differently — exceeding `should_retry` stops the retry, while
   exhausting the schedule would skip the *sleep* and keep going.
+
+### ADR-009 — A failure during cleanup is reported *beside* its cause, not instead of it `[DECIDED 2026-07-31]`
+**Context:** three lifecycle sites wrote `cleanup().await?` before propagating an outcome — the launcher's terminal
+`update_execution`, `Job::run`'s terminal `update_step_execution`, and `run_step`'s `commit.rollback`. Rust has no
+`finally`, so that `?` returns the *cleanup* error and silently drops the failure being cleaned up after. A job that
+died on a bad row would report "repository failed", with the bad row nowhere in the message.
+
+**Decision:** a `BatchError::CleanupFailed { cause, during_cleanup }` variant plus
+`BatchError::with_cleanup(self, Result<(), BatchError>)`. The primary failure stays the `#[source]`; the cleanup
+failure is preserved alongside it. An `Ok` cleanup returns the cause untouched, so call sites read identically either
+way.
+
+**Why not simply keep the primary and drop the cleanup error?** Because the two demand different responses and only
+one of them is about the job. The cause says what to fix. A failed terminal status write means the metadata store
+still reads `Started`, so the next launch is refused with `JobExecutionAlreadyRunning` and needs an operator to call
+`abandon_execution`. Dropping it would hide an operational decision someone has to make.
+
+**Why not log it and propagate only the cause?** That was the original plan (deferred to Phase 13 for a logger), but
+it makes the recovery path depend on whether anyone configured a subscriber. Putting both in the returned value means
+a caller that branches on errors can see both without reading a log.
+
+**Consequences:**
+- **Classification is unaffected, because the *cause* is the `#[source]`.** A `Classifier` walking `source()` reaches
+  the original backend error, not the rollback that happened because of it. Verified by walking a real chain rather
+  than assuming: note the chain node is a `Box<BatchError>`, so `source()`-walking to a concrete backend error works
+  while a mid-chain `downcast_ref::<BatchError>()` would need the boxed type.
+- **A failed rollback does not retry.** `run_step` returns instead: a transaction whose rollback failed is in an
+  unknown state, and retrying on it is worse than failing.
+- **Nesting is possible and correct.** If both a step's and its job's status writes fail, each layer records its own,
+  and the innermost cause is still the step's error. Verbose when the whole store is down; accurate always.
+- **Metrics stay consistent with the store**: the terminal counters are emitted only when the status write succeeded,
+  so a metric never claims a status the repository never recorded.

@@ -265,13 +265,58 @@ before writing any of it.
 
 **Bug 11a fixed, found while scoping this phase.** Counters and bookmark were persisted only *after* `step.run` returned, so a process `SIGKILL`ed mid-step lost everything it had committed. Probing the store during a step gave `(read_count: 0, bookmark: None)` after a chunk had fully committed. Phase 9's restart therefore only ever worked for a step that **returned an error** — not for a crash, which is what US-2 actually describes. All five Phase 9 restart tests injected a writer error and none of them noticed. Pinned by `committed_work_is_durable_before_the_step_finishes`, which asserts against the repository *from inside* the second chunk's write.
 
-## Phase 12 — Metrics ☐
-- **Goals:** `metrics` facade + Prometheus; counters/histograms per FR-8.1.
-- **Tasks:** `batchflow-metrics`; instrument engine. **Acceptance:** scrape shows throughput/retries/skips. **Testing:** metric assertions. **Docs:** dashboards note.
+## Phase 12 — Metrics ☑
+> **12a ☑** the vocabulary. `batchflow_core::metrics`: metric-name and label-key constants plus `describe()`.
+> **12b ☑** the chunk loop. `ChunkMetrics` handles hoisted per step; item counters emitted after the commit, retries as they happen.
+> **12c ☑** the lifecycle. `jobs_started/finished`, `steps_started/finished`, `step_duration` in `launcher.rs`/`job.rs`.
+> **12d ☑** `batchflow-metrics`: Prometheus exporter, bucketed histograms, `install()`.
 
-## Phase 13 — Tracing ☐
+- **Goals:** `metrics` facade + Prometheus; counters/histograms per FR-8.1.
+- **Acceptance:** ☑ a scrape shows items, retries, skips-by-phase and durations. **Testing:** ☑ metric assertions against a `DebuggingRecorder` and a rendered Prometheus scrape. **Docs:** ☐ dashboards note.
+
+**The `metrics` facade is a dependency of `batchflow-core`, not of a side crate.** The emit points are inside the private chunk loop, so no external crate can reach them; a listener trait would have invented a public callback API whose only consumer is metrics. `cargo tree` settled the NFR-3 question with evidence: `metrics` costs core exactly one runtime dependency (`rapidhash`) — lighter than `thiserror`. `batchflow-metrics` still earns its place, holding the exporter.
+
+**Two rules decided the whole design.** (1) *Labels are bounded dimensions; ids are not labels.* `job`/`step`/`status`/`phase` are author-written and finite; a `JobExecutionId` label would mint one time series per run, written once and kept forever. Correlating a specific run is tracing's job (Phase 13), where high cardinality is the point. (2) *Emit after the commit.* A counter incremented before a rollback can never be decremented — counters are monotonic. The chunk loop's control flow enforces this for free: the retry loop leaves only by `break` (committed) or `return Err`, so everything after it describes committed work.
+
+**Retries are the deliberate exception to rule 2**, counted as they happen rather than post-commit. Rule 2 governs counts that must reconcile with committed data; a retry is an event, not a row. Counting them only on chunks that eventually commit would report zero for exactly the chunk an operator is paged about.
+
+**The reconciliation property:** `sum(batchflow_items_written_total)` equals `SELECT sum(write_count)` for the same runs, because both fold at the same commit point. A metric that disagrees with the metadata store is worse than no metric.
+
+**Hoisting the metric handles turned out to be a correctness fix, not just a performance one.** Label values must be owned (`&str` gives `E0521`), so resolving handles per chunk would allocate per commit interval. Building them once per step also *registers* every series at step start — so a counter that has not happened yet reads `0` instead of being absent. That closes the trap where a job which has never failed has no `..._failed_total` series at all, and a success-rate panel silently shows nothing for the healthiest jobs. Found by a test asserting `None` and getting `Some(0)`.
+
+**`jobs_finished_total{status}` is one metric with a label, not two metric names.** The rule: *use a label when summing across its values is meaningful.* `completed + failed = total runs` — meaningful, so label. `read + written` counts the same item twice — meaningless, so separate names. It also means a new `BatchStatus` variant needs no code change, only a new label value.
+
+**Placement is load-bearing in two places, and both are mutation-tested.** `steps_started` sits *below* the restart `continue`, so a step skipped on restart is not counted as started. `jobs_started` sits *after* the FR-4.4 gate, so a rejected relaunch does not inflate `started - finished` — the in-flight count — by one forever.
+
+**12d: no HTTP server.** `metrics-exporter-prometheus` with `default-features = false` drops `http-listener` and `push-gateway`, and with them hyper, rustls and tokio-net: **168 → 60** dependency-tree entries. `render()` returns a `String`; routing it is the application's job. Note `default-features = false` cannot be set in a member crate when the dependency comes from `[workspace.dependencies]` — it must be declared at the root, as `sqlx` already is.
+
+**Explicit histogram buckets, not the default summaries.** Without `set_buckets_for_metric` the exporter renders a histogram as a summary, whose quantiles are computed per process and cannot be aggregated — "p99 chunk latency across four workers" becomes unanswerable. Buckets are summable.
+
+**`describe()` runs after `install_recorder()`.** Descriptions are stored *in* the recorder, so describing first writes them nowhere and the scrape ships with no `# HELP`. Both this and the bucket decision are pinned by mutation.
+
+**Writing the operator-facing help text first was a design step, not documentation.** `describe()`'s string for `steps_started_total` said "a step skipped on restart is not counted" in 12a, before any emit existed; 12c's job was to make the code true. Writing `items_read_total`'s help forced reading `chunk.rs` closely enough to notice that `read` is measured after the skip loop but before processing — something no reader could infer from the name.
+
+**Recorders are global, so tests never install one.** `metrics::with_local_recorder` scopes a recorder to a closure via a thread-local; a test that called `set_global_recorder` would make every other test in the binary order-dependent, and the second one would simply fail. Same discipline at the exporter level: `builder().build_recorder()`, never `install()`.
+
+## Phase 13 — Tracing ☐  ← **next**
 - **Goals:** `tracing` spans per job/step/chunk; correlation IDs; OTel export.
 - **Tasks:** `batchflow-tracing`; span instrumentation. **Acceptance:** nested spans visible. **Testing:** span capture. **Docs:** OTel setup.
+
+**This is where the execution ids go.** Phase 12 deliberately kept `JobExecutionId`/`StepExecutionId` *out* of metric
+labels — one label value per run mints one time series per run, written once and kept forever. Spans are the opposite:
+high cardinality is the point, and a span carrying the execution id is exactly how an operator gets from "the failure
+rate spiked at 02:14" to "this run, this step, this chunk". The split between the two is a design decision already
+taken, not something to revisit here.
+
+**`StepCommit::job_name` is the precedent to follow, and to generalise from — carefully.** 12b added it because the
+chunk loop is reached through `dyn Step` and could not otherwise learn the job's name. Tracing will want the same
+identity plus the execution ids, which is the *second* case — so this is the point at which generalising is justified,
+where in 12b it would have been a guess. (Same rule that kept `CannotAbandon` narrow in 9a until Phase 10 supplied a
+second status error.)
+
+**Debt 3's remaining half lives here.** ADR-009 put both failures in the returned error, so nothing is lost without a
+logger. What tracing adds is the *event* at the moment cleanup fails — useful because by the time the error reaches a
+caller, the fact that the metadata store is now stale has already stopped being actionable at the site that knew it.
 
 ## Phase 14 — Scheduling ☐ (`JobLauncher` already exists — this phase is the adapters only)
 - **Goals:** launch API + adapters (tokio-cron-scheduler / cron / k8s). No home-grown engine (ADR-006).
@@ -296,13 +341,14 @@ before writing any of it.
 ---
 
 ## Cross-cutting quality gate (every phase)
-`cargo fmt --check` · `cargo clippy --workspace --all-targets -- -D warnings` · `cargo test --workspace` · examples compile · no dead code · no needless clone/alloc.
-**Read the `Doc-tests` counts, do not just read the unit count** — see debt (6). A doctest can disappear without anything going red. Note there are now doctests in three crates (`batchflow_core`, `batchflow`, `batchflow_postgres`); the facade's is the one that guards user-facing re-exports.
+`cargo fmt --check` · `cargo clippy --workspace --all-targets -- -D warnings` · `cargo test --workspace` · **`cargo doc --workspace --no-deps`** · examples compile · no dead code · no needless clone/alloc.
+**`cargo doc` is a gate in its own right.** `fmt`, `clippy` and `test` were all green in 12a while a broken intra-doc link sat in `lib.rs` — and broken links are what docs.rs ships. `#![warn(missing_docs)]` is on in all four crates, so a new public item without rustdoc now fails clippy too.
+**Read the `Doc-tests` counts, do not just read the unit count** — see debt (6). A doctest can disappear without anything going red. Note there are now doctests in four crates (`batchflow_core`, `batchflow`, `batchflow_metrics`, `batchflow_postgres`); the facade's is the one that guards user-facing re-exports.
 Postgres integration tests need Docker running. They are part of the gate, not an optional extra — `cargo test --workspace` silently covers less without it.
 
 ## Current position (2026-07-30)
-Phase 0 ◐ docs (tech-eval open items) · 1 ☑ workspace · 2 ☑ traits · 3 ☑ Job + typestate `JobBuilder` · 4 ◐ step model (tasklet trait pending) · 5 ☑ engine · 6 ◐ chunk processing (property tests/tuning guide pending) · 7 ☑ JobRepository · 8 ☑ ExecutionContext · 9 ☑ restart · **10 ☑ retry & skip** (10d chunk-scanning `[OPEN]`) · 11 ☑ transactions.
-`batchflow-core` modules: `chunk`/`classifier`/`context`/`error`/`execution`/`fault`/`item`/`job`/`launcher`/`memory`/`repository`/`step` + `#[cfg(test)] testing`, with `lib.rs` as a pure re-export surface (private `mod` + flat `pub use`, so module layout stays refactorable). **120 tests green: 95 core unit · 5 doctests (core, facade, postgres) · 20 Postgres integration across `repository`/`classifier`/`fault_tolerance`.** clippy `--all-targets -D warnings` clean, `cargo fmt --check` clean.
+Phase 0 ◐ docs (tech-eval open items) · 1 ☑ workspace · 2 ☑ traits · 3 ☑ Job + typestate `JobBuilder` · 4 ◐ step model (tasklet trait pending) · 5 ☑ engine · 6 ◐ chunk processing (property tests/tuning guide pending) · 7 ☑ JobRepository · 8 ☑ ExecutionContext · 9 ☑ restart · **10 ☑ retry & skip** (10d chunk-scanning `[OPEN]`) · 11 ☑ transactions · **12 ☑ metrics**.
+`batchflow-core` modules: `chunk`/`classifier`/`context`/`error`/`execution`/`fault`/`item`/`job`/`launcher`/`memory`/`repository`/`step` + `#[cfg(test)] testing`, with `lib.rs` as a pure re-export surface (private `mod` + flat `pub use`, so module layout stays refactorable). **134 tests green: 105 core unit · 3 `batchflow-metrics` unit · 6 doctests (core, facade, metrics) · 20 Postgres integration across `repository`/`classifier`/`fault_tolerance`.** clippy `--all-targets -D warnings` clean, `cargo fmt --check` clean, `cargo doc` clean, `#![warn(missing_docs)]` on everywhere and silent.
 
 **US-3 and US-4 now hold end to end.** A malformed staging row raises a real `22P02`, is skipped, and the job completes with `skip_count` durable in `step_execution`. A writer that loses a lock race raises a real `55P03`, the chunk is rolled back and re-attempted in a *fresh* transaction, and every row lands exactly once.
 
@@ -319,15 +365,15 @@ A job now runs end to end through metadata: `JobLauncher::run` resolves a `JobIn
 **Known debt, deliberately deferred:**
 1. ~~`Starting`/`Started` still passes the FR-4.4 gate.~~ **Closed in 9a** — rejected, with `abandon_execution` shipped in the same change.
 2. ~~`JobLauncher::run` resolves the instance and reads its last execution under separate lock acquisitions.~~ **Closed for Postgres in 11d** — `UNIQUE (job_name, parameters)` plus a single `INSERT .. ON CONFLICT` makes instance identity the database's job. The launcher's *gate* (read last execution, then create) is still two statements outside a transaction; two processes racing an instance with no prior execution can still both launch. Narrow, and it needs a `SELECT .. FOR UPDATE` around the gate to close — deferred, and recorded here rather than claimed fixed.
-3. A failing `update_execution` masks the job's original error (`launcher.rs`). Real systems log the cause before propagating — Phase 13.
-4. Library-craft gap: no `#![warn(missing_docs)]`, `Job`/`ChunkStep` lack `Debug` (API guideline C-DEBUG) — `ChunkStep` now has a second reason, since `FaultTolerance` holds a `Box<dyn Classifier>`; see ADR-008 for the intended fix.
+3. ~~A failing `update_execution` masks the job's original error (`launcher.rs`).~~ **Closed 2026-07-31, see ADR-009.** It was three sites, not one — the launcher's terminal `update_execution`, `Job::run`'s terminal `update_step_execution`, and `run_step`'s `commit.rollback` — all the same shape: `cleanup().await?` before propagating an outcome, which returns the *cleanup* error and drops the failure being cleaned up after. Fixed with `BatchError::CleanupFailed { cause, during_cleanup }` + `with_cleanup`, keeping the cause as the `#[source]` so classification still sees the real failure. **The earlier note here said this needed a logger (Phase 13); that was wrong** — putting both failures in the returned value is better than logging one, because it does not make recovery depend on whether a subscriber was configured. All three fixed sites are mutation-verified, each failing exactly one test.
+4. ~~Library-craft gap: no `#![warn(missing_docs)]`, `Job`/`ChunkStep` lack `Debug`.~~ **Closed 2026-07-31.** `#![warn(missing_docs)]` is on in all four crates and the workspace reports zero — 127 items documented in `batchflow-core`, 3 in `batchflow-postgres`. C-DEBUG satisfied: derives on `FailFast`/`Unmanaged`/`JobLauncher`/`PostgresJobRepository`, hand-written impls where a derive is impossible. `FaultTolerance` prints its policy and `<dyn Classifier>` exactly as ADR-008 specified — a `Debug` supertrait on `Classifier` would tax every user's impl for a diagnostic. `ChunkStep` and `Job` are hand-written too, so no reader, processor, writer or step needs a `Debug` bound of its own: `Job { name: "nightly", steps: ["log"] }`. **`cargo doc` is now a fourth gate** — `fmt`, `clippy` and `test` were all green while a broken intra-doc link sat in `lib.rs`, and broken links are what docs.rs ships.
    ~~Implementing `Step` requires the caller to depend on `async-trait` directly.~~ **Closed in 9a** by `pub use async_trait::async_trait;` in `lib.rs`.
    **Correction (2026-07-30): the reasoning recorded here was wrong.** This entry claimed doctests "see the crate plus its dev-dependencies, not its normal dependencies", and therefore stand where a user stands. Both halves are false, verified by probe: a doctest in `batchflow-core` compiles `use serde::Serialize;` even though `serde` is a normal dependency that core does not re-export. rustdoc passes `--extern` for *all* direct dependencies. **A doctest is therefore more permissive than a real user's crate and can give a false green** — it will compile code a downstream crate cannot. The re-export is still correct and necessary; only the diagnosis was.
    The structural fix is the **facade crate**: `batchflow` depends on exactly one thing, `batchflow-core`, which is the graph a user actually has. A doctest there implementing `Step` via `batchflow::batchflow_core::async_trait` now guards the re-export, and deleting it fails that doctest. Core's own `Job::builder` doctest happens to catch this particular deletion because it imports *through* the re-export — but a core doctest written `use async_trait::async_trait;` would pass while every user broke. In the facade that mistake is unavailable. **User-facing API examples belong in `crates/batchflow/src/lib.rs`.**
-5. `read_chunk`/`process_chunk`/`run_step` are `pub` without a deliberate SemVer decision — and every one of them changed signature again in Phase 10 (`process_chunk` lost its writer and `tx`; all three gained a `&FaultTolerance` and a skip counter), on top of `run_step`'s 7c-2 break. That is four breaking changes to functions nobody decided were public. `ProcessedChunk` also shipped in 10b-1 **unexported**, reachable only as an inferred type — and nothing warned, because `dead_code` sees it used one module over. Settle the whole surface before 0.1.0.
+5. ~~`read_chunk`/`process_chunk`/`run_step` are `pub` without a deliberate SemVer decision.~~ **Closed in 12b.** All four (including `ProcessedChunk`) are `pub(crate)`; `ChunkStep` is the supported way in. Grep had already shown nothing outside `chunk.rs` used three of them. This is what made 12b's new `ChunkConfig`/`ChunkMetrics` free — they never became API. Net effect of adding observability across the whole chunk loop: the public surface got *smaller*, four items retired against one method added (`StepCommit::job_name`).
 6. **Doc-comment tests have no build-time protection against deletion.** The `Job::builder` `compile_fail` block has now been stripped along with its surrounding rustdoc **twice** (most recently by commit `9659a37`, which also deleted `Job::run`'s docs and left `Plan.md` claiming doctests existed when the count was 0). Nothing fails when it vanishes. Mitigation for now: the block says in its own text that it is a test, and the `Doc-tests` count in `cargo test` output is part of the quality gate below.
 
-**Next milestone: Phase 12 — metrics, or Phase 10d — chunk-scanning.** FR-6.1/6.2/6.3 are closed and proven against a real database, so the remaining fault-tolerance gap is narrow and specific: a *write* failure names a chunk, not an item, so `ErrorAction::Skip` cannot apply there. Closing it means chunk-scanning (FR-6.4) — a second one-at-a-time pass, N transactions instead of one, and an unresolved question about non-idempotent writers. That is a design decision to take deliberately, not the obvious next increment.
+**Next milestone: Phase 13 — tracing.** (Historical note, kept because the reasoning still holds:) FR-6.1/6.2/6.3 are closed and proven against a real database, so the remaining fault-tolerance gap is narrow and specific: a *write* failure names a chunk, not an item, so `ErrorAction::Skip` cannot apply there. Closing it means chunk-scanning (FR-6.4) — a second one-at-a-time pass, N transactions instead of one, and an unresolved question about non-idempotent writers. That is a design decision to take deliberately, not the obvious next increment.
 
 Phase 12 is the better default next step: retry and skip now happen *silently*. A job that skipped 400 rows and retried 30 chunks reports exactly the same thing as one that sailed through, and `skip_count` in the metadata store is the only evidence. Fault tolerance without observability converts loud failures into quiet data loss.
 

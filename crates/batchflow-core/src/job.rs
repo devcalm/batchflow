@@ -66,6 +66,24 @@ pub struct Job<Tx = ()> {
     steps: Vec<Box<dyn Step<Tx>>>,
 }
 
+/// Hand-written because the steps are `Box<dyn Step<Tx>>`. Lists their names,
+/// which is what identifies a job's shape.
+impl<Tx> std::fmt::Debug for Job<Tx> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Job")
+            .field("name", &self.name)
+            .field(
+                "steps",
+                &self
+                    .steps
+                    .iter()
+                    .map(|step| step.name())
+                    .collect::<Vec<_>>(),
+            )
+            .finish()
+    }
+}
+
 impl<Tx> Job<Tx> {
     /// Start building a [`Job`] called `name`. Steps are boxed internally, so
     /// callers never write `Box::new`.
@@ -116,6 +134,11 @@ impl<Tx> Job<Tx> {
         }
     }
 
+    /// Builds a job from a step list.
+    ///
+    /// The dynamic escape hatch from [`builder`](Job::builder): the typestate
+    /// builder changes type on the first `.step()`, so it cannot be driven from
+    /// a loop. This can.
     pub fn new(name: impl Into<String>, steps: Vec<Box<dyn Step<Tx>>>) -> Self {
         Self {
             name: name.into(),
@@ -199,33 +222,52 @@ impl<Tx> Job<Tx> {
                 BatchStatus::Failed
             };
             step_execution.set_status(status);
-            repository.update_step_execution(&step_execution).await?;
+            let recorded = repository.update_step_execution(&step_execution).await;
 
             // After the write, so the metric cannot claim a terminal status the
             // repository never recorded.
-            histogram!(
-                STEP_DURATION,
-                LABEL_JOB => job_name.to_owned(),
-                LABEL_STEP => step_execution.step_name().to_owned(),
-            )
-            .record(started.elapsed().as_secs_f64());
-            counter!(
-                STEPS_FINISHED,
-                LABEL_JOB => job_name.to_owned(),
-                LABEL_STEP => step_execution.step_name().to_owned(),
-                LABEL_STATUS => status_label(status),
-            )
-            .increment(1);
+            if recorded.is_ok() {
+                emit_step_finished(job_name, &step_execution, status, started);
+            }
 
-            outcome?;
+            // Same precedence as the launcher: the step's failure is the cause,
+            // and failing to record it is a consequence.
+            if let Err(error) = outcome {
+                return Err(error.with_cleanup(recorded));
+            }
+
+            recorded?;
         }
 
         Ok(())
     }
 
+    /// The job's name. Half of the identity key, with its parameters.
     pub fn name(&self) -> &str {
         &self.name
     }
+}
+
+fn emit_step_finished(
+    job_name: &str,
+    step_execution: &StepExecution,
+    status: BatchStatus,
+    started: Instant,
+) {
+    histogram!(
+        STEP_DURATION,
+        LABEL_JOB => job_name.to_owned(),
+        LABEL_STEP => step_execution.step_name().to_owned(),
+    )
+    .record(started.elapsed().as_secs_f64());
+
+    counter!(
+        STEPS_FINISHED,
+        LABEL_JOB => job_name.to_owned(),
+        LABEL_STEP => step_execution.step_name().to_owned(),
+        LABEL_STATUS => status_label(status),
+    )
+    .increment(1);
 }
 
 /// Typestate marker: no step has been added yet, so there is nothing to build.
@@ -236,6 +278,10 @@ pub struct NoSteps;
 #[derive(Debug)]
 pub struct HasSteps;
 
+/// Builds a [`Job`], refusing at compile time to build an empty one.
+///
+/// `State` starts as [`NoSteps`]; the first `.step()` moves it to [`HasSteps`],
+/// which is the only state `build` is defined on.
 pub struct JobBuilder<State = NoSteps, Tx = ()> {
     name: String,
     steps: Vec<Box<dyn Step<Tx>>>,
@@ -243,6 +289,8 @@ pub struct JobBuilder<State = NoSteps, Tx = ()> {
 }
 
 impl<State, Tx> JobBuilder<State, Tx> {
+    /// Appends a step, boxing it so callers never write `Box::new`. The first
+    /// call is what makes the builder buildable.
     pub fn step<S: Step<Tx> + 'static>(mut self, step: S) -> JobBuilder<HasSteps, Tx> {
         self.steps.push(Box::new(step));
 
@@ -255,6 +303,10 @@ impl<State, Tx> JobBuilder<State, Tx> {
 }
 
 impl<Tx> JobBuilder<HasSteps, Tx> {
+    /// Finishes the job.
+    ///
+    /// Returns `Job`, not `Result<Job, _>`: the only failure it could report is
+    /// "no steps", and that is a compile error instead.
     pub fn build(self) -> Job<Tx> {
         Job {
             name: self.name,
