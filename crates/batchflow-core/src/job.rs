@@ -1,10 +1,15 @@
 use crate::BatchError;
+use crate::metrics::{
+    LABEL_JOB, LABEL_STATUS, LABEL_STEP, STEP_DURATION, STEPS_FINISHED, STEPS_STARTED, status_label,
+};
 use crate::{
     BatchStatus, ExecutionContext, JobExecution, JobRepository, Step, StepCommit, StepContribution,
     StepExecution,
 };
+use ::metrics::{counter, histogram};
 use async_trait::async_trait;
 use std::marker::PhantomData;
+use std::time::Instant;
 
 /// Persists a step's committed work: folds the counters into its
 /// [`StepExecution`] and stores the bookmark, then writes the row.
@@ -14,10 +19,15 @@ use std::marker::PhantomData;
 struct RepositoryCommit<'a, R> {
     repository: &'a R,
     step_execution: &'a mut StepExecution,
+    job_name: &'a str,
 }
 
 #[async_trait]
 impl<R: JobRepository> StepCommit<R::Tx> for RepositoryCommit<'_, R> {
+    fn job_name(&self) -> &str {
+        self.job_name
+    }
+
     async fn begin(&mut self) -> Result<R::Tx, BatchError> {
         self.repository.begin().await
     }
@@ -134,6 +144,8 @@ impl<Tx> Job<Tx> {
         R: JobRepository<Tx = Tx>,
         Tx: Send,
     {
+        let job_name = self.name.as_str();
+
         for step in &mut self.steps {
             // Must precede `create_step_execution`: mint first and this returns
             // *this* attempt's own record, so nothing is ever skipped and every
@@ -147,6 +159,17 @@ impl<Tx> Job<Tx> {
             {
                 continue;
             }
+
+            // Below the `continue`, so a step skipped on restart is not counted
+            // as started. It did not run, and a `steps_started` that included it
+            // would make a restart look like a full execution.
+            let started = Instant::now();
+            counter!(
+                STEPS_STARTED,
+                LABEL_JOB => job_name.to_owned(),
+                LABEL_STEP => step.name().to_owned(),
+            )
+            .increment(1);
 
             let mut context = previous
                 .map(|previous| previous.execution_context().clone())
@@ -165,16 +188,34 @@ impl<Tx> Job<Tx> {
                 let mut commit = RepositoryCommit {
                     repository,
                     step_execution: &mut step_execution,
+                    job_name,
                 };
                 step.run(&mut context, &mut commit).await
             };
 
-            step_execution.set_status(if outcome.is_ok() {
+            let status = if outcome.is_ok() {
                 BatchStatus::Completed
             } else {
                 BatchStatus::Failed
-            });
+            };
+            step_execution.set_status(status);
             repository.update_step_execution(&step_execution).await?;
+
+            // After the write, so the metric cannot claim a terminal status the
+            // repository never recorded.
+            histogram!(
+                STEP_DURATION,
+                LABEL_JOB => job_name.to_owned(),
+                LABEL_STEP => step_execution.step_name().to_owned(),
+            )
+            .record(started.elapsed().as_secs_f64());
+            counter!(
+                STEPS_FINISHED,
+                LABEL_JOB => job_name.to_owned(),
+                LABEL_STEP => step_execution.step_name().to_owned(),
+                LABEL_STATUS => status_label(status),
+            )
+            .increment(1);
 
             outcome?;
         }

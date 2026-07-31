@@ -1,5 +1,5 @@
 use crate::FaultTolerance;
-use crate::run_step;
+use crate::chunk::{ChunkConfig, run_step};
 use crate::{BatchError, ExecutionContext, ItemProcessor, ItemReader, TransactionalWriter};
 use async_trait::async_trait;
 use std::num::NonZeroUsize;
@@ -72,6 +72,14 @@ impl StepContribution {
 /// which `JobRepository` is not, and it keeps persistence out of step code.
 #[async_trait]
 pub trait StepCommit<Tx = ()>: Send {
+    /// The name of the job this step is running under.
+    ///
+    /// A step cannot know it — the name lives on [`Job`](crate::Job) and only
+    /// the engine crosses that boundary — but the chunk loop needs it to label
+    /// its metrics. No default body: one returning `""` would silently emit
+    /// unlabelled metrics for the lifetime of the process.
+    fn job_name(&self) -> &str;
+
     async fn begin(&mut self) -> Result<Tx, BatchError>;
 
     async fn commit(
@@ -162,14 +170,15 @@ where
         context: &mut ExecutionContext,
         commit: &mut dyn StepCommit<Tx>,
     ) -> Result<(), BatchError> {
+        let config = ChunkConfig::new(self.chunk_size, &self.fault, commit.job_name(), &self.name);
+
         run_step(
             &mut self.reader,
             &mut self.processor,
             &mut self.writer,
-            self.chunk_size,
+            &config,
             context,
             commit,
-            &self.fault,
         )
         .await
     }

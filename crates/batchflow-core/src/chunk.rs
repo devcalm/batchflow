@@ -1,14 +1,76 @@
+use crate::metrics::{
+    CHUNK_DURATION, CHUNK_RETRIES, CHUNKS_COMMITTED, ITEMS_FILTERED, ITEMS_READ, ITEMS_SKIPPED,
+    ITEMS_WRITTEN, LABEL_JOB, LABEL_PHASE, LABEL_STEP,
+};
 use crate::{BatchError, ExecutionContext, FaultTolerance, ItemDisposition};
 use crate::{ItemProcessor, ItemReader, TransactionalWriter};
 use crate::{StepCommit, StepContribution};
+use ::metrics::{Counter, Histogram, counter, histogram};
 use std::num::NonZeroUsize;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// What a processed chunk yields: the items to write, and how many the
 /// processor filtered out.
-pub struct ProcessedChunk<O> {
+pub(crate) struct ProcessedChunk<O> {
     pub items: Vec<O>,
     pub filtered: usize,
+}
+
+/// Metric handles for one step execution, resolved once.
+///
+/// Label values must be owned, so building these per chunk would allocate two
+/// `String`s and hit the registry eight times for every commit interval.
+pub(crate) struct ChunkMetrics {
+    items_read: Counter,
+    items_written: Counter,
+    items_filtered: Counter,
+    skipped_reading: Counter,
+    skipped_processing: Counter,
+    chunks_committed: Counter,
+    retries: Counter,
+    chunk_duration: Histogram,
+}
+
+impl ChunkMetrics {
+    pub(crate) fn new(job: &str, step: &str) -> Self {
+        let (job, step) = (job.to_owned(), step.to_owned());
+
+        Self {
+            items_read: counter!(ITEMS_READ, LABEL_JOB => job.clone(), LABEL_STEP => step.clone()),
+            items_written: counter!(ITEMS_WRITTEN, LABEL_JOB => job.clone(), LABEL_STEP => step.clone()),
+            items_filtered: counter!(ITEMS_FILTERED, LABEL_JOB => job.clone(), LABEL_STEP => step.clone()),
+            skipped_reading: counter!(ITEMS_SKIPPED, LABEL_JOB => job.clone(), LABEL_STEP => step.clone(), LABEL_PHASE => "read"),
+            skipped_processing: counter!(ITEMS_SKIPPED, LABEL_JOB => job.clone(), LABEL_STEP => step.clone(), LABEL_PHASE => "process"),
+            chunks_committed: counter!(CHUNKS_COMMITTED, LABEL_JOB => job.clone(), LABEL_STEP => step.clone()),
+            retries: counter!(CHUNK_RETRIES, LABEL_JOB => job.clone(), LABEL_STEP => step.clone()),
+            chunk_duration: histogram!(CHUNK_DURATION, LABEL_JOB => job, LABEL_STEP => step),
+        }
+    }
+}
+
+/// What a step was configured with, as opposed to the collaborators it drives.
+///
+/// Bundled because `run_step` was already at clippy's argument limit: growing
+/// under an `#[allow]` would have hidden the next addition too.
+pub(crate) struct ChunkConfig<'a> {
+    chunk_size: NonZeroUsize,
+    fault: &'a FaultTolerance,
+    metrics: ChunkMetrics,
+}
+
+impl<'a> ChunkConfig<'a> {
+    pub(crate) fn new(
+        chunk_size: NonZeroUsize,
+        fault: &'a FaultTolerance,
+        job: &str,
+        step: &str,
+    ) -> Self {
+        Self {
+            chunk_size,
+            fault,
+            metrics: ChunkMetrics::new(job, step),
+        }
+    }
 }
 
 /// Reads up to `chunk_size` items, skipping ones the classifier tolerates.
@@ -20,7 +82,7 @@ pub struct ProcessedChunk<O> {
 /// `skipped` is the step-wide running total, which is what bounds this loop: a
 /// reader that errors without advancing past the offending item would otherwise
 /// spin forever. The skip limit turns that into a step failure instead.
-pub async fn read_chunk<R>(
+pub(crate) async fn read_chunk<R>(
     reader: &mut R,
     chunk_size: NonZeroUsize,
     fault: &FaultTolerance,
@@ -51,7 +113,7 @@ where
 /// Called exactly once per chunk, outside any transaction. `process` consumes
 /// its input, so a second attempt would have nothing to re-process — which is
 /// why the retry boundary in [`run_step`] sits around the write, not here.
-pub async fn process_chunk<P>(
+pub(crate) async fn process_chunk<P>(
     processor: &mut P,
     items: Vec<P::In>,
     fault: &FaultTolerance,
@@ -94,14 +156,13 @@ async fn back_off(backoff: &mut impl Iterator<Item = Duration>) {
     }
 }
 
-pub async fn run_step<R, P, W, Tx>(
+pub(crate) async fn run_step<R, P, W, Tx>(
     reader: &mut R,
     processor: &mut P,
     writer: &mut W,
-    chunk_size: NonZeroUsize,
+    config: &ChunkConfig<'_>,
     context: &mut ExecutionContext,
     commit: &mut dyn StepCommit<Tx>,
-    fault: &FaultTolerance,
 ) -> Result<(), BatchError>
 where
     R: ItemReader,
@@ -109,6 +170,13 @@ where
     W: TransactionalWriter<Tx, Item = P::Out>, // writer consumes what the processor produces
     Tx: Send,
 {
+    let ChunkConfig {
+        chunk_size,
+        fault,
+        metrics,
+    } = config;
+    let chunk_size = *chunk_size;
+
     reader.open(context).await?;
 
     // Step-wide, because the skip limit is step-wide: one bad row in each of a
@@ -119,18 +187,21 @@ where
 
     loop {
         let skipped_before = skipped;
+        let chunk_start = Instant::now();
 
         let chunk = read_chunk(reader, chunk_size, fault, &mut skipped).await?;
         if chunk.is_empty() {
             break;
         }
         let read = chunk.len();
+        let skipped_reading = skipped - skipped_before;
 
         // Outside the transaction: processing may be slow, and holding locks
         // across it is how a batch job becomes a production incident. It also
         // runs exactly once — `process` consumes its item, so the retry below
         // has only the outputs to work with, never the inputs.
         let processed = process_chunk(processor, chunk, fault, &mut skipped).await?;
+        let skipped_processing = skipped - skipped_before - skipped_reading;
 
         let mut chunk_contribution = StepContribution::new();
         chunk_contribution.increment_read(read);
@@ -163,6 +234,7 @@ where
                 commit.rollback(tx).await?;
 
                 if fault.should_retry(&error, attempt) {
+                    metrics.retries.increment(1);
                     back_off(&mut backoff).await;
                     attempt += 1;
                     continue;
@@ -180,6 +252,7 @@ where
                     // transiently (Postgres raises 40001 at COMMIT), so this
                     // path retries too — with its own fresh transaction.
                     if fault.should_retry(&error, attempt) {
+                        metrics.retries.increment(1);
                         back_off(&mut backoff).await;
                         attempt += 1;
                         continue;
@@ -188,6 +261,30 @@ where
                 }
             }
         }
+
+        // Reached only by a chunk that committed: the loop above leaves either
+        // by `break` on a successful commit or by returning the error. So the
+        // counters published here can never describe work that rolled back,
+        // and they agree with what the repository persisted in the same
+        // transaction — `sum(items_written_total)` reconciles with
+        // `sum(write_count)`.
+        //
+        // Retries are the deliberate exception, counted above as they happen:
+        // a chunk that retried five times and then failed must still report
+        // them, or the metric hides exactly the incident it exists for.
+        metrics
+            .chunk_duration
+            .record(chunk_start.elapsed().as_secs_f64());
+        metrics.chunks_committed.increment(1);
+        metrics.items_read.increment(read as u64);
+        metrics
+            .items_written
+            .increment(processed.items.len() as u64);
+        metrics.items_filtered.increment(processed.filtered as u64);
+        metrics.skipped_reading.increment(skipped_reading as u64);
+        metrics
+            .skipped_processing
+            .increment(skipped_processing as u64);
     }
 
     Ok(())
@@ -199,7 +296,7 @@ mod tests {
     use crate::testing::{
         BookmarkReader, CollectingWriter, CommitEvent, EvenDoubler, FailingReader, FailingWriter,
         FlakyWriter, POSITION, PoisonProcessor, PoisonReader, RecordingCommit, RetryAll, SkipAll,
-        TransientWriter, VecReader, nz, nz32,
+        TransientWriter, VecReader, block_on, counter, labels_of, nz, nz32, recorded,
     };
     use crate::{ContextValue, RetryPolicy, Unmanaged};
     use tokio::time::Instant;
@@ -273,10 +370,9 @@ mod tests {
             &mut reader,
             &mut processor,
             &mut writer,
-            nz(2),
+            &ChunkConfig::new(nz(2), &FaultTolerance::default(), "test-job", "test-step"),
             &mut context,
             &mut commit,
-            &FaultTolerance::default(),
         )
         .await
         .unwrap();
@@ -303,10 +399,9 @@ mod tests {
             &mut reader,
             &mut processor,
             &mut writer,
-            nz(2),
+            &ChunkConfig::new(nz(2), &FaultTolerance::default(), "test-job", "test-step"),
             &mut context,
             &mut commit,
-            &FaultTolerance::default(),
         )
         .await;
 
@@ -338,10 +433,9 @@ mod tests {
             &mut reader,
             &mut processor,
             &mut writer,
-            nz(2),
+            &ChunkConfig::new(nz(2), &FaultTolerance::default(), "test-job", "test-step"),
             &mut context,
             &mut commit,
-            &FaultTolerance::default(),
         )
         .await
         .unwrap();
@@ -365,10 +459,9 @@ mod tests {
             &mut reader,
             &mut processor,
             &mut writer,
-            nz(2),
+            &ChunkConfig::new(nz(2), &FaultTolerance::default(), "test-job", "test-step"),
             &mut context,
             &mut commit,
-            &FaultTolerance::default(),
         )
         .await;
 
@@ -400,10 +493,9 @@ mod tests {
             &mut reader,
             &mut processor,
             &mut writer,
-            nz(2),
+            &ChunkConfig::new(nz(2), &fault, "test-job", "test-step"),
             &mut context,
             &mut commit,
-            &fault,
         )
         .await
         .unwrap();
@@ -449,10 +541,9 @@ mod tests {
             &mut reader,
             &mut processor,
             &mut writer,
-            nz(2),
+            &ChunkConfig::new(nz(2), &fault, "test-job", "test-step"),
             &mut context,
             &mut commit,
-            &fault,
         )
         .await
         .unwrap();
@@ -485,10 +576,9 @@ mod tests {
             &mut reader,
             &mut processor,
             &mut writer,
-            nz(2),
+            &ChunkConfig::new(nz(2), &fault, "test-job", "test-step"),
             &mut context,
             &mut commit,
-            &fault,
         )
         .await
         .unwrap();
@@ -514,10 +604,9 @@ mod tests {
             &mut reader,
             &mut processor,
             &mut writer,
-            nz(2),
+            &ChunkConfig::new(nz(2), &fault, "test-job", "test-step"),
             &mut context,
             &mut commit,
-            &fault,
         )
         .await;
 
@@ -544,10 +633,9 @@ mod tests {
             &mut reader,
             &mut processor,
             &mut writer,
-            nz(2),
+            &ChunkConfig::new(nz(2), &fault, "test-job", "test-step"),
             &mut context,
             &mut commit,
-            &fault,
         )
         .await;
 
@@ -574,10 +662,9 @@ mod tests {
             &mut reader,
             &mut processor,
             &mut writer,
-            nz(2),
+            &ChunkConfig::new(nz(2), &fault, "test-job", "test-step"),
             &mut context,
             &mut commit,
-            &fault,
         )
         .await
         .unwrap();
@@ -613,10 +700,9 @@ mod tests {
             &mut reader,
             &mut processor,
             &mut writer,
-            nz(3),
+            &ChunkConfig::new(nz(3), &fault, "test-job", "test-step"),
             &mut context,
             &mut commit,
-            &fault,
         )
         .await
         .unwrap();
@@ -645,10 +731,9 @@ mod tests {
             &mut reader,
             &mut processor,
             &mut writer,
-            nz(3),
+            &ChunkConfig::new(nz(3), &FaultTolerance::default(), "test-job", "test-step"),
             &mut context,
             &mut commit,
-            &FaultTolerance::default(),
         )
         .await;
 
@@ -673,10 +758,9 @@ mod tests {
             &mut reader,
             &mut processor,
             &mut writer,
-            nz(4),
+            &ChunkConfig::new(nz(4), &fault, "test-job", "test-step"),
             &mut context,
             &mut commit,
-            &fault,
         )
         .await;
 
@@ -706,10 +790,9 @@ mod tests {
             &mut reader,
             &mut processor,
             &mut writer,
-            nz(3),
+            &ChunkConfig::new(nz(3), &fault, "test-job", "test-step"),
             &mut context,
             &mut commit,
-            &fault,
         )
         .await
         .unwrap();
@@ -738,10 +821,9 @@ mod tests {
             &mut reader,
             &mut processor,
             &mut writer,
-            nz(2),
+            &ChunkConfig::new(nz(2), &fault, "test-job", "test-step"),
             &mut context,
             &mut commit,
-            &fault,
         )
         .await;
 
@@ -763,10 +845,9 @@ mod tests {
             &mut reader,
             &mut processor,
             &mut writer,
-            nz(2),
+            &ChunkConfig::new(nz(2), &FaultTolerance::default(), "test-job", "test-step"),
             &mut context,
             &mut commit,
-            &FaultTolerance::default(),
         )
         .await
         .unwrap();
@@ -788,10 +869,9 @@ mod tests {
             &mut reader,
             &mut processor,
             &mut writer,
-            nz(2),
+            &ChunkConfig::new(nz(2), &FaultTolerance::default(), "test-job", "test-step"),
             &mut context,
             &mut commit,
-            &FaultTolerance::default(),
         )
         .await
         .unwrap();
@@ -819,10 +899,9 @@ mod tests {
             &mut reader,
             &mut processor,
             &mut writer,
-            nz(2),
+            &ChunkConfig::new(nz(2), &FaultTolerance::default(), "test-job", "test-step"),
             &mut context,
             &mut commit,
-            &FaultTolerance::default(),
         )
         .await;
 
@@ -830,5 +909,132 @@ mod tests {
         assert_eq!(writer.0.written, vec![4, 8]);
         assert_eq!(commit.total.read_count(), 2);
         assert_eq!(context.get_long(POSITION).unwrap(), Some(2));
+    }
+
+    /// The reconciliation property: every published item counter equals what
+    /// the same commit persisted. A metric that disagrees with the metadata
+    /// store is worse than no metric.
+    #[test]
+    fn a_committed_chunk_publishes_counters_matching_what_it_persisted() {
+        let mut commit = RecordingCommit::new();
+
+        let snapshot = recorded(|| {
+            block_on(async {
+                let mut reader = VecReader::new(vec![1, 2, 3, 4, 5, 6]);
+                let mut processor = EvenDoubler;
+                let mut writer = Unmanaged(CollectingWriter::new());
+                let mut context = ExecutionContext::new();
+
+                run_step(
+                    &mut reader,
+                    &mut processor,
+                    &mut writer,
+                    &ChunkConfig::new(nz(2), &FaultTolerance::default(), "nightly", "load"),
+                    &mut context,
+                    &mut commit,
+                )
+                .await
+                .unwrap();
+            });
+        });
+
+        assert_eq!(
+            counter(&snapshot, ITEMS_READ, None),
+            Some(commit.total.read_count() as u64)
+        );
+        assert_eq!(
+            counter(&snapshot, ITEMS_WRITTEN, None),
+            Some(commit.total.write_count() as u64)
+        );
+        assert_eq!(
+            counter(&snapshot, ITEMS_FILTERED, None),
+            Some(commit.total.filter_count() as u64)
+        );
+        // chunk_size 2 over 6 items: the transaction boundary, not the totals.
+        assert_eq!(counter(&snapshot, CHUNKS_COMMITTED, None), Some(3));
+
+        assert_eq!(
+            labels_of(&snapshot, ITEMS_READ),
+            vec![
+                (LABEL_JOB.to_owned(), "nightly".to_owned()),
+                (LABEL_STEP.to_owned(), "load".to_owned()),
+            ]
+        );
+    }
+
+    /// Rule 2, and its one exception, in a single run: a chunk that retried and
+    /// then failed publishes its *retries* but none of its item counters.
+    ///
+    /// Counting retries only on chunks that eventually commit would report zero
+    /// for exactly the chunk an operator is paged about.
+    #[test]
+    fn a_chunk_that_retried_and_failed_publishes_retries_but_no_items() {
+        let fault = FaultTolerance::new()
+            .classifier(RetryAll)
+            .retry(RetryPolicy::attempts(nz32(3)));
+
+        let snapshot = recorded(|| {
+            block_on(async {
+                let mut reader = VecReader::new(vec![2, 4]);
+                let mut processor = EvenDoubler;
+                let mut writer = Unmanaged(FailingWriter);
+                let mut commit = RecordingCommit::new();
+                let mut context = ExecutionContext::new();
+
+                let result = run_step(
+                    &mut reader,
+                    &mut processor,
+                    &mut writer,
+                    &ChunkConfig::new(nz(2), &fault, "nightly", "load"),
+                    &mut context,
+                    &mut commit,
+                )
+                .await;
+
+                assert!(result.is_err());
+            });
+        });
+
+        // Three attempts means two retries.
+        assert_eq!(counter(&snapshot, CHUNK_RETRIES, None), Some(2));
+
+        // `Some(0)`, not `None`: hoisting the handles registers every series
+        // when the step starts, so a metric that has not happened yet reads as
+        // zero rather than being absent. That is what makes a rate query over a
+        // job that has never failed return 0 instead of nothing at all.
+        assert_eq!(counter(&snapshot, ITEMS_READ, None), Some(0));
+        assert_eq!(counter(&snapshot, ITEMS_WRITTEN, None), Some(0));
+        assert_eq!(counter(&snapshot, CHUNKS_COMMITTED, None), Some(0));
+    }
+
+    /// Skips are attributed to the phase that dropped the item: a bad input row
+    /// and a bad transform are different incidents.
+    #[test]
+    fn skips_are_published_under_the_phase_that_dropped_the_item() {
+        let fault = FaultTolerance::new().classifier(SkipAll).skip_limit(10);
+
+        let snapshot = recorded(|| {
+            block_on(async {
+                let mut reader = PoisonReader::new(vec![2, 3, 4], 3);
+                let mut processor = EvenDoubler;
+                let mut writer = Unmanaged(CollectingWriter::new());
+                let mut commit = RecordingCommit::new();
+                let mut context = ExecutionContext::new();
+
+                run_step(
+                    &mut reader,
+                    &mut processor,
+                    &mut writer,
+                    &ChunkConfig::new(nz(4), &fault, "nightly", "load"),
+                    &mut context,
+                    &mut commit,
+                )
+                .await
+                .unwrap();
+            });
+        });
+
+        assert_eq!(counter(&snapshot, ITEMS_SKIPPED, Some("read")), Some(1));
+        assert_eq!(counter(&snapshot, ITEMS_SKIPPED, Some("process")), Some(0));
     }
 }

@@ -4,12 +4,17 @@
 //! release build. Lives in its own module because several modules' tests need the
 //! same fakes, and duplicating them is how test suites drift apart.
 
+use crate::metrics::LABEL_PHASE;
 use crate::{
     BatchError, Classifier, ContextValue, ErrorAction, ExecutionContext, InMemoryJobRepository,
     ItemProcessor, ItemReader, ItemWriter, JobExecution, JobExecutionId, JobInstance,
     JobInstanceId, JobParameters, JobRepository, Step, StepCommit, StepContribution, StepExecution,
 };
+use ::metrics::{Key, SharedString, Unit};
 use async_trait::async_trait;
+use metrics_util::CompositeKey;
+use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+use std::future::Future;
 use std::num::{NonZeroU32, NonZeroUsize};
 use std::sync::{Arc, Mutex};
 
@@ -537,6 +542,10 @@ impl RecordingCommit {
 
 #[async_trait]
 impl StepCommit<()> for RecordingCommit {
+    fn job_name(&self) -> &str {
+        "test-job"
+    }
+
     async fn begin(&mut self) -> Result<(), BatchError> {
         self.begins += 1;
         self.events.push(CommitEvent::Begin);
@@ -569,4 +578,70 @@ impl StepCommit<()> for RecordingCommit {
         self.events.push(CommitEvent::Rollback);
         Ok(())
     }
+}
+
+// ---------------------------------------------------------------------------
+// Metrics test support
+// ---------------------------------------------------------------------------
+
+/// Runs `body` with a recorder scoped to this thread and returns what it
+/// emitted.
+///
+/// `with_local_recorder` rather than `metrics::set_global_recorder`: a
+/// global can be installed only once per process, so tests using one are
+/// order-dependent and cannot run in parallel.
+pub(crate) type Recorded = Vec<(CompositeKey, Option<Unit>, Option<SharedString>, DebugValue)>;
+
+pub(crate) fn recorded(body: impl FnOnce()) -> Recorded {
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    metrics::with_local_recorder(&recorder, body);
+    snapshotter.snapshot().into_vec()
+}
+
+/// A current-thread runtime, so emissions land on the thread the recorder
+/// is scoped to.
+pub(crate) fn block_on(future: impl Future<Output = ()>) {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(future);
+}
+
+/// The counter named `name` whose `phase` label matches, or `None` if no
+/// such series was ever emitted — which is distinct from a series sitting
+/// at zero, and is what the rollback test asserts.
+pub(crate) fn counter(snapshot: &Recorded, name: &str, phase: Option<&str>) -> Option<u64> {
+    snapshot
+        .iter()
+        .find_map(|(composite, _unit, _help, value)| match value {
+            DebugValue::Counter(n)
+                if composite.key().name() == name
+                    && phase_of(composite.key()).as_deref() == phase =>
+            {
+                Some(*n)
+            }
+            _ => None,
+        })
+}
+
+fn phase_of(key: &Key) -> Option<String> {
+    key.labels()
+        .find(|label| label.key() == LABEL_PHASE)
+        .map(|label| label.value().to_owned())
+}
+
+pub(crate) fn labels_of(snapshot: &Recorded, name: &str) -> Vec<(String, String)> {
+    snapshot
+        .iter()
+        .find(|(composite, ..)| composite.key().name() == name)
+        .map(|(composite, ..)| {
+            composite
+                .key()
+                .labels()
+                .map(|label| (label.key().to_owned(), label.value().to_owned()))
+                .collect()
+        })
+        .unwrap_or_default()
 }

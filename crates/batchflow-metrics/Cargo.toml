@@ -1,0 +1,21 @@
+[package]
+name = "batchflow-metrics"
+description = "Prometheus exporter wiring for BatchFlow, a Spring Batch-inspired batch processing framework for Rust."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+documentation = "https://docs.rs/batchflow-metrics"
+keywords = ["batch", "metrics", "prometheus", "observability"]
+categories = ["asynchronous", "development-tools::profiling"]
+
+[dependencies]
+batchflow-core.workspace = true
+metrics.workspace = true
+# Trimmed to no default features at the workspace root — see the note there.
+# `render()` returns a String; serving it is the application's job.
+metrics-exporter-prometheus.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }

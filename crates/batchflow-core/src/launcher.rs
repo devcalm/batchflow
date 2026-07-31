@@ -1,4 +1,6 @@
+use crate::metrics::{JOBS_FINISHED, JOBS_STARTED, LABEL_JOB, LABEL_STATUS, status_label};
 use crate::{BatchError, BatchStatus, Job, JobExecution, JobParameters, JobRepository};
+use ::metrics::counter;
 
 /// Owns the `JobExecution` lifecycle: resolves identity, enforces FR-4.4, and
 /// records what happened.
@@ -82,6 +84,11 @@ impl<R: JobRepository> JobLauncher<R> {
         execution.set_status(BatchStatus::Started);
         self.repository.update_execution(&execution).await?;
 
+        // Past every gate above, so a launch rejected by FR-4.4 is not counted
+        // as a start. `jobs_started - jobs_finished` is then the number of runs
+        // in flight, and a rejected launch must not inflate it forever.
+        counter!(JOBS_STARTED, LABEL_JOB => job.name().to_owned()).increment(1);
+
         let outcome = job.run(&execution, &self.repository).await;
 
         let status = if outcome.is_ok() {
@@ -93,6 +100,13 @@ impl<R: JobRepository> JobLauncher<R> {
         execution.set_status(status);
         self.repository.update_execution(&execution).await?;
 
+        counter!(
+            JOBS_FINISHED,
+            LABEL_JOB => job.name().to_owned(),
+            LABEL_STATUS => status_label(status),
+        )
+        .increment(1);
+
         outcome?;
         Ok(execution)
     }
@@ -101,11 +115,13 @@ impl<R: JobRepository> JobLauncher<R> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::metrics::{LABEL_STEP, STEP_DURATION, STEPS_FINISHED, STEPS_STARTED};
     use crate::testing::{
-        BookmarkReader, CollectingWriter, EvenDoubler, FailingStep, LogStep, SharedSink, VecReader,
-        nz,
+        BookmarkReader, CollectingWriter, EvenDoubler, FailingStep, LogStep, Recorded, SharedSink,
+        VecReader, block_on, counter, labels_of, nz, recorded,
     };
     use crate::{ChunkStep, InMemoryJobRepository, JobExecutionId, JobParameter, Unmanaged};
+    use metrics_util::debugging::DebugValue;
 
     fn params(date: &str) -> JobParameters {
         JobParameters::new().with("date", JobParameter::String(date.into()))
@@ -585,5 +601,170 @@ mod tests {
         let parameters = params("2026-07-28");
 
         assert_send(launcher.run(&mut job, &parameters));
+    }
+
+    /// The counter for a metric with a `status` label, or `None` if that
+    /// status was never emitted.
+    fn with_status(snapshot: &Recorded, name: &str, status: &str) -> Option<u64> {
+        snapshot
+            .iter()
+            .find(|(composite, ..)| {
+                composite.key().name() == name
+                    && composite
+                        .key()
+                        .labels()
+                        .any(|label| label.key() == LABEL_STATUS && label.value() == status)
+            })
+            .and_then(|(.., value)| match value {
+                DebugValue::Counter(n) => Some(*n),
+                _ => None,
+            })
+    }
+
+    #[test]
+    fn a_successful_run_publishes_started_and_finished_as_completed() {
+        let snapshot = recorded(|| {
+            block_on(async {
+                let launcher = JobLauncher::new(InMemoryJobRepository::default());
+                let mut job = ok_job();
+                launcher.run(&mut job, &params("2026-07-31")).await.unwrap();
+            });
+        });
+
+        assert_eq!(counter(&snapshot, JOBS_STARTED, None), Some(1));
+        assert_eq!(with_status(&snapshot, JOBS_FINISHED, "completed"), Some(1));
+        assert_eq!(with_status(&snapshot, JOBS_FINISHED, "failed"), None);
+        assert_eq!(
+            labels_of(&snapshot, JOBS_STARTED),
+            vec![(LABEL_JOB.to_owned(), "nightly".to_owned())]
+        );
+    }
+
+    /// The `status` label is what makes one metric answer "what fraction
+    /// failed?" — two separate metric names could not.
+    #[test]
+    fn a_failing_run_publishes_finished_as_failed() {
+        let snapshot = recorded(|| {
+            block_on(async {
+                let launcher = JobLauncher::new(InMemoryJobRepository::default());
+                let mut job = failing_job();
+                assert!(launcher.run(&mut job, &params("2026-07-31")).await.is_err());
+            });
+        });
+
+        assert_eq!(counter(&snapshot, JOBS_STARTED, None), Some(1));
+        assert_eq!(with_status(&snapshot, JOBS_FINISHED, "failed"), Some(1));
+        assert_eq!(with_status(&snapshot, JOBS_FINISHED, "completed"), None);
+        assert_eq!(with_status(&snapshot, STEPS_FINISHED, "failed"), Some(1));
+    }
+
+    /// A launch rejected by FR-4.4 never ran, so it must not appear as a start.
+    /// Otherwise `jobs_started - jobs_finished` — the in-flight count — grows by
+    /// one on every rejected relaunch and never comes back down.
+    #[test]
+    fn a_rejected_relaunch_publishes_nothing() {
+        let snapshot = recorded(|| {
+            block_on(async {
+                let launcher = JobLauncher::new(InMemoryJobRepository::default());
+
+                let mut first = ok_job();
+                launcher
+                    .run(&mut first, &params("2026-07-31"))
+                    .await
+                    .unwrap();
+
+                let mut again = ok_job();
+                assert!(
+                    launcher
+                        .run(&mut again, &params("2026-07-31"))
+                        .await
+                        .is_err()
+                );
+            });
+        });
+
+        // One launch, not two: the rejected one is invisible to both counters.
+        assert_eq!(counter(&snapshot, JOBS_STARTED, None), Some(1));
+        assert_eq!(with_status(&snapshot, JOBS_FINISHED, "completed"), Some(1));
+    }
+
+    /// FR-5.1: a step skipped on restart did not run, so it is not counted as
+    /// started — which is exactly what `describe()` promises operators.
+    #[test]
+    fn a_step_skipped_on_restart_is_not_counted_as_started() {
+        let sink = SharedSink::new();
+
+        let loader = |sink: &SharedSink| {
+            ChunkStep::new(
+                "load",
+                VecReader::new(vec![2, 4]),
+                EvenDoubler,
+                Unmanaged(sink.writer(usize::MAX)),
+                nz(2),
+            )
+        };
+
+        let first = recorded(|| {
+            block_on(async {
+                let launcher = JobLauncher::new(InMemoryJobRepository::default());
+                let mut job = Job::new(
+                    "nightly",
+                    vec![Box::new(loader(&sink)), Box::new(FailingStep)],
+                );
+                assert!(launcher.run(&mut job, &params("2026-07-31")).await.is_err());
+
+                // Restart the same instance against the same repository.
+                let mut retry = Job::new(
+                    "nightly",
+                    vec![Box::new(loader(&sink)), Box::new(FailingStep)],
+                );
+                assert!(
+                    launcher
+                        .run(&mut retry, &params("2026-07-31"))
+                        .await
+                        .is_err()
+                );
+            });
+        });
+
+        // "load" started once across two attempts; "failing" started twice.
+        assert_eq!(step_counter(&first, STEPS_STARTED, "load"), Some(1));
+        assert_eq!(step_counter(&first, STEPS_STARTED, "failing"), Some(2));
+
+        // The duration histogram must agree: no sample for a step that never ran.
+        assert_eq!(histogram_samples(&first, STEP_DURATION, "load"), 1);
+    }
+
+    fn step_counter(snapshot: &Recorded, name: &str, step: &str) -> Option<u64> {
+        snapshot
+            .iter()
+            .find(|(composite, ..)| {
+                composite.key().name() == name
+                    && composite
+                        .key()
+                        .labels()
+                        .any(|label| label.key() == LABEL_STEP && label.value() == step)
+            })
+            .and_then(|(.., value)| match value {
+                DebugValue::Counter(n) => Some(*n),
+                _ => None,
+            })
+    }
+
+    fn histogram_samples(snapshot: &Recorded, name: &str, step: &str) -> usize {
+        snapshot
+            .iter()
+            .find(|(composite, ..)| {
+                composite.key().name() == name
+                    && composite
+                        .key()
+                        .labels()
+                        .any(|label| label.key() == LABEL_STEP && label.value() == step)
+            })
+            .map(|(.., value)| match value {
+                DebugValue::Histogram(samples) => samples.len(),
+                _ => 0,
+            })
+            .unwrap_or(0)
     }
 }
