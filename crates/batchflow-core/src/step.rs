@@ -7,6 +7,8 @@ use std::num::NonZeroUsize;
 /// A chunk's pending counter deltas, folded into a [`StepExecution`] only at
 /// the commit point.
 ///
+/// [`StepExecution`]: crate::StepExecution
+///
 /// Separate from `StepExecution` because the owners differ: a step reports
 /// deltas, the repository owns the persisted totals and the id. A step cannot
 /// return a `StepExecution` at all - it has no repository to mint one.

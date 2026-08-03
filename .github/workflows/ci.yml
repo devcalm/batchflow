@@ -1,0 +1,97 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    # Weekly, so an upstream release that breaks us surfaces on a Monday
+    # rather than inside an unrelated pull request.
+    - cron: "0 6 * * 1"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # Registry dependencies are compiled with `--cap-lints allow`, so this denies
+  # warnings in our own crates only -- including the jobs that never run clippy.
+  RUSTFLAGS: -D warnings
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Docker is preinstalled on the GitHub-hosted runners, so the testcontainers
+  # suite needs no configuration. DATABASE_URL is deliberately left unset: with
+  # it, `sqlx::query!` would validate against the live database instead of the
+  # committed `.sqlx/` cache, and a stale cache would pass CI while breaking
+  # every contributor who builds without Docker.
+  test:
+    name: test (stable)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace --locked
+
+  lint:
+    name: fmt + clippy + doc
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: cargo doc --workspace --no-deps --locked
+        env:
+          # broken_intra_doc_links is warn-by-default, so plain `cargo doc`
+          # exits 0 on links that docs.rs then ships broken.
+          RUSTDOCFLAGS: -D warnings
+
+  # `rust-version` promises that the *library* builds, not that the test suite
+  # does: dev-dependencies carry their own MSRVs we make no promise about. So
+  # this is `check`, without `--all-targets`.
+  #
+  # Two lanes because MSRV belongs to a crate, not to the repository. sqlx 0.9
+  # forces `batchflow-postgres` to 1.94; holding the whole workspace there
+  # would deny 1.85 users a facade that does not depend on it. Each lane checks
+  # exactly the crates whose `rust-version` it is.
+  msrv:
+    name: msrv (${{ matrix.rust }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - rust: "1.85"
+            packages: -p batchflow-core -p batchflow -p batchflow-metrics
+          - rust: "1.94"
+            packages: -p batchflow-postgres
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.rust }}
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check ${{ matrix.packages }} --locked
+
+  # The jobs above pin Cargo.lock so a red build always means someone changed
+  # this repository. That reproducibility costs us the other signal -- an
+  # upstream release that breaks us -- which this job buys back on a schedule,
+  # where it cannot block an unrelated pull request.
+  latest-deps:
+    name: latest dependencies
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule'
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo update
+      - run: cargo test --workspace

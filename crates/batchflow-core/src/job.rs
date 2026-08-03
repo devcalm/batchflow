@@ -177,8 +177,9 @@ impl<Tx> Job<Tx> {
                 .last_step_execution(job_execution.instance_id(), step.name())
                 .await?;
 
-            if let Some(previous) = &previous
-                && previous.status() == BatchStatus::Completed
+            if previous
+                .as_ref()
+                .is_some_and(|previous| previous.status() == BatchStatus::Completed)
             {
                 continue;
             }

@@ -298,6 +298,26 @@ before writing any of it.
 
 **Recorders are global, so tests never install one.** `metrics::with_local_recorder` scopes a recorder to a closure via a thread-local; a test that called `set_global_recorder` would make every other test in the binary order-dependent, and the second one would simply fail. Same discipline at the exporter level: `builder().build_recorder()`, never `install()`.
 
+## Phase 12.5 — CI ☑ (unplanned; added 2026-08-03)
+- **Goals:** make the cross-cutting quality gate below executable by a machine that is not the author's laptop.
+- **Tasks:** ☑ `.github/workflows/ci.yml` — `test` / `lint` / `msrv` (matrix) / `latest-deps` (scheduled).
+- **Acceptance:** ☑ every promise in the table below is checked by a job. **Testing:** the workflow itself; two jobs went red on their first run and both were real.
+
+**A gate you run by hand is a gate you run with the wrong flags.** Three of the four promises this repo makes were unchecked, and running them properly found two live bugs at HEAD.
+
+- **`cargo doc` was never a gate.** `rustdoc::broken_intra_doc_links` is warn-by-default, so `cargo doc` exits **0** on exactly the failure the gate was written to catch. `step.rs:7` had an unresolved `[`StepExecution`]` link at HEAD — `step.rs` never brings the type into scope, and docs.rs would have shipped `StepContribution`'s first line as literal `[StepExecution]` text. Fixed with a reference-style path link (`[`StepExecution`]: crate::StepExecution`), which keeps the prose reading naturally; a `use` for docs alone would trip `unused_imports`. **The gate is `RUSTDOCFLAGS: -D warnings`, not `cargo doc`.**
+- **`rust-version = "1.85"` was false in two independent ways.** (1) `sqlx 0.9` requires 1.94, so `batchflow-postgres` could never have built there. (2) `job.rs:180` used a **let-chain**, stable only since 1.88 — so even `batchflow-core` was lying. Nothing detected either, because the claim had no test.
+
+**MSRV belongs to a crate, not to a repository.** `[workspace.package]` is right for `version`/`license`/`authors` — facts about the project — and wrong for `rust-version`, which is a fact about *one crate's dependency graph*. Users take a crate, not a workspace: someone on 1.85 can have `batchflow` + the in-memory store perfectly well, and inheriting 1.94 across the board would deny them that for a Postgres backend they never asked for. So `batchflow-postgres` overrides to `rust-version = "1.94"` and the `msrv` job is a two-lane matrix, each lane checking exactly the crates whose version it names.
+- **The let-chain was rewritten, not the MSRV bumped.** `previous.as_ref().is_some_and(|p| p.status() == Completed)` is stable since 1.70 and is *better* code — a predicate instead of a binding nobody uses. When sugar costs three minor versions of compatibility and buys nothing, drop the sugar. Had it cost readability, raising `rust-version` to 1.88 would have been the honest answer instead: **an MSRV describes reality, it is not an aspiration to contort code toward.**
+- **The MSRV job is `check`, not `test`, and has no `--all-targets`.** `rust-version` promises the *library* compiles. `testcontainers` and `tokio`'s `test-util` carry their own MSRVs this project promises nothing about, and letting a dev-dependency's bump turn the MSRV job red would train everyone to ignore it.
+
+**The Postgres suite needs no CI configuration, and that is the payoff of 11e.** The tests call `PostgresImage::default().start()` themselves and GitHub's runners ship Docker, so there is no `services:` block. More importantly `DATABASE_URL` is left **unset on purpose**: were it set, `sqlx::query!` would validate against the live database instead of the committed `.sqlx/` cache, and a stale cache would pass CI while breaking every contributor who builds without Docker. Here the thing that makes the build reproducible is the *absence* of a variable.
+
+**`--locked` everywhere, plus a scheduled job that deliberately drops it.** A library's `Cargo.lock` is ignored by everyone downstream; it pins only our own CI. With `--locked`, red always means *someone changed this repository* — but CI can then never tell us an upstream release broke us. `latest-deps` buys that signal back on a weekly cron with `continue-on-error`, where it cannot block an unrelated pull request. Two failure modes, separated, instead of one channel carrying both ambiguously.
+
+**`RUSTFLAGS: -D warnings` at workflow level is not redundant with `clippy -- -D warnings`.** Cargo compiles registry dependencies with `--cap-lints allow`, so the env var denies warnings in *our* crates only — including in the `test` and `msrv` jobs, which never invoke clippy. The clippy flag denies clippy's own lints on top of that.
+
 ## Phase 13 — Tracing ☐  ← **next**
 - **Goals:** `tracing` spans per job/step/chunk; correlation IDs; OTel export.
 - **Tasks:** `batchflow-tracing`; span instrumentation. **Acceptance:** nested spans visible. **Testing:** span capture. **Docs:** OTel setup.
@@ -341,13 +361,16 @@ caller, the fact that the metadata store is now stale has already stopped being 
 ---
 
 ## Cross-cutting quality gate (every phase)
-`cargo fmt --check` · `cargo clippy --workspace --all-targets -- -D warnings` · `cargo test --workspace` · **`cargo doc --workspace --no-deps`** · examples compile · no dead code · no needless clone/alloc.
-**`cargo doc` is a gate in its own right.** `fmt`, `clippy` and `test` were all green in 12a while a broken intra-doc link sat in `lib.rs` — and broken links are what docs.rs ships. `#![warn(missing_docs)]` is on in all four crates, so a new public item without rustdoc now fails clippy too.
+**Executed by `.github/workflows/ci.yml` since 12.5 — this list is the specification, that file is the implementation. They must not drift.**
+`cargo fmt --all --check` · `cargo clippy --workspace --all-targets --locked -- -D warnings` · `cargo test --workspace --locked` · **`RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --locked`** · `cargo +<msrv> check` per lane · examples compile · no dead code · no needless clone/alloc.
+**`cargo doc` is a gate in its own right — but only with `RUSTDOCFLAGS="-D warnings"`.** `fmt`, `clippy` and `test` were all green in 12a while a broken intra-doc link sat in `lib.rs`, and 12.5 found the *same class of bug still live* at `step.rs:7`, because bare `cargo doc` exits 0 on broken links. Broken links are what docs.rs ships. `#![warn(missing_docs)]` is on in all four crates, so a new public item without rustdoc now fails clippy too.
 **Read the `Doc-tests` counts, do not just read the unit count** — see debt (6). A doctest can disappear without anything going red. Note there are now doctests in four crates (`batchflow_core`, `batchflow`, `batchflow_metrics`, `batchflow_postgres`); the facade's is the one that guards user-facing re-exports.
 Postgres integration tests need Docker running. They are part of the gate, not an optional extra — `cargo test --workspace` silently covers less without it.
 
-## Current position (2026-07-30)
-Phase 0 ◐ docs (tech-eval open items) · 1 ☑ workspace · 2 ☑ traits · 3 ☑ Job + typestate `JobBuilder` · 4 ◐ step model (tasklet trait pending) · 5 ☑ engine · 6 ◐ chunk processing (property tests/tuning guide pending) · 7 ☑ JobRepository · 8 ☑ ExecutionContext · 9 ☑ restart · **10 ☑ retry & skip** (10d chunk-scanning `[OPEN]`) · 11 ☑ transactions · **12 ☑ metrics**.
+## Current position (2026-08-03)
+Phase 0 ◐ docs (tech-eval open items) · 1 ☑ workspace · 2 ☑ traits · 3 ☑ Job + typestate `JobBuilder` · 4 ◐ step model (tasklet trait pending) · 5 ☑ engine · 6 ◐ chunk processing (property tests/tuning guide pending) · 7 ☑ JobRepository · 8 ☑ ExecutionContext · 9 ☑ restart · **10 ☑ retry & skip** (10d chunk-scanning `[OPEN]`) · 11 ☑ transactions · 12 ☑ metrics · **12.5 ☑ CI**.
+
+**MSRV is now per-crate and verified:** 1.85 for `batchflow-core`/`batchflow`/`batchflow-metrics`, 1.94 for `batchflow-postgres` (sqlx 0.9). Both lanes checked locally against real toolchains before the workflow was committed, and both are jobs in CI.
 `batchflow-core` modules: `chunk`/`classifier`/`context`/`error`/`execution`/`fault`/`item`/`job`/`launcher`/`memory`/`repository`/`step` + `#[cfg(test)] testing`, with `lib.rs` as a pure re-export surface (private `mod` + flat `pub use`, so module layout stays refactorable). **134 tests green: 105 core unit · 3 `batchflow-metrics` unit · 6 doctests (core, facade, metrics) · 20 Postgres integration across `repository`/`classifier`/`fault_tolerance`.** clippy `--all-targets -D warnings` clean, `cargo fmt --check` clean, `cargo doc` clean, `#![warn(missing_docs)]` on everywhere and silent.
 
 **US-3 and US-4 now hold end to end.** A malformed staging row raises a real `22P02`, is skipped, and the job completes with `skip_count` durable in `step_execution`. A writer that loses a lock race raises a real `55P03`, the chunk is rolled back and re-attempted in a *fresh* transaction, and every row lands exactly once.

@@ -3,7 +3,11 @@ name = "batchflow-postgres"
 description = "Postgres metadata store for BatchFlow, a Spring Batch-inspired batch processing framework for Rust."
 version.workspace = true
 edition.workspace = true
-rust-version.workspace = true
+# Deliberately *not* `workspace = true`. MSRV is a property of a crate's own
+# dependency graph, not of the repository: sqlx 0.9 requires 1.94, and
+# inheriting the workspace's 1.85 would publish a promise this crate cannot
+# keep. A user on 1.85 can still take `batchflow` with the in-memory store.
+rust-version = "1.94"
 license.workspace = true
 authors.workspace = true
 documentation = "https://docs.rs/batchflow-postgres"
