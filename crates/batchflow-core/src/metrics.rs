@@ -142,3 +142,53 @@ pub fn describe() {
         "Wall time for one step execution."
     );
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Pins the *values*, which no other test does.
+    ///
+    /// Every emit site and every assertion goes through these constants, so a
+    /// rename moves both sides together: mutation testing in 13c renamed
+    /// `ITEMS_READ` to `batchflow_ITEMS_RENAMED_total` and the whole workspace
+    /// suite stayed green, while every Grafana panel would have gone blank.
+    /// A metric name is a published contract; changing one should require a
+    /// diff here that a reviewer can see.
+    #[test]
+    fn the_metric_vocabulary_is_a_published_contract() {
+        assert_eq!(JOBS_STARTED, "batchflow_jobs_started_total");
+        assert_eq!(JOBS_FINISHED, "batchflow_jobs_finished_total");
+        assert_eq!(STEPS_STARTED, "batchflow_steps_started_total");
+        assert_eq!(STEPS_FINISHED, "batchflow_steps_finished_total");
+
+        assert_eq!(ITEMS_READ, "batchflow_items_read_total");
+        assert_eq!(ITEMS_WRITTEN, "batchflow_items_written_total");
+        assert_eq!(ITEMS_FILTERED, "batchflow_items_filtered_total");
+        assert_eq!(ITEMS_SKIPPED, "batchflow_items_skipped_total");
+
+        assert_eq!(CHUNKS_COMMITTED, "batchflow_chunks_committed_total");
+        assert_eq!(CHUNK_RETRIES, "batchflow_chunk_retries_total");
+        assert_eq!(CHUNK_DURATION, "batchflow_chunk_duration_seconds");
+        assert_eq!(STEP_DURATION, "batchflow_step_duration_seconds");
+
+        assert_eq!(LABEL_JOB, "job");
+        assert_eq!(LABEL_STEP, "step");
+        assert_eq!(LABEL_STATUS, "status");
+        assert_eq!(LABEL_PHASE, "phase");
+    }
+
+    /// The status label values are equally published, and an exhaustive match
+    /// means a new `BatchStatus` variant lands here as a compile error.
+    #[test]
+    fn every_status_renders_a_stable_label() {
+        use crate::BatchStatus::*;
+
+        assert_eq!(status_label(Starting), "starting");
+        assert_eq!(status_label(Started), "started");
+        assert_eq!(status_label(Completed), "completed");
+        assert_eq!(status_label(Failed), "failed");
+        assert_eq!(status_label(Stopped), "stopped");
+        assert_eq!(status_label(Abandoned), "abandoned");
+    }
+}

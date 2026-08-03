@@ -9,15 +9,21 @@ use crate::{
     BatchError, BatchStatus, Classifier, ContextValue, ErrorAction, ExecutionContext,
     InMemoryJobRepository, ItemProcessor, ItemReader, ItemWriter, JobExecution, JobExecutionId,
     JobInstance, JobInstanceId, JobParameters, JobRepository, Step, StepCommit, StepContribution,
-    StepExecution,
+    StepExecution, StepExecutionId, StepIdentity,
 };
 use ::metrics::{Key, SharedString, Unit};
 use async_trait::async_trait;
 use metrics_util::CompositeKey;
 use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::num::{NonZeroU32, NonZeroUsize};
 use std::sync::{Arc, Mutex};
+use tracing::field::{Field, Visit};
+use tracing::instrument::WithSubscriber;
+use tracing::{Event, Level, Subscriber};
+use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
+use tracing_subscriber::registry::LookupSpan;
 
 /// Shorthand for a chunk-size literal. A zero here is a bug in the test itself,
 /// so panicking is the right response.
@@ -552,8 +558,13 @@ impl RecordingCommit {
 
 #[async_trait]
 impl StepCommit<()> for RecordingCommit {
-    fn job_name(&self) -> &str {
-        "test-job"
+    fn identity(&self) -> StepIdentity<'_> {
+        StepIdentity {
+            job_name: "test-job",
+            step_name: "test-step",
+            job_execution_id: JobExecutionId::new(1),
+            step_execution_id: StepExecutionId::new(1),
+        }
     }
 
     async fn begin(&mut self) -> Result<(), BatchError> {
@@ -778,4 +789,126 @@ pub(crate) fn labels_of(snapshot: &Recorded, name: &str) -> Vec<(String, String)
                 .collect()
         })
         .unwrap_or_default()
+}
+
+// ---------------------------------------------------------------------------
+// Tracing test support
+// ---------------------------------------------------------------------------
+
+/// One captured event, flattened for assertions.
+#[derive(Debug, Clone)]
+pub(crate) struct Captured {
+    pub level: Level,
+    pub message: String,
+    pub fields: BTreeMap<String, String>,
+    /// Span names enclosing the event, innermost first.
+    pub spans: Vec<String>,
+}
+
+impl Captured {
+    /// The value of `name`, or `None` if the event never carried that field.
+    pub fn field(&self, name: &str) -> Option<&str> {
+        self.fields.get(name).map(String::as_str)
+    }
+}
+
+/// Flattens an event's fields to strings.
+///
+/// All three `record_*` arms are needed: `tracing` dispatches by *type*, so
+/// `phase = "read"` lands in `record_str`, `skipped = 1usize` in `record_u64`
+/// and `error = %error` in `record_debug`. A missing arm drops that field
+/// silently rather than failing to compile.
+#[derive(Default)]
+struct FieldCollector {
+    message: String,
+    fields: BTreeMap<String, String>,
+}
+
+impl FieldCollector {
+    fn put(&mut self, field: &Field, value: String) {
+        if field.name() == "message" {
+            self.message = value;
+        } else {
+            self.fields.insert(field.name().to_owned(), value);
+        }
+    }
+}
+
+impl Visit for FieldCollector {
+    fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+        self.put(field, format!("{value:?}"));
+    }
+
+    fn record_str(&mut self, field: &Field, value: &str) {
+        self.put(field, value.to_owned());
+    }
+
+    fn record_u64(&mut self, field: &Field, value: u64) {
+        self.put(field, value.to_string());
+    }
+}
+
+/// Collects every event into a shared buffer. The tracing counterpart of
+/// [`DebuggingRecorder`].
+#[derive(Clone, Default)]
+pub(crate) struct CaptureLayer(Arc<Mutex<Vec<Captured>>>);
+
+impl<S> Layer<S> for CaptureLayer
+where
+    S: Subscriber + for<'a> LookupSpan<'a>,
+{
+    fn on_event(&self, event: &Event<'_>, ctx: Context<'_, S>) {
+        let mut collector = FieldCollector::default();
+        event.record(&mut collector);
+
+        let spans = ctx
+            .event_scope(event)
+            .map(|scope| scope.map(|span| span.name().to_owned()).collect())
+            .unwrap_or_default();
+
+        self.0.lock().unwrap().push(Captured {
+            level: *event.metadata().level(),
+            message: collector.message,
+            fields: collector.fields,
+            spans,
+        });
+    }
+}
+
+/// Runs `future` with a subscriber scoped to it, returning its output and
+/// everything it emitted.
+///
+/// `WithSubscriber` rather than `tracing::subscriber::with_default`: the latter
+/// takes a *synchronous* closure and installs a thread-local, which an async
+/// body stops seeing the moment it is polled on another thread. That failure is
+/// silent — a test capturing nothing passes every assertion about absence. It
+/// is the same trap as `Span::enter` versus `Instrument`, and the compiler
+/// catches neither.
+///
+/// Never `set_global_default`, for the reason [`recorded`] gives about
+/// recorders: one per process makes every test order-dependent.
+pub(crate) async fn captured<F>(future: F) -> (F::Output, Vec<Captured>)
+where
+    F: Future,
+{
+    let layer = CaptureLayer::default();
+    let events = Arc::clone(&layer.0);
+    let subscriber = tracing_subscriber::registry().with(layer);
+
+    let output = future.with_subscriber(subscriber).await;
+
+    let events = events.lock().unwrap().clone();
+    (output, events)
+}
+
+/// Every captured event at `level` whose message matches.
+pub(crate) fn events_named<'a>(
+    events: &'a [Captured],
+    level: Level,
+    message: &str,
+) -> Vec<&'a Captured> {
+    events
+        .iter()
+        .filter(|event| event.level == level && event.message == message)
+        .collect()
 }

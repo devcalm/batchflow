@@ -21,6 +21,7 @@ mod repository;
 mod testing;
 
 pub mod metrics;
+pub mod tracing;
 
 /// Re-exported so implementing [`Step`] needs no direct `async-trait` dependency.
 pub use async_trait::async_trait;
@@ -37,4 +38,4 @@ pub use job::{HasSteps, Job, JobBuilder, NoSteps};
 pub use launcher::JobLauncher;
 pub use memory::InMemoryJobRepository;
 pub use repository::JobRepository;
-pub use step::{ChunkStep, Step, StepCommit, StepContribution};
+pub use step::{ChunkStep, Step, StepCommit, StepContribution, StepIdentity};

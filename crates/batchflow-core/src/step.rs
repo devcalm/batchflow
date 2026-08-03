@@ -1,6 +1,7 @@
 use crate::FaultTolerance;
 use crate::chunk::{ChunkConfig, run_step};
 use crate::{BatchError, ExecutionContext, ItemProcessor, ItemReader, TransactionalWriter};
+use crate::{JobExecutionId, StepExecutionId};
 use async_trait::async_trait;
 use std::num::NonZeroUsize;
 
@@ -83,6 +84,22 @@ impl StepContribution {
     }
 }
 
+/// Identifies the step a [`StepCommit`] belongs to.
+///
+/// The chunk loop is reached through `dyn Step`, so it cannot learn any of
+/// this on its own; the engine is the only thing that knows all four facts.
+#[derive(Debug, Clone, Copy)]
+pub struct StepIdentity<'a> {
+    /// The name of the job this step is running under.
+    pub job_name: &'a str,
+    /// The step's own name.
+    pub step_name: &'a str,
+    /// The job execution this step belongs to.
+    pub job_execution_id: JobExecutionId,
+    /// This step execution.
+    pub step_execution_id: StepExecutionId,
+}
+
 /// The step's transaction boundary. `commit` folds `contribution` into the
 /// persisted counters, stores `context` as the bookmark, and commits `tx` —
 /// so the chunk's data and its metadata become durable together.
@@ -91,13 +108,11 @@ impl StepContribution {
 /// which `JobRepository` is not, and it keeps persistence out of step code.
 #[async_trait]
 pub trait StepCommit<Tx = ()>: Send {
-    /// The name of the job this step is running under.
+    /// Identifies the step this commit belongs to.
     ///
-    /// A step cannot know it — the name lives on [`Job`](crate::Job) and only
-    /// the engine crosses that boundary — but the chunk loop needs it to label
-    /// its metrics. No default body: one returning `""` would silently emit
-    /// unlabelled metrics for the lifetime of the process.
-    fn job_name(&self) -> &str;
+    /// No default body: one returning placeholder values would silently
+    /// mislabel every span and metric for the lifetime of the process.
+    fn identity(&self) -> StepIdentity<'_>;
 
     /// Opens the transaction for one chunk.
     async fn begin(&mut self) -> Result<Tx, BatchError>;
@@ -224,7 +239,12 @@ where
         context: &mut ExecutionContext,
         commit: &mut dyn StepCommit<Tx>,
     ) -> Result<(), BatchError> {
-        let config = ChunkConfig::new(self.chunk_size, &self.fault, commit.job_name(), &self.name);
+        let config = ChunkConfig::new(
+            self.chunk_size,
+            &self.fault,
+            commit.identity().job_name,
+            &self.name,
+        );
 
         run_step(
             &mut self.reader,

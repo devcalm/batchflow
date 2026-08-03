@@ -30,6 +30,14 @@ testcontainers-modules = "0.13"
 # recorder; the exporter and its dependencies live in `batchflow-metrics`.
 metrics = "0.24"
 metrics-util = "0.20"
+tracing = "0.1"
+# Test-only capture layer. `default-features = false` must be declared here and
+# not in the member: a workspace dependency's default features cannot be turned
+# off downstream. Drops the `fmt` stack, which a capture layer never formats.
+tracing-subscriber = { version = "0.3", default-features = false, features = [
+    "registry",
+    "std",
+] }
 # `default-features = false` here rather than in the member: a workspace
 # dependency's default-features cannot be turned off downstream. Drops
 # `http-listener`/`push-gateway` and with them hyper, rustls and tokio-net.

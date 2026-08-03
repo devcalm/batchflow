@@ -328,3 +328,39 @@ a caller that branches on errors can see both without reading a log.
   and the innermost cause is still the step's error. Verbose when the whole store is down; accurate always.
 - **Metrics stay consistent with the store**: the terminal counters are emitted only when the status write succeeded,
   so a metric never claims a status the repository never recorded.
+
+### ADR-010 — No `batchflow-tracing` crate; the engine ships a vocabulary, the application owns the pipeline `[DECIDED 2026-08-03]`
+**Context:** `Plan.md` Phase 13 promised a `batchflow-tracing` crate for OTel export, by analogy with
+`batchflow-metrics`. That plan was written in Phase 0, before either existed. Once the spans and events were built,
+the analogy did not hold.
+
+**Decision:** there is no `batchflow-tracing` crate. `batchflow_core::tracing` exports the span-name and field-key
+vocabulary; wiring an exporter is documented in the facade's rustdoc and left to the application.
+
+**Why — three reasons, in increasing order of importance.**
+1. **The exporter is the dependency trap 12d already solved.** Measured, not estimated:
+   `tracing-opentelemetry` + `opentelemetry` + `opentelemetry_sdk` is **39 crates**; adding `opentelemetry-otlp`
+   takes it to **99**, pulling hyper, prost, tower and the http stack. `batchflow-core`'s entire runtime tree is 24.
+   12d's answer was that `render()` returns a `String` and routing it is the application's job; the same answer
+   applies, so the crate could at most ship a `Layer`.
+2. **Once the exporter is gone, there is no content left.** `batchflow-metrics` earns its existence by holding real
+   decisions — the histogram bucket boundaries, and calling `describe()` *after* `install_recorder()`. Sampling was
+   the candidate here, and 13b removed the need for it: with chunk spans deliberately rejected, a ten-step job emits
+   **eleven spans per run**. What remains is `tracing_opentelemetry::layer().with_tracer(tracer)`.
+3. **Shipping it would actively break users.** `tracing-opentelemetry` 0.33 is hard-paired to `opentelemetry` 0.32,
+   and the OTel Rust ecosystem bumps majors roughly quarterly. A user on `opentelemetry` 0.31 who added our crate
+   would get two semver-incompatible copies of `opentelemetry` in one binary — and therefore **two global tracer
+   providers**. Our layer would register with one while their exporter installed into the other, and spans would go
+   nowhere, silently, with everything compiling. `batchflow-metrics` documents its Prometheus coupling and accepts
+   it because that crate carries value in exchange; here the exchange is fifteen lines of glue.
+
+**Consequences:**
+- **The deliverable is the vocabulary, not the transport** — the tracing counterpart of 12a. `SPAN_JOB`/`SPAN_STEP`
+  and the `FIELD_*` keys are what an operator writes queries against, and a rename is now a visible change.
+- **`tracing` field names cannot be constants, and the failure is silent.** `tracing`'s macros take a field name as
+  an *identifier*: `warn!(FIELD_PHASE = "read")` compiles and emits a field literally named `FIELD_PHASE`. Span
+  names *are* evaluated as expressions, so `info_span!(SPAN_JOB, ..)` is correct and is used. Verified by probe in
+  both directions rather than assumed. Field literals in the engine are therefore bound to the module **only by
+  tests**, which is why the 13b assertions were rewritten to use the constants.
+- **Revisit if OTel Rust reaches 1.0**, at which point the version-pinning objection expires and a thin layer crate
+  might be worth its maintenance. Nothing else about the decision would change.

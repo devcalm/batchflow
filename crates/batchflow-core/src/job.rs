@@ -2,11 +2,13 @@ use crate::BatchError;
 use crate::metrics::{
     LABEL_JOB, LABEL_STATUS, LABEL_STEP, STEP_DURATION, STEPS_FINISHED, STEPS_STARTED, status_label,
 };
+use crate::tracing::SPAN_STEP;
 use crate::{
     BatchStatus, ExecutionContext, JobExecution, JobRepository, Step, StepCommit, StepContribution,
-    StepExecution,
+    StepExecution, StepIdentity,
 };
 use ::metrics::{counter, histogram};
+use ::tracing::Instrument;
 use async_trait::async_trait;
 use std::marker::PhantomData;
 use std::time::Instant;
@@ -24,8 +26,13 @@ struct RepositoryCommit<'a, R> {
 
 #[async_trait]
 impl<R: JobRepository> StepCommit<R::Tx> for RepositoryCommit<'_, R> {
-    fn job_name(&self) -> &str {
-        self.job_name
+    fn identity(&self) -> StepIdentity<'_> {
+        StepIdentity {
+            job_name: self.job_name,
+            step_name: self.step_execution.step_name(),
+            job_execution_id: self.step_execution.job_execution_id(),
+            step_execution_id: self.step_execution.id(),
+        }
     }
 
     async fn begin(&mut self) -> Result<R::Tx, BatchError> {
@@ -205,6 +212,12 @@ impl<Tx> Job<Tx> {
             step_execution.set_status(BatchStatus::Started);
             repository.update_step_execution(&step_execution).await?;
 
+            let span = ::tracing::info_span!(
+                SPAN_STEP,
+                step = %step.name(),
+                step_execution_id = step_execution.id().get(),
+            );
+
             // Counters and bookmark are now persisted by the step at each of
             // its commit points, not here — so a crash mid-step leaves the work
             // that did commit recorded.
@@ -214,7 +227,7 @@ impl<Tx> Job<Tx> {
                     step_execution: &mut step_execution,
                     job_name,
                 };
-                step.run(&mut context, &mut commit).await
+                step.run(&mut context, &mut commit).instrument(span).await
             };
 
             let status = if outcome.is_ok() {
@@ -234,6 +247,12 @@ impl<Tx> Job<Tx> {
             // Same precedence as the launcher: the step's failure is the cause,
             // and failing to record it is a consequence.
             if let Err(error) = outcome {
+                if let Err(ref cleanup) = recorded {
+                    tracing::error!(
+                        error = %cleanup,
+                        "failed to record the terminal step status; the metadata store is now stale"
+                    );
+                }
                 return Err(error.with_cleanup(recorded));
             }
 

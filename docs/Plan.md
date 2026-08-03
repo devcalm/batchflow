@@ -318,25 +318,80 @@ before writing any of it.
 
 **`RUSTFLAGS: -D warnings` at workflow level is not redundant with `clippy -- -D warnings`.** Cargo compiles registry dependencies with `--cap-lints allow`, so the env var denies warnings in *our* crates only — including in the `test` and `msrv` jobs, which never invoke clippy. The clippy flag denies clippy's own lints on top of that.
 
-## Phase 13 — Tracing ☐  ← **next**
-- **Goals:** `tracing` spans per job/step/chunk; correlation IDs; OTel export.
-- **Tasks:** `batchflow-tracing`; span instrumentation. **Acceptance:** nested spans visible. **Testing:** span capture. **Docs:** OTel setup.
+## Phase 13 — Tracing ☑
+> **13a ☑** the identity seam. `StepCommit::job_name()` → `identity() -> StepIdentity<'_>` (job name, step name, `JobExecutionId`, `StepExecutionId`).
+> **13b ☑** spans and events. `tracing` in core; `job`/`step` spans via `Instrument`; events for skips, retries and failed cleanup; capture harness + 7 tests, all mutation-verified.
+> **13c ☑** the vocabulary — `batchflow_core::tracing`, and **ADR-010: no `batchflow-tracing` crate**.
 
-**This is where the execution ids go.** Phase 12 deliberately kept `JobExecutionId`/`StepExecutionId` *out* of metric
-labels — one label value per run mints one time series per run, written once and kept forever. Spans are the opposite:
-high cardinality is the point, and a span carrying the execution id is exactly how an operator gets from "the failure
-rate spiked at 02:14" to "this run, this step, this chunk". The split between the two is a design decision already
-taken, not something to revisit here.
+- **Goals:** `tracing` spans per job/step; correlation IDs; OTel export.
+- **Acceptance:** ☑ nested spans visible and asserted. **Testing:** ☑ `CaptureLayer` + 16 mutations, all caught. **Docs:** ☑ OTel setup in the facade rustdoc (ADR-010: no exporter crate).
 
-**`StepCommit::job_name` is the precedent to follow, and to generalise from — carefully.** 12b added it because the
-chunk loop is reached through `dyn Step` and could not otherwise learn the job's name. Tracing will want the same
-identity plus the execution ids, which is the *second* case — so this is the point at which generalising is justified,
-where in 12b it would have been a guess. (Same rule that kept `CannotAbandon` narrow in 9a until Phase 10 supplied a
-second status error.)
+**Metrics gave the aggregate, the metadata store gives the final state, and neither gives the sequence.** At 02:14 a `skip_count` of 400 cannot say whether the skips were one contiguous block (a corrupt input segment) or scattered evenly (a systematic parse bug), and those two have opposite remedies. Every question that page raises is a question about *ordering in time*, which is the one thing a counter structurally cannot hold. That is why Phase 12 deliberately kept the execution ids **out** of metric labels — one label value per run mints one time series per run — and why they belong here, where high cardinality is the point.
 
-**Debt 3's remaining half lives here.** ADR-009 put both failures in the returned error, so nothing is lost without a
-logger. What tracing adds is the *event* at the moment cleanup fails — useful because by the time the error reaches a
-caller, the fact that the metadata store is now stale has already stopped being actionable at the site that knew it.
+**13a — the identity seam, and a correction to why it exists.** `StepIdentity` replaces `job_name()` rather than joining it with three more getters: the four facts share one owner, one lifetime and one consumer set. `RepositoryCommit` already held every one of them, so the widening cost no plumbing — usually a sign the seam was cut in the right place.
+- **The original justification was overstated and is corrected here.** "The chunk loop cannot learn this on its own" is false: `Job::run` holds all four directly, and once it wraps `step.run` in a span the chunk loop inherits them through the span tree. What `StepIdentity` actually buys is that the chunk loop is **self-describing rather than dependent on its caller having wrapped it** — and, more concretely, that a *third-party* `Step` implementation, which receives only `&mut ExecutionContext` and `&mut dyn StepCommit`, has some way to know which execution it is in. That is a public-API argument, not an engine one.
+- **`ChunkConfig::new` deliberately still takes two `&str`.** Handing it the whole `StepIdentity` would walk `JobExecutionId` into the function that builds **metric labels**, one plausible-looking line away from unbounded time-series growth that shows up in the Prometheus bill weeks later, not in CI. This cuts against 10b-4's "when two parameters are one decision, pass the decision" — correctly, because that rule is about *coupled* parameters, not about handing a callee fields it must not touch. Same instinct as 9a's `abandon_execution` taking an id rather than a `&JobExecution`.
+
+**13b — the async footgun that the type system does *not* catch.** Holding a `span.enter()` guard across an `.await` compiles. It is wrong: the guard pushes onto a *thread-local* stack, so at a yield the next task on that thread inherits the span, and on resume elsewhere the span is not entered at all. Verified by probe, and the result was the opposite of what we assumed going in:
+
+| held across `.await` | compiles? |
+|---|---|
+| `std::sync::MutexGuard` | **no** — `future cannot be sent between threads safely` |
+| `tracing::span::Entered` | **yes** — `Entered` is `Send` |
+
+The `+ Send` discipline that mechanically forbids the mutex bug is silent here. `.instrument(span)` is the only correct form across yields. **The same trap has a second door in the tests:** `tracing::subscriber::with_default` takes a *synchronous* closure, so an async body stops seeing the subscriber after a yield — and that failure is silent, since a test capturing nothing still passes every assertion about absence. `WithSubscriber::with_subscriber` is the async form. Sync/async pairs: `enter`/`instrument`, `with_default`/`with_subscriber`.
+
+**Chunk-level is events, not spans — this phase revises the plan's own promise.** 10M items at `chunk_size` 100 is 100,000 spans per run, and the question a chunk span mostly answers is already answered by `batchflow_chunk_duration` as an *aggregatable* histogram. The rule: **a span is for something you want to time and nest; an event is for something that happened.** A chunk that commits normally is not interesting; one that retried three times is. Volume is self-bounding — `skip_limit` is a hard cap on skip events, a property inherited free from 10c.
+
+**Observability reached back and changed an API from 10c.** `disposition` takes the error **by value** and `ItemDisposition::Skip` carried nothing, so a skipped row's error was already dropped before anything could log it — the counter was the only survivor. `Skip(BatchError)` returns it while preserving the property 10c chose by-value for: there is still no path where a caller consults the classifier and forgets the limit. Expect this direction of pressure; it is why 12a's "write the operator-facing text first" works.
+
+**The commit-retry path had no event, and the test is what found it.** Both `should_retry` sites look alike, but `Plan.md`'s own Phase 10 note records that **Postgres raises `40001` at `COMMIT`** — so the commit path, not the write path, is where a real serialization failure surfaces. It was the one site missed, which made the most common production retry the invisible one. Two distinct messages now, and `a_retried_commit_emits_its_own_event` asserts the *other* message is absent, so an operator grepping for one cannot silently match the other.
+
+**Debt 3's remaining half is closed.** All three `with_cleanup` sites now emit at `ERROR` before wrapping. ADR-009 already put both failures in the returned value, so nothing was *lost* without a subscriber; what the event adds is the moment — by the time the error reaches a caller, "the metadata store is now stale" has stopped being actionable at the site that knew it. Note the earlier claim that this *needed* a logger stays wrong: the return value is the primary channel, the event is the timestamp.
+
+**Every emit point is mutation-verified — 10 mutations, 10 caught**, nine failing exactly one test. The tenth (renaming the `job` span) fails two, which is genuine coupling: both tests assert on the span tree. Without this pass the whole phase would have been decorative, exactly as `Plan.md` warned after the 10e retry-writer episode. `CaptureLayer` is the tracing counterpart of `DebuggingRecorder`, and it lives under the same rule: **scoped per test, never `set_global_default`** — one per process makes every test order-dependent.
+- **`Visit` needs all three `record_*` arms.** tracing dispatches by *type*: `phase = "read"` lands in `record_str`, `skipped = 1usize` in `record_u64`, `error = %error` in `record_debug`. A missing arm drops that field **silently** rather than failing to compile — so the harness itself needed the same skepticism as the code.
+
+**Dependency cost, measured not asserted:** core's runtime tree is **24 crates**; `tracing` added 3 (`tracing`, `tracing-core`, and build-time-only `tracing-attributes`), and `Cargo.lock` gained **zero** new package entries because sqlx and testcontainers already pulled them. `tracing-subscriber` is dev-only with `default-features = false` — and per the note the root file already carries, that flag must be declared in `[workspace.dependencies]`, never in the member.
+
+**13c — the planned crate was not built, and the reasoning is ADR-010.** `Plan.md`'s Phase 0 promise of a
+`batchflow-tracing` crate did not survive contact with the built system. Measured rather than estimated: the layer
+alone is **39 crates**, adding `opentelemetry-otlp` takes it to **99** (hyper, prost, tower, the http stack) against
+core's own runtime tree of 24. 12d's answer applies unchanged — the application owns the pipeline. But once the
+exporter is gone there is no content left: `batchflow-metrics` earns its place by holding bucket boundaries and
+`describe()` ordering, whereas sampling — the only candidate here — was made moot by 13b rejecting chunk spans, so a
+ten-step job emits eleven spans per run. And shipping it would *harm* users: `tracing-opentelemetry` 0.33 is
+hard-paired to `opentelemetry` 0.32, so a user on 0.31 would get two semver-incompatible copies in one binary, hence
+two global tracer providers, hence spans silently going nowhere while everything compiles. **Not every planned crate
+should be built; the plan is a hypothesis, and this one was falsified.**
+
+**What shipped instead is 12a's counterpart: the vocabulary.** `batchflow_core::tracing` holds `SPAN_JOB`/`SPAN_STEP`
+and the nine `FIELD_*` keys, each with operator-facing rustdoc, plus the fifteen-line OTLP recipe in the *facade's*
+docs — the crate whose dependency graph matches a user's.
+
+**Span names can be constants; field names cannot, and the failure is silent.** Verified by probe in both directions:
+
+| written | recorded |
+|---|---|
+| `info_span!(SPAN_STEP)` | span named `step` — the constant **is** evaluated ✅ |
+| `warn!("phase" = "read")` | field `phase` ✅ |
+| `warn!(FIELD_PHASE = "read")` | field **`FIELD_PHASE`** — compiles, constant never read ❌ |
+
+`tracing` takes a field name as an *identifier*. So the engine uses `SPAN_*` at its emit sites and keeps field names
+as literals, and the only thing binding those literals to the module is the tests — which is why 13b's assertions
+were rewritten to go through the constants.
+
+**Mutation testing found a hole that had been open since Phase 12.** Renaming a `SPAN_*` constant initially survived,
+because the emit site and the assertion both use it and move together. Probing further: renaming `ITEMS_READ` — a
+*published Prometheus metric name* — left the entire workspace suite green while every Grafana panel would have gone
+blank. Closed in both modules with a test that pins the literal **values**. That looks tautological and is not: these
+strings are a published contract, exactly like a wire format, and the test's job is to make changing one a deliberate
+act with a reviewable diff. `the_phase_key_matches_its_metric_label` additionally pins `FIELD_PHASE == LABEL_PHASE`,
+so an event and a counter cannot come to partition skips differently.
+
+**Phase 13's own forward-looking notes are now spent** — the execution ids went into spans,
+`StepCommit::job_name` generalised into `StepIdentity`, and debt 3's remaining half closed with the `ERROR` events
+at all three `with_cleanup` sites. Nothing from the original Phase 13 sketch is outstanding.
 
 ## Phase 14 — Scheduling ☐ (`JobLauncher` already exists — this phase is the adapters only)
 - **Goals:** launch API + adapters (tokio-cron-scheduler / cron / k8s). No home-grown engine (ADR-006).
@@ -346,7 +401,7 @@ caller, the fact that the metadata store is now stale has already stopped being 
 - **Goals:** Redis backend; harden Postgres; backend conformance suite.
 - **Tasks:** `batchflow-redis`; shared trait test-suite run against every backend. **Acceptance:** all backends pass same suite. **Testing:** testcontainers. **Docs:** backend matrix.
 
-## Phase 16 — Examples ☐
+## Phase 16 — Examples ☐  ← **next**
 - **Goals:** runnable end-to-end examples (CSV→Postgres, restart demo, retry/skip demo).
 - **Acceptance:** `cargo run --example` works; examples compile in CI. **Docs:** examples README.
 
@@ -368,7 +423,9 @@ caller, the fact that the metadata store is now stale has already stopped being 
 Postgres integration tests need Docker running. They are part of the gate, not an optional extra — `cargo test --workspace` silently covers less without it.
 
 ## Current position (2026-08-03)
-Phase 0 ◐ docs (tech-eval open items) · 1 ☑ workspace · 2 ☑ traits · 3 ☑ Job + typestate `JobBuilder` · 4 ◐ step model (tasklet trait pending) · 5 ☑ engine · 6 ◐ chunk processing (property tests/tuning guide pending) · 7 ☑ JobRepository · 8 ☑ ExecutionContext · 9 ☑ restart · **10 ☑ retry & skip** (10d chunk-scanning `[OPEN]`) · 11 ☑ transactions · 12 ☑ metrics · **12.5 ☑ CI**.
+Phase 0 ◐ docs (tech-eval open items) · 1 ☑ workspace · 2 ☑ traits · 3 ☑ Job + typestate `JobBuilder` · 4 ◐ step model (tasklet trait pending) · 5 ☑ engine · 6 ◐ chunk processing (property tests/tuning guide pending) · 7 ☑ JobRepository · 8 ☑ ExecutionContext · 9 ☑ restart · **10 ☑ retry & skip** (10d chunk-scanning `[OPEN]`) · 11 ☑ transactions · 12 ☑ metrics · 12.5 ☑ CI · **13 ☑ tracing**.
+
+**125 tests green without a database** (116 core unit · 3 `batchflow-metrics` unit · 6 doctests), core having gained 7 tracing tests in 13b and 4 vocabulary tests in 13c. The 20 Postgres integration tests were **not run for this phase** — Docker was down on the authoring machine — so the workspace total of 141 is carried forward from 12.5, not re-verified. CI runs them on every push; that is the point of 12.5.
 
 **MSRV is now per-crate and verified:** 1.85 for `batchflow-core`/`batchflow`/`batchflow-metrics`, 1.94 for `batchflow-postgres` (sqlx 0.9). Both lanes checked locally against real toolchains before the workflow was committed, and both are jobs in CI.
 `batchflow-core` modules: `chunk`/`classifier`/`context`/`error`/`execution`/`fault`/`item`/`job`/`launcher`/`memory`/`repository`/`step` + `#[cfg(test)] testing`, with `lib.rs` as a pure re-export surface (private `mod` + flat `pub use`, so module layout stays refactorable). **134 tests green: 105 core unit · 3 `batchflow-metrics` unit · 6 doctests (core, facade, metrics) · 20 Postgres integration across `repository`/`classifier`/`fault_tolerance`.** clippy `--all-targets -D warnings` clean, `cargo fmt --check` clean, `cargo doc` clean, `#![warn(missing_docs)]` on everywhere and silent.

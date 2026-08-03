@@ -99,7 +99,10 @@ where
             Ok(Some(item)) => chunk.push(item),
             Ok(None) => break,
             Err(error) => match fault.disposition(error, *skipped) {
-                ItemDisposition::Skip => *skipped += 1,
+                ItemDisposition::Skip(error) => {
+                    *skipped += 1;
+                    tracing::warn!(phase = "read", skipped = *skipped, error = %error, "item skipped");
+                }
                 ItemDisposition::Fail(error) => return Err(error),
             },
         }
@@ -130,7 +133,10 @@ where
             Ok(Some(out)) => outputs.push(out),
             Ok(None) => filtered += 1,
             Err(error) => match fault.disposition(error, *skipped) {
-                ItemDisposition::Skip => *skipped += 1,
+                ItemDisposition::Skip(error) => {
+                    tracing::warn!(phase = "process", skipped = *skipped, error = %error, "item skipped");
+                    *skipped += 1
+                }
                 ItemDisposition::Fail(error) => return Err(error),
             },
         }
@@ -236,10 +242,15 @@ where
                 // write error, not the rollback error, because the write is why
                 // there was a rollback at all.
                 if let Err(rollback_error) = commit.rollback(tx).await {
+                    tracing::error!(
+                        error = %rollback_error,
+                        "rollback failed; the transaction is in an unknown state"
+                    );
                     return Err(error.with_cleanup(Err(rollback_error)));
                 }
 
                 if fault.should_retry(&error, attempt) {
+                    tracing::warn!(attempt, error = %error, "chunk failed, retrying");
                     metrics.retries.increment(1);
                     back_off(&mut backoff).await;
                     attempt += 1;
@@ -258,6 +269,7 @@ where
                     // transiently (Postgres raises 40001 at COMMIT), so this
                     // path retries too — with its own fresh transaction.
                     if fault.should_retry(&error, attempt) {
+                        tracing::warn!(attempt, error = %error, "chunk commit failed, retrying");
                         metrics.retries.increment(1);
                         back_off(&mut backoff).await;
                         attempt += 1;
@@ -302,11 +314,14 @@ mod tests {
     use crate::testing::{
         BookmarkReader, CollectingWriter, CommitEvent, EvenDoubler, FailingReader, FailingWriter,
         FlakyWriter, POSITION, PoisonProcessor, PoisonReader, RecordingCommit, RetryAll, SkipAll,
-        TransientWriter, VecReader, block_on, counter, labels_of, nz, nz32, recorded,
+        TransientWriter, VecReader, block_on, captured, counter, events_named, labels_of, nz, nz32,
+        recorded,
     };
+    use crate::tracing::{FIELD_ATTEMPT, FIELD_ERROR, FIELD_PHASE, FIELD_SKIPPED};
     use crate::{ContextValue, RetryPolicy, Unmanaged};
     use std::error::Error;
     use tokio::time::Instant;
+    use tracing::Level;
 
     #[tokio::test]
     async fn reads_a_full_chunk() {
@@ -1087,5 +1102,165 @@ mod tests {
             node = current.source();
         }
         assert_eq!(depth, 2, "chain: Box<BatchError::Write> -> its Cause");
+    }
+
+    // ---- tracing (Phase 13b) ----
+
+    /// A skipped row is a data-quality incident. The counter says *how many*;
+    /// only the event says *where*, which is what separates a corrupt segment
+    /// from a systematic parse bug.
+    #[tokio::test]
+    async fn a_skipped_read_emits_a_warning_naming_the_phase() {
+        let mut reader = PoisonReader::new(vec![2, 99, 4, 6], 99);
+        let mut processor = PoisonProcessor { poison: 0 };
+        let mut writer = Unmanaged(CollectingWriter::new());
+        let mut commit = RecordingCommit::new();
+        let mut context = ExecutionContext::new();
+        let fault = FaultTolerance::new().classifier(SkipAll).skip_limit(1);
+
+        let (result, events) = captured(run_step(
+            &mut reader,
+            &mut processor,
+            &mut writer,
+            &ChunkConfig::new(nz(3), &fault, "test-job", "test-step"),
+            &mut context,
+            &mut commit,
+        ))
+        .await;
+        result.unwrap();
+
+        let skips = events_named(&events, Level::WARN, "item skipped");
+        assert_eq!(skips.len(), 1, "{events:#?}");
+        assert_eq!(skips[0].field(FIELD_PHASE), Some("read"));
+        // The running ordinal, not a flag: consecutive ordinals across nearby
+        // reads are what "contiguous" looks like in a log.
+        assert_eq!(skips[0].field(FIELD_SKIPPED), Some("1"));
+        assert!(
+            skips[0]
+                .field("error")
+                .unwrap()
+                .contains("malformed row 99")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_skipped_process_item_emits_a_warning_naming_the_phase() {
+        let mut reader = VecReader::new(vec![2, 4]);
+        let mut processor = PoisonProcessor { poison: 4 };
+        let mut writer = Unmanaged(CollectingWriter::new());
+        let mut commit = RecordingCommit::new();
+        let mut context = ExecutionContext::new();
+        let fault = FaultTolerance::new().classifier(SkipAll).skip_limit(1);
+
+        let (result, events) = captured(run_step(
+            &mut reader,
+            &mut processor,
+            &mut writer,
+            &ChunkConfig::new(nz(2), &fault, "test-job", "test-step"),
+            &mut context,
+            &mut commit,
+        ))
+        .await;
+        result.unwrap();
+
+        let skips = events_named(&events, Level::WARN, "item skipped");
+        assert_eq!(skips.len(), 1, "{events:#?}");
+        assert_eq!(skips[0].field(FIELD_PHASE), Some("process"));
+        assert!(skips[0].field(FIELD_ERROR).unwrap().contains("bad item 4"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_retried_write_emits_an_event_carrying_its_attempt_number() {
+        let mut reader = VecReader::new(vec![2, 4]);
+        let mut processor = EvenDoubler;
+        let mut writer = Unmanaged(TransientWriter::new(1));
+        let mut commit = RecordingCommit::new();
+        let mut context = ExecutionContext::new();
+
+        let fault = FaultTolerance::new()
+            .classifier(RetryAll)
+            .retry(RetryPolicy::attempts(nz32(3)));
+
+        let (result, events) = captured(run_step(
+            &mut reader,
+            &mut processor,
+            &mut writer,
+            &ChunkConfig::new(nz(2), &fault, "test-job", "test-step"),
+            &mut context,
+            &mut commit,
+        ))
+        .await;
+        result.unwrap();
+
+        let retries = events_named(&events, Level::WARN, "chunk failed, retrying");
+        assert_eq!(retries.len(), 1, "{events:#?}");
+        assert_eq!(retries[0].field(FIELD_ATTEMPT), Some("1"));
+        assert!(retries[0].field(FIELD_ERROR).unwrap().contains("deadlock"));
+    }
+
+    /// The retry an operator actually sees in production: Postgres raises
+    /// `40001` *at* `COMMIT`, so this path — not the write path — is where a
+    /// serialization failure surfaces. It emitted nothing until 13b-3.
+    #[tokio::test(start_paused = true)]
+    async fn a_retried_commit_emits_its_own_event() {
+        let mut reader = VecReader::new(vec![2, 4]);
+        let mut processor = EvenDoubler;
+        let mut writer = Unmanaged(CollectingWriter::new());
+        let mut commit = RecordingCommit::failing_commits(1);
+        let mut context = ExecutionContext::new();
+
+        let fault = FaultTolerance::new()
+            .classifier(RetryAll)
+            .retry(RetryPolicy::attempts(nz32(3)));
+
+        let (result, events) = captured(run_step(
+            &mut reader,
+            &mut processor,
+            &mut writer,
+            &ChunkConfig::new(nz(2), &fault, "test-job", "test-step"),
+            &mut context,
+            &mut commit,
+        ))
+        .await;
+        result.unwrap();
+
+        let retries = events_named(&events, Level::WARN, "chunk commit failed, retrying");
+        assert_eq!(retries.len(), 1, "{events:#?}");
+        assert_eq!(retries[0].field(FIELD_ATTEMPT), Some("1"));
+
+        // Distinct message from the write-path retry: an operator grepping for
+        // one must not silently match the other.
+        assert!(events_named(&events, Level::WARN, "chunk failed, retrying").is_empty());
+    }
+
+    /// A rollback that fails leaves the transaction in an unknown state, and by
+    /// the time the error reaches a caller that fact has stopped being
+    /// actionable at the site that knew it. ADR-009 keeps both failures in the
+    /// returned error; this is the event at the moment it happens.
+    #[tokio::test]
+    async fn a_failed_rollback_emits_an_error_event() {
+        let mut reader = VecReader::new(vec![2, 4]);
+        let mut processor = EvenDoubler;
+        let mut writer = Unmanaged(FailingWriter);
+        let mut commit = RecordingCommit::failing_rollback();
+        let mut context = ExecutionContext::new();
+
+        let (result, events) = captured(run_step(
+            &mut reader,
+            &mut processor,
+            &mut writer,
+            &ChunkConfig::new(nz(2), &FaultTolerance::default(), "test-job", "test-step"),
+            &mut context,
+            &mut commit,
+        ))
+        .await;
+        result.unwrap_err();
+
+        let failures = events_named(
+            &events,
+            Level::ERROR,
+            "rollback failed; the transaction is in an unknown state",
+        );
+        assert_eq!(failures.len(), 1, "{events:#?}");
     }
 }

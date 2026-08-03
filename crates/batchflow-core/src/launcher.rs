@@ -1,6 +1,8 @@
 use crate::metrics::{JOBS_FINISHED, JOBS_STARTED, LABEL_JOB, LABEL_STATUS, status_label};
+use crate::tracing::SPAN_JOB;
 use crate::{BatchError, BatchStatus, Job, JobExecution, JobParameters, JobRepository};
 use ::metrics::counter;
+use ::tracing::Instrument;
 
 /// Owns the `JobExecution` lifecycle: resolves identity, enforces FR-4.4, and
 /// records what happened.
@@ -92,7 +94,17 @@ impl<R: JobRepository> JobLauncher<R> {
         // in flight, and a rejected launch must not inflate it forever.
         counter!(JOBS_STARTED, LABEL_JOB => job.name().to_owned()).increment(1);
 
-        let outcome = job.run(&execution, &self.repository).await;
+        // Span name from the constant; field names cannot be — `tracing` takes
+        // them as identifiers, so `FIELD_JOB = ..` would emit a field called
+        // "FIELD_JOB". The tests are what bind these literals to the module.
+        let span = ::tracing::info_span!(
+            SPAN_JOB,
+            job = %job.name(),
+            instance_id = instance.id().get(),
+            execution_id = execution.id().get(),
+        );
+
+        let outcome = job.run(&execution, &self.repository).instrument(span).await;
 
         let status = if outcome.is_ok() {
             BatchStatus::Completed
@@ -117,6 +129,12 @@ impl<R: JobRepository> JobLauncher<R> {
         // here would report the store's error and throw the job's away —
         // leaving the caller unable to say why the run failed at all.
         if let Err(error) = outcome {
+            if let Err(ref cleanup) = recorded {
+                tracing::error!(
+                    error = %cleanup,
+                    "failed to record the terminal job status; the metadata store is now stale"
+                );
+            }
             return Err(error.with_cleanup(recorded));
         }
 
@@ -130,11 +148,16 @@ mod tests {
     use super::*;
     use crate::metrics::{LABEL_STEP, STEP_DURATION, STEPS_FINISHED, STEPS_STARTED};
     use crate::testing::{
-        BookmarkReader, CollectingWriter, EvenDoubler, FailingStep, LogStep, Recorded, SharedSink,
-        StatusWriteFails, VecReader, block_on, counter, labels_of, nz, recorded,
+        BookmarkReader, CollectingWriter, EvenDoubler, FailingStep, LogStep, PoisonProcessor,
+        Recorded, SharedSink, SkipAll, StatusWriteFails, VecReader, block_on, captured, counter,
+        events_named, labels_of, nz, recorded,
     };
-    use crate::{ChunkStep, InMemoryJobRepository, JobExecutionId, JobParameter, Unmanaged};
+    use crate::tracing::SPAN_STEP;
+    use crate::{
+        ChunkStep, FaultTolerance, InMemoryJobRepository, JobExecutionId, JobParameter, Unmanaged,
+    };
     use metrics_util::debugging::DebugValue;
+    use tracing::Level;
 
     fn params(date: &str) -> JobParameters {
         JobParameters::new().with("date", JobParameter::String(date.into()))
@@ -831,5 +854,76 @@ mod tests {
         // `StatusWriteFails` only rejects a *failed* status, so a successful run
         // is unaffected - the control that keeps the test above honest.
         launcher.run(&mut job, &params("2026-07-31")).await.unwrap();
+    }
+
+    // ---- tracing (Phase 13b) ----
+
+    /// A chunk step that skips one row, so the chunk loop emits an event from
+    /// as deep in the stack as anything gets.
+    fn skipping_job() -> Job {
+        let step = ChunkStep::new(
+            "load",
+            VecReader::new(vec![2, 4]),
+            PoisonProcessor { poison: 4 },
+            Unmanaged(CollectingWriter::new()),
+            nz(2),
+        )
+        .with_fault_tolerance(FaultTolerance::new().classifier(SkipAll).skip_limit(1));
+
+        Job::new("nightly", vec![Box::new(step)])
+    }
+
+    /// The nesting *is* the feature: it is what lets an operator go from "the
+    /// skip rate spiked" to this run, this step. The chunk loop never names the
+    /// job or the execution — it inherits them by being inside the spans.
+    #[tokio::test]
+    async fn a_chunk_event_nests_inside_the_step_and_job_spans() {
+        let launcher = JobLauncher::new(InMemoryJobRepository::default());
+        let mut job = skipping_job();
+
+        let (result, events) = captured(launcher.run(&mut job, &params("2026-08-03"))).await;
+        result.unwrap();
+
+        let skips = events_named(&events, Level::WARN, "item skipped");
+        assert_eq!(skips.len(), 1, "{events:#?}");
+        assert_eq!(
+            skips[0].spans,
+            vec![SPAN_STEP.to_owned(), SPAN_JOB.to_owned()]
+        );
+    }
+
+    /// ADR-009 puts both failures in the returned error, so nothing is lost
+    /// without a subscriber. What the event adds is the moment: by the time the
+    /// error reaches a caller, "the metadata store is now stale" has stopped
+    /// being actionable at the site that knew it.
+    #[tokio::test]
+    async fn a_failed_terminal_status_write_emits_an_error_event_at_each_layer() {
+        let launcher = JobLauncher::new(StatusWriteFails::new());
+        let mut job = failing_job();
+
+        let (result, events) = captured(launcher.run(&mut job, &params("2026-08-03"))).await;
+        result.unwrap_err();
+
+        let step = events_named(
+            &events,
+            Level::ERROR,
+            "failed to record the terminal step status; the metadata store is now stale",
+        );
+        assert_eq!(step.len(), 1, "{events:#?}");
+
+        let job = events_named(
+            &events,
+            Level::ERROR,
+            "failed to record the terminal job status; the metadata store is now stale",
+        );
+        assert_eq!(job.len(), 1, "{events:#?}");
+
+        // Both are emitted *after* the step span closes - the span wraps
+        // `step.run`, not the status write that follows it.
+        assert_eq!(step[0].spans, vec![SPAN_JOB.to_owned()]);
+        assert!(
+            job[0].spans.is_empty(),
+            "the launcher's own event is outside"
+        );
     }
 }

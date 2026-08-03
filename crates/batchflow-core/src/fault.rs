@@ -86,7 +86,7 @@ impl Default for RetryPolicy {
 #[derive(Debug)]
 pub enum ItemDisposition {
     /// Drop this item, count it, carry on with the chunk.
-    Skip,
+    Skip(BatchError),
     /// Give up on the step, with this error.
     Fail(BatchError),
 }
@@ -177,7 +177,7 @@ impl FaultTolerance {
         }
 
         if skipped < self.skip_limit {
-            ItemDisposition::Skip
+            ItemDisposition::Skip(error)
         } else {
             ItemDisposition::Fail(BatchError::SkipLimitExceeded {
                 limit: self.skip_limit,
@@ -242,7 +242,7 @@ mod tests {
 
         assert!(matches!(
             fault.disposition(BatchError::process("bad"), 1),
-            ItemDisposition::Skip
+            ItemDisposition::Skip(_)
         ));
         assert!(matches!(
             fault.disposition(BatchError::process("bad"), 2),
