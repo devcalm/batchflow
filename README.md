@@ -16,6 +16,15 @@ This `0.0.0` release **reserves the crate name** while the framework is being
 designed and built in the open. **It is not yet usable.** The API is unstable
 and will change.
 
+## Examples
+
+Four runnable programs, from a ten-item in-memory job to a CSV loaded into
+Postgres through a real transaction — see [docs/Examples.md](docs/Examples.md).
+
+```sh
+cargo run -p batchflow --example hello_batch
+```
+
 ## Planned capabilities
 
 - Chunk-oriented processing (`read → process → write`) with configurable commit intervals

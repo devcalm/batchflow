@@ -149,6 +149,7 @@ name = "batchflow"
 version = "0.0.0"
 dependencies = [
  "batchflow-core",
+ "tokio",
 ]
 
 [[package]]
@@ -181,6 +182,7 @@ dependencies = [
 name = "batchflow-postgres"
 version = "0.0.0"
 dependencies = [
+ "batchflow",
  "batchflow-core",
  "serde",
  "serde_json",

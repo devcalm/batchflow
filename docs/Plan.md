@@ -401,11 +401,28 @@ at all three `with_cleanup` sites. Nothing from the original Phase 13 sketch is 
 - **Goals:** Redis backend; harden Postgres; backend conformance suite.
 - **Tasks:** `batchflow-redis`; shared trait test-suite run against every backend. **Acceptance:** all backends pass same suite. **Testing:** testcontainers. **Docs:** backend matrix.
 
-## Phase 16 — Examples ☐  ← **next**
+## Phase 16 — Examples ☑ (2026-08-04)
 - **Goals:** runnable end-to-end examples (CSV→Postgres, restart demo, retry/skip demo).
-- **Acceptance:** `cargo run --example` works; examples compile in CI. **Docs:** examples README.
+- **Delivered:** `hello_batch`, `restart_demo`, `retry_skip_demo` in `crates/batchflow/examples/`; `csv_to_postgres` (+ `people.csv`) in `crates/batchflow-postgres/examples/`; `crates/batchflow/tests/restart.rs`; `docs/Examples.md`. **149 tests green** across all four crates with Docker up — the first full verification since 12.5.
 
-## Phase 17 — Performance Optimization ☐
+**Examples belong in the facade, not in `batchflow-core`.** Same structural argument as the doctest in `crates/batchflow/src/lib.rs`: rustdoc and cargo both pass `--extern` for a crate's own dependencies, so a core example can compile code no user can. The rule that falls out for facade dev-dependencies: **legitimate iff a real user would also declare it.** `tokio` qualifies (nothing runs an async framework without a runtime); `async-trait` does not, and that it does not is the entire point of re-exporting it. `csv_to_postgres` lives in `batchflow-postgres/examples/` with `batchflow` added as a *dev*-dependency there, so it imports `batchflow::batchflow_core::*` + `batchflow_postgres::*` — exactly an application's pair — without dragging sqlx, testcontainers and MSRV 1.94 into the facade's `--all-targets` build. No cycle: `batchflow` depends on `batchflow-core`, not on `batchflow-postgres`.
+
+**CI covers examples, but only by compiling them.** Verified rather than assumed, by planting a `useless_format`: `cargo clippy --workspace --all-targets` fails on it, and the MSRV lane's `check` (no `--all-targets`, line 59 of `ci.yml`) does not. So no workflow change was needed — but "examples compile in CI" buys compilation, not execution, and the acceptance criterion as originally written read as coverage. **Where a property must be enforced rather than illustrated it belongs in `tests/`**, which is why `restart.rs` exists: the demo's `assert!` never runs in CI. Corollary found the same way: a facade-level integration test is *not* redundant with core's unit tests, because its dependency graph is one crate deep and it is therefore the only place a missing `pub use` goes red.
+
+**Assert the exact output, not merely the absence of duplicates.** A reader resuming at the *wrong* offset produces a duplicate-free but incomplete sink; only the full expected vector catches it. Mutation-verified throughout: disabling `ItemReader::open` fails exactly 2 of `restart.rs`'s 3 tests (the status test correctly survives — a broken bookmark does not change what status was recorded), and moving `self.next += 1` after the corrupt-row check in `retry_skip_demo` makes row 4 be skipped five times, exhaust the limit and fail the step with `read=0`. **The skip limit is the only thing between a non-advancing reader and an infinite loop, which is a bad thing to be relying on** — a skipping reader must make progress, and the engine cannot enforce it because `read` is opaque.
+
+**A retry/skip demo did not need Docker, contrary to the phase sketch.** `fault_tolerance.rs` already *proves* retry and skip against real SQLSTATEs; a demo's job is the wiring, which is backend-independent. Building `retry_skip_demo` in-memory around its own `FeedError` made it strictly more useful, since most users classify their own errors rather than Postgres's — and it demonstrates that **classifiers compose by delegation** (`LoaderClassifier` handles `MalformedRow` and defers everything else to `PostgresClassifier`, neither knowing about the other).
+
+**API findings from standing where a user stands** — the real yield of this phase:
+1. `InMemoryJobRepository` derives `Default` but has no `new()`, while `JobLauncher::new` sits beside it in the same expression.
+2. `JobRepository` exposes only `last_execution(instance_id)`; **there is no way to list all executions of an instance**, so a failed attempt's row becomes unreachable once the next attempt exists (`restart.rs` has to snapshot between runs) and "what did this instance do across all attempts?" is unanswerable. Needs a paging decision before it can be added — flagged for 15/18.
+3. In-memory ids come from one shared counter (instance 1, execution 2) while Postgres uses per-table sequences. Harmless — ids are opaque newtypes — but **Phase 15's conformance suite must not assert on id values.**
+4. The typestate `JobBuilder` **does** work with a non-`()` `Tx` when the target type is known (`fn build_job(..) -> Job<PgTx>` is enough). Every existing Postgres call site uses `Job::<PgTx>::new` instead, which now looks like habit rather than necessity — worth revisiting.
+5. `RetryPolicy` is `Copy`; clippy's `clone_on_copy` caught the `.clone()` calls.
+
+**Two decisions still unstated, deliberately left open:** whether examples and `tests/` should be MSRV-checked (they currently are not, and it is defensible — neither constrains a downstream user's MSRV), and whether CI should execute examples as well as compile them.
+
+## Phase 17 — Performance Optimization ☐  ← **next**
 - **Goals:** criterion benches; remove needless allocs/clones; validate P-1..P-5.
 - **Acceptance:** benchmarked numbers (no guessing before this). **Testing:** criterion. **Docs:** perf report.
 
@@ -423,9 +440,9 @@ at all three `with_cleanup` sites. Nothing from the original Phase 13 sketch is 
 Postgres integration tests need Docker running. They are part of the gate, not an optional extra — `cargo test --workspace` silently covers less without it.
 
 ## Current position (2026-08-03)
-Phase 0 ◐ docs (tech-eval open items) · 1 ☑ workspace · 2 ☑ traits · 3 ☑ Job + typestate `JobBuilder` · 4 ◐ step model (tasklet trait pending) · 5 ☑ engine · 6 ◐ chunk processing (property tests/tuning guide pending) · 7 ☑ JobRepository · 8 ☑ ExecutionContext · 9 ☑ restart · **10 ☑ retry & skip** (10d chunk-scanning `[OPEN]`) · 11 ☑ transactions · 12 ☑ metrics · 12.5 ☑ CI · **13 ☑ tracing**.
+Phase 0 ◐ docs (tech-eval open items) · 1 ☑ workspace · 2 ☑ traits · 3 ☑ Job + typestate `JobBuilder` · 4 ◐ step model (tasklet trait pending) · 5 ☑ engine · 6 ◐ chunk processing (property tests/tuning guide pending) · 7 ☑ JobRepository · 8 ☑ ExecutionContext · 9 ☑ restart · **10 ☑ retry & skip** (10d chunk-scanning `[OPEN]`) · 11 ☑ transactions · 12 ☑ metrics · 12.5 ☑ CI · 13 ☑ tracing · 14 ☐ scheduling · 15 ☐ storage backends · **16 ☑ examples**.
 
-**125 tests green without a database** (116 core unit · 3 `batchflow-metrics` unit · 6 doctests), core having gained 7 tracing tests in 13b and 4 vocabulary tests in 13c. The 20 Postgres integration tests were **not run for this phase** — Docker was down on the authoring machine — so the workspace total of 141 is carried forward from 12.5, not re-verified. CI runs them on every push; that is the point of 12.5.
+**149 tests green across the whole workspace, Docker up, re-verified 2026-08-04** — 116 `batchflow-core` unit · 3 `batchflow` integration (`tests/restart.rs`, new in 16) · 3 `batchflow-metrics` unit · 2 `batchflow-postgres` unit · 18 Postgres integration (6 classifier · 3 fault-tolerance · 9 repository) · 7 doctests across four crates. This is the first full run since 12.5; the previous carried-forward figure of 141 is superseded. `cargo fmt --check`, `cargo clippy --workspace --all-targets -D warnings` and `RUSTDOCFLAGS="-D warnings" cargo doc` all clean, and all four examples run.
 
 **MSRV is now per-crate and verified:** 1.85 for `batchflow-core`/`batchflow`/`batchflow-metrics`, 1.94 for `batchflow-postgres` (sqlx 0.9). Both lanes checked locally against real toolchains before the workflow was committed, and both are jobs in CI.
 `batchflow-core` modules: `chunk`/`classifier`/`context`/`error`/`execution`/`fault`/`item`/`job`/`launcher`/`memory`/`repository`/`step` + `#[cfg(test)] testing`, with `lib.rs` as a pure re-export surface (private `mod` + flat `pub use`, so module layout stays refactorable). **134 tests green: 105 core unit · 3 `batchflow-metrics` unit · 6 doctests (core, facade, metrics) · 20 Postgres integration across `repository`/`classifier`/`fault_tolerance`.** clippy `--all-targets -D warnings` clean, `cargo fmt --check` clean, `cargo doc` clean, `#![warn(missing_docs)]` on everywhere and silent.

@@ -13,3 +13,10 @@ categories = ["asynchronous", "concurrency"]
 
 [dependencies]
 batchflow-core.workspace = true
+
+# Examples only. A dev-dependency here is legitimate exactly when a real user
+# would also declare it: nobody runs an async framework without a runtime, so
+# `tokio` qualifies. `async-trait` would not — the whole point of re-exporting
+# it from `batchflow-core` is that users never name it in their own manifest.
+[dev-dependencies]
+tokio.workspace = true
