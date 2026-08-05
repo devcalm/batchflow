@@ -42,3 +42,10 @@ tracing-subscriber = { version = "0.3", default-features = false, features = [
 # dependency's default-features cannot be turned off downstream. Drops
 # `http-listener`/`push-gateway` and with them hyper, rustls and tokio-net.
 metrics-exporter-prometheus = { version = "0.18", default-features = false }
+# Benchmarks only. `default-features = false` drops plotters, rayon and
+# html_reports; `cargo_bench_support` is not optional — without it `cargo bench`
+# refuses to run the harness at all.
+criterion = { version = "0.7", default-features = false, features = [
+    "async_tokio",
+    "cargo_bench_support",
+] }
