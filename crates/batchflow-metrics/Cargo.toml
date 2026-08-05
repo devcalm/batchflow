@@ -6,6 +6,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
+repository.workspace = true
 documentation = "https://docs.rs/batchflow-metrics"
 keywords = ["batch", "metrics", "prometheus", "observability"]
 categories = ["asynchronous", "development-tools::profiling"]

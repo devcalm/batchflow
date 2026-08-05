@@ -1,11 +1,12 @@
 [package]
 name = "batchflow"
-description = "A production-grade batch processing framework for Rust, inspired by Spring Batch. Under active development — name reservation release."
+description = "A batch processing framework for Rust, inspired by Spring Batch: chunk-oriented processing, transactional commit intervals, restart from a durable bookmark, retry and skip."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
+repository.workspace = true
 readme = "README.md"
 documentation = "https://docs.rs/batchflow"
 keywords = ["batch", "etl", "pipeline", "orchestration", "job"]

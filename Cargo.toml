@@ -5,16 +5,19 @@ members = ["crates/*"]
 # Metadata shared by every member crate. Individual crates opt in with
 # `field.workspace = true`, so we bump versions / edition / license in one place.
 [workspace.package]
-version = "0.0.0"
+version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT OR Apache-2.0"
 authors = ["Oleksii Tsvietaiev <o.tsvietaiev92@gmail.com>"]
+# Without this, crates.io shows no source link and docs.rs cannot offer "go to
+# source" on any item.
+repository = "https://github.com/devcalm/batchflow"
 
 # Dependencies shared across the workspace. Members reference them with
 # `dep.workspace = true`, keeping versions aligned in one place.
 [workspace.dependencies]
-batchflow-core = { path = "crates/batchflow-core", version = "0.0.0" }
+batchflow-core = { path = "crates/batchflow-core", version = "0.1.0" }
 async-trait = "0.1"
 # Backoff *schedules* only. The retry loop is hand-written: its body needs
 # `&mut` access to the writer and committer and must own a fresh `Tx` per

@@ -10,6 +10,7 @@ edition.workspace = true
 rust-version = "1.94"
 license.workspace = true
 authors.workspace = true
+repository.workspace = true
 documentation = "https://docs.rs/batchflow-postgres"
 keywords = ["batch", "etl", "postgres", "sqlx", "orchestration"]
 categories = ["asynchronous", "database"]
@@ -32,4 +33,4 @@ testcontainers-modules = { workspace = true, features = ["postgres"] }
 # Examples only, and only so they import through the facade the way a user
 # does: `batchflow` + `batchflow-postgres` is exactly the pair an application
 # declares. No cycle - `batchflow` depends on `batchflow-core`, not on this.
-batchflow = { path = "../batchflow", version = "0.0.0" }
+batchflow = { path = "../batchflow", version = "0.1.0" }
