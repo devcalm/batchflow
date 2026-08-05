@@ -11,6 +11,16 @@ documentation = "https://docs.rs/batchflow-core"
 keywords = ["batch", "etl", "pipeline", "orchestration", "job"]
 categories = ["asynchronous", "concurrency"]
 
+# `conformance` is off by default, so without this docs.rs would not document
+# the suite - and a backend author is exactly who needs to read it.
+[package.metadata.docs.rs]
+all-features = true
+
+[features]
+# The shared `JobRepository` test suite. A dev-dependency for backend authors;
+# off by default so it never reaches a release build.
+conformance = []
+
 [dependencies]
 async-trait.workspace = true
 backon.workspace = true

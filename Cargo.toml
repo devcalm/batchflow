@@ -45,6 +45,10 @@ tracing-subscriber = { version = "0.3", default-features = false, features = [
 # dependency's default-features cannot be turned off downstream. Drops
 # `http-listener`/`push-gateway` and with them hyper, rustls and tokio-net.
 metrics-exporter-prometheus = { version = "0.18", default-features = false }
+# `batchflow-redis` only. Default features carry `script` (Lua), which is what
+# makes check-then-act operations atomic in a store with no transactions.
+redis = { version = "1.5", features = ["tokio-comp", "connection-manager"] }
+
 # Benchmarks only. `default-features = false` drops plotters, rayon and
 # html_reports; `cargo_bench_support` is not optional — without it `cargo bench`
 # refuses to run the harness at all.

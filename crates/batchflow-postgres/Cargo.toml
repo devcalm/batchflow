@@ -28,6 +28,10 @@ sqlx = { workspace = true, features = [
 ] }
 
 [dev-dependencies]
+# The same crate as the normal dependency above, with the shared JobRepository
+# test suite switched on. Cargo unifies the two, so the feature is present only
+# while building tests.
+batchflow-core = { workspace = true, features = ["conformance"] }
 tokio.workspace = true
 testcontainers-modules = { workspace = true, features = ["postgres"] }
 # Examples only, and only so they import through the facade the way a user

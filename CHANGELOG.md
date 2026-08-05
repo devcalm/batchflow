@@ -5,8 +5,9 @@ All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-All four crates — `batchflow`, `batchflow-core`, `batchflow-postgres` and
-`batchflow-metrics` — share one version number and are released together.
+All five crates — `batchflow`, `batchflow-core`, `batchflow-postgres`,
+`batchflow-redis` and `batchflow-metrics` — share one version number and are
+released together.
 
 ## [Unreleased]
 
@@ -61,6 +62,15 @@ rather than a diff.
   `batchflow-metrics` provides a Prometheus exporter.
 
 **Backends**
+- A shared conformance suite behind `batchflow-core`'s `conformance` feature:
+  `job_repository_conformance!(setup())` generates one test per property of the
+  `JobRepository` contract. Both shipped backends run the identical list, and a
+  third-party backend gets the contract as executable tests rather than prose.
+- `batchflow-redis`: a `RedisJobRepository` whose `Tx` is a `MULTI`/`EXEC`
+  pipeline, so a rolled-back chunk was never sent. Check-then-act operations
+  are Lua scripts. **Requires Redis with `appendonly yes` and
+  `appendfsync always`** — see its docs; weaker persistence makes restart
+  semantics probabilistic.
 - `batchflow-postgres`: a `PostgresJobRepository` with embedded migrations, and
   `PostgresClassifier`, which maps SQLSTATE to a retry/skip/fail decision
   without core ever learning what a SQLSTATE is.
@@ -68,8 +78,9 @@ rather than a diff.
 ### Notes
 
 - MSRV is per crate: **1.85** for `batchflow`, `batchflow-core` and
-  `batchflow-metrics`; **1.94** for `batchflow-postgres`, which sqlx 0.9
-  requires. A user on 1.85 can still take the facade with the in-memory store.
+  `batchflow-metrics`; **1.88** for `batchflow-redis` (redis 1.5); **1.94** for
+  `batchflow-postgres` (sqlx 0.9). A user on 1.85 can still take the facade
+  with the in-memory store.
 - `BatchError` and the public enums that will grow are `#[non_exhaustive]`.
 - Measured framework overhead is ~3.9 ns per item plus ~102 ns per chunk, and
   allocation is a function of the chunk count rather than the item count. See
@@ -84,7 +95,7 @@ rather than a diff.
   unique constraint in Postgres, but reading the last execution and creating
   the next one are two statements outside a transaction, so two processes
   racing an instance that has no prior execution can both launch.
-- **No scheduling adapters and no Redis backend** (planned; both are additive).
+- **No scheduling adapters** (planned; additive).
 - Parallel and partitioned steps are not implemented. A reader is `&mut self`,
   so parallelism comes from partitioning, which is future work.
 

@@ -11,6 +11,8 @@ Concepts first, then recipes. If you want running code instead, start with
 - [Retry and skip](#retry-and-skip)
 - [PostgreSQL](#postgresql)
 - [Observability](#observability)
+- [Choosing a backend](#choosing-a-backend)
+- [Writing your own backend](#writing-your-own-backend)
 - [Mistakes worth avoiding](#mistakes-worth-avoiding)
 
 ## The model
@@ -392,6 +394,61 @@ batchflow_metrics::builder().install()?;
 store, because both are published only after the chunk commits. Retries are the
 deliberate exception — counted as they happen, so a chunk that retried five
 times and then failed still reports them.
+
+## Choosing a backend
+
+| | `Tx` | Rollback | Use when |
+|---|---|---|---|
+| `InMemoryJobRepository` | `()` | none — at-least-once | tests, experiments |
+| `PostgresJobRepository` | `sqlx::Transaction` | real | the default choice |
+| `RedisJobRepository` | `MULTI`/`EXEC` pipeline | discard-before-send | metadata already lives in Redis |
+
+Redis buffers commands client-side and sends them only at commit, so a
+rolled-back chunk was never sent — but it has no read-your-writes inside a
+transaction and no conflict detection, and **it is only correct with
+`appendonly yes` and `appendfsync always`**. The metadata store is the
+exactly-once guarantee; a store that can lose the last seconds of writes makes
+restart probabilistic. If in doubt, use PostgreSQL.
+
+## Writing your own backend
+
+`JobRepository` is the main extension point. Its contract is published as an
+executable test suite rather than as prose, so you can check your
+implementation against the same list the shipped backends pass:
+
+```toml
+[dev-dependencies]
+batchflow-core = { version = "0.1", features = ["conformance"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+```
+
+```rust
+// tests/conformance.rs
+async fn setup() -> ((), MyRepository) {
+    ((), MyRepository::new(/* ... */))
+}
+
+batchflow_core::job_repository_conformance!(setup());
+```
+
+That generates one `#[tokio::test]` per property — instance identity, execution
+ordering, the abandon rules, step-execution scoping, bookmark round-tripping.
+The setup expression is evaluated once per test and returns `(guard,
+repository)`, where the guard is whatever must stay alive for the repository to
+work (a container handle, a temp directory) or `()`.
+
+Two things the suite deliberately does **not** assert, both worth understanding
+before you implement:
+
+**Rollback is not part of the contract.** A store with no transactions sets
+`Tx = ()` and degrades to at-least-once — that is what `InMemoryJobRepository`
+does, and it is honest rather than hidden. If your backend has real
+transactions, test rollback yourself; it is a promise you are making, not one
+the trait makes.
+
+**Ids are opaque.** The suite only ever compares them for equality, because the
+in-memory store draws from one counter while PostgreSQL uses a sequence per
+table. Do not assume ids are dense, ordered across tables, or meaningful.
 
 ## Mistakes worth avoiding
 

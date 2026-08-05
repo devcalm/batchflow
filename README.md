@@ -42,15 +42,14 @@ cargo run -p batchflow --example hello_batch
   interval **is** the transaction boundary: a chunk's rows, its counters and
   its reader bookmark become durable together or not at all
 - Trait-based `ItemReader` / `ItemProcessor` / `ItemWriter`
-- Durable job metadata behind a `JobRepository` trait (in-memory, PostgreSQL)
+- Durable job metadata behind a `JobRepository` trait (in-memory, PostgreSQL, Redis)
 - Restart: skip completed steps, reopen the reader at the last committed chunk
 - Retry and skip driven by a `Classifier` over your own error type
 - Metrics (`metrics`/Prometheus) and tracing (`tracing`/OpenTelemetry)
 - Integration with external schedulers (cron, Kubernetes CronJobs) rather than
   a bespoke scheduler
 
-Not yet: parallel or partitioned steps, chunk scanning, a Redis backend,
-scheduling adapters.
+Not yet: parallel or partitioned steps, chunk scanning, scheduling adapters.
 
 ## Crates
 
@@ -59,6 +58,7 @@ scheduling adapters.
 | [`batchflow`](crates/batchflow) | The facade — depend on this | 1.85 |
 | [`batchflow-core`](crates/batchflow-core) | Traits and execution engine | 1.85 |
 | [`batchflow-postgres`](crates/batchflow-postgres) | PostgreSQL metadata store | 1.94 |
+| [`batchflow-redis`](crates/batchflow-redis) | Redis metadata store (needs `appendfsync always`) | 1.88 |
 | [`batchflow-metrics`](crates/batchflow-metrics) | Prometheus exporter | 1.85 |
 
 ## Documentation

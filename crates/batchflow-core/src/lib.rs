@@ -20,6 +20,12 @@ mod repository;
 #[cfg(test)]
 mod testing;
 
+// Available to core's own tests without the feature, and to backend crates
+// with it. `mod testing` is `#[cfg(test)]` and therefore invisible outside this
+// crate - which is exactly the trap this module must not fall into.
+#[cfg(any(test, feature = "conformance"))]
+pub mod conformance;
+
 pub mod metrics;
 pub mod tracing;
 

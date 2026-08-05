@@ -71,6 +71,8 @@ jobs:
         include:
           - rust: "1.85"
             packages: -p batchflow-core -p batchflow -p batchflow-metrics
+          - rust: "1.88"
+            packages: -p batchflow-redis
           - rust: "1.94"
             packages: -p batchflow-postgres
     steps:
