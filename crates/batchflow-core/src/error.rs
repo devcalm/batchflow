@@ -138,21 +138,25 @@ pub enum BatchError {
 /// recover.
 impl BatchError {
     /// Wraps a reader failure.
+    #[must_use]
     pub fn read(cause: impl Into<Cause>) -> Self {
         Self::Read(cause.into())
     }
 
     /// Wraps a writer failure.
+    #[must_use]
     pub fn write(cause: impl Into<Cause>) -> Self {
         Self::Write(cause.into())
     }
 
     /// Wraps a processor failure.
+    #[must_use]
     pub fn process(cause: impl Into<Cause>) -> Self {
         Self::Process(cause.into())
     }
 
     /// Wraps a metadata-store failure.
+    #[must_use]
     pub fn repository(cause: impl Into<Cause>) -> Self {
         Self::Repository(cause.into())
     }
@@ -176,6 +180,7 @@ impl BatchError {
     ///
     /// An `Ok` cleanup returns `self` untouched, so call sites read the same
     /// either way.
+    #[must_use]
     pub fn with_cleanup(self, cleanup: Result<(), BatchError>) -> Self {
         match cleanup {
             Ok(()) => self,

@@ -133,6 +133,7 @@ impl<Tx> Job<Tx> {
     ///
     /// let job = Job::builder("nightly").build();
     /// ```
+    #[must_use]
     pub fn builder(name: impl Into<String>) -> JobBuilder<NoSteps, Tx> {
         JobBuilder {
             name: name.into(),
@@ -146,6 +147,7 @@ impl<Tx> Job<Tx> {
     /// The dynamic escape hatch from [`builder`](Job::builder): the typestate
     /// builder changes type on the first `.step()`, so it cannot be driven from
     /// a loop. This can.
+    #[must_use]
     pub fn new(name: impl Into<String>, steps: Vec<Box<dyn Step<Tx>>>) -> Self {
         Self {
             name: name.into(),
@@ -311,6 +313,7 @@ pub struct JobBuilder<State = NoSteps, Tx = ()> {
 impl<State, Tx> JobBuilder<State, Tx> {
     /// Appends a step, boxing it so callers never write `Box::new`. The first
     /// call is what makes the builder buildable.
+    #[must_use]
     pub fn step<S: Step<Tx> + 'static>(mut self, step: S) -> JobBuilder<HasSteps, Tx> {
         self.steps.push(Box::new(step));
 
@@ -327,6 +330,7 @@ impl<Tx> JobBuilder<HasSteps, Tx> {
     ///
     /// Returns `Job`, not `Result<Job, _>`: the only failure it could report is
     /// "no steps", and that is a compile error instead.
+    #[must_use]
     pub fn build(self) -> Job<Tx> {
         Job {
             name: self.name,

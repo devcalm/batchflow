@@ -18,10 +18,11 @@ use metrics_util::debugging::{DebugValue, DebuggingRecorder};
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::num::{NonZeroU32, NonZeroUsize};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Once};
 use tracing::field::{Field, Visit};
 use tracing::instrument::WithSubscriber;
-use tracing::{Event, Level, Subscriber};
+use tracing::subscriber::Interest;
+use tracing::{Event, Level, Metadata, Subscriber, span};
 use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
 use tracing_subscriber::registry::LookupSpan;
 
@@ -432,6 +433,13 @@ impl JobRepository for CommitFails {
         self.0.last_execution(instance_id).await
     }
 
+    async fn executions(
+        &self,
+        instance_id: JobInstanceId,
+    ) -> Result<Vec<JobExecution>, BatchError> {
+        self.0.executions(instance_id).await
+    }
+
     async fn abandon_execution(&self, execution_id: JobExecutionId) -> Result<(), BatchError> {
         self.0.abandon_execution(execution_id).await
     }
@@ -683,6 +691,13 @@ impl JobRepository for StatusWriteFails {
         self.0.last_execution(instance_id).await
     }
 
+    async fn executions(
+        &self,
+        instance_id: JobInstanceId,
+    ) -> Result<Vec<JobExecution>, BatchError> {
+        self.0.executions(instance_id).await
+    }
+
     async fn abandon_execution(&self, execution_id: JobExecutionId) -> Result<(), BatchError> {
         self.0.abandon_execution(execution_id).await
     }
@@ -848,6 +863,42 @@ impl Visit for FieldCollector {
     }
 }
 
+/// A process-wide default that enables nothing but claims interest in
+/// everything.
+///
+/// `tracing` caches a callsite's `Interest` **globally**, the first time that
+/// callsite is reached. The tests here that install no subscriber reach the
+/// framework's `warn!` and `info_span!` callsites too, and with no default in
+/// place those get cached as `Interest::never()` — after which every later
+/// [`captured`] test sees nothing from that callsite, whatever subscriber it
+/// installs. It presents as a missing event, not as a broken harness.
+///
+/// `sometimes` forces `tracing` to ask the *current* dispatcher per event
+/// rather than trust the cache, which is what makes a per-task subscriber work.
+/// Applications never hit this: they install one subscriber at startup, before
+/// any callsite is reached.
+struct AlwaysAsk;
+
+impl Subscriber for AlwaysAsk {
+    fn register_callsite(&self, _: &Metadata<'_>) -> Interest {
+        Interest::sometimes()
+    }
+
+    fn enabled(&self, _: &Metadata<'_>) -> bool {
+        false
+    }
+
+    fn new_span(&self, _: &span::Attributes<'_>) -> span::Id {
+        span::Id::from_u64(1)
+    }
+
+    fn record(&self, _: &span::Id, _: &span::Record<'_>) {}
+    fn record_follows_from(&self, _: &span::Id, _: &span::Id) {}
+    fn event(&self, _: &Event<'_>) {}
+    fn enter(&self, _: &span::Id) {}
+    fn exit(&self, _: &span::Id) {}
+}
+
 /// Collects every event into a shared buffer. The tracing counterpart of
 /// [`DebuggingRecorder`].
 #[derive(Clone, Default)]
@@ -891,6 +942,13 @@ pub(crate) async fn captured<F>(future: F) -> (F::Output, Vec<Captured>)
 where
     F: Future,
 {
+    // Setting a global default also rebuilds the interest cache, so this undoes
+    // any callsite a subscriber-less test poisoned before the first capture.
+    static ASK_EVERY_TIME: Once = Once::new();
+    ASK_EVERY_TIME.call_once(|| {
+        let _ = ::tracing::subscriber::set_global_default(AlwaysAsk);
+    });
+
     let layer = CaptureLayer::default();
     let events = Arc::clone(&layer.0);
     let subscriber = tracing_subscriber::registry().with(layer);

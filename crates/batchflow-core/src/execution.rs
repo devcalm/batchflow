@@ -49,12 +49,14 @@ pub struct JobParameters(BTreeMap<String, JobParameter>);
 
 impl JobParameters {
     /// An empty set.
+    #[must_use]
     pub fn new() -> Self {
         Self(BTreeMap::new())
     }
 
     /// Adds or replaces one parameter. Changing any value selects a *different*
     /// [`JobInstance`].
+    #[must_use]
     pub fn with(mut self, key: impl Into<String>, value: JobParameter) -> Self {
         self.0.insert(key.into(), value);
         self
@@ -82,6 +84,7 @@ pub struct StepExecutionId(i64);
 
 impl JobInstanceId {
     /// Wraps a raw id. Minted by the repository, not by application code.
+    #[must_use]
     pub fn new(id: i64) -> Self {
         Self(id)
     }
@@ -94,6 +97,7 @@ impl JobInstanceId {
 
 impl JobExecutionId {
     /// Wraps a raw id. Minted by the repository, not by application code.
+    #[must_use]
     pub fn new(id: i64) -> Self {
         Self(id)
     }
@@ -106,6 +110,7 @@ impl JobExecutionId {
 
 impl StepExecutionId {
     /// Wraps a raw id. Minted by the repository, not by application code.
+    #[must_use]
     pub fn new(id: i64) -> Self {
         Self(id)
     }
@@ -131,6 +136,7 @@ pub struct JobInstance {
 
 impl JobInstance {
     /// The `id` is assigned by the `JobRepository`, never by the caller.
+    #[must_use]
     pub fn new(id: JobInstanceId, job_name: impl Into<String>, parameters: JobParameters) -> Self {
         Self {
             id,
@@ -167,6 +173,7 @@ pub struct JobExecution {
 impl JobExecution {
     /// Opens an attempt in [`BatchStatus::Starting`]. The `id` is assigned by
     /// the [`JobRepository`](crate::JobRepository).
+    #[must_use]
     pub fn new(id: JobExecutionId, instance_id: JobInstanceId) -> Self {
         Self {
             id,
@@ -231,6 +238,7 @@ pub struct StepExecution {
 impl StepExecution {
     /// The `id` is assigned by the `JobRepository`, never by the caller — which
     /// is precisely why a `Step` cannot produce one of these itself.
+    #[must_use]
     pub fn new(
         id: StepExecutionId,
         job_execution_id: JobExecutionId,

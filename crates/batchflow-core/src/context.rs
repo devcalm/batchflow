@@ -63,6 +63,7 @@ pub struct ExecutionContext(BTreeMap<String, ContextValue>);
 
 impl ExecutionContext {
     /// An empty context - what a step starts with on a fresh run.
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }

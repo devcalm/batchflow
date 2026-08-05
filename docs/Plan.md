@@ -434,7 +434,22 @@ at all three `with_cleanup` sites. Nothing from the original Phase 13 sketch is 
 
 **Known gap, stated in the report rather than hidden:** the benchmark installs neither a metrics recorder nor a tracing subscriber, so the Phase 12/13 observability that sits *inside* the measured loop is configured away. These are a lower bound. Measuring the loop under a live recorder and subscriber is the obvious next benchmark and is not written.
 
-## Phase 18 — Documentation ☐  ← **next**
+## Phase 18 — Documentation ◐  ← **in progress**
+- **Goals:** complete rustdoc, book-style guide, API-guidelines pass, SemVer/CHANGELOG.
+- **18a ◐ the API-guidelines pass** — the breaking-change window, which closes at 0.1.0.
+  - ☑ `JobRepository::executions(instance_id) -> Vec<JobExecution>`, oldest first, closing the gap Phase 16 found. **Unpaged, deliberately:** an instance's executions are its retry attempts, which the domain bounds at a handful, and `step_executions` already returns an unbounded `Vec`; the query that would need paging is "all *instances* of a job", which this is not. Adding a method to a public trait is breaking for implementors and there is no honest default body for a storage query, so this had to land now. Cost demonstrated on ourselves: two test fakes stopped compiling.
+  - ☑ `#[must_use]` on **constructors and consuming builders only** (24 items). Deliberately *not* on the 25 `&self` getters clippy's `must_use_candidate` also flags: dropping a getter result is obviously pointless and never a subtle bug, and marking them dilutes the signal on the ones where dropping silently discards configuration. **The lint is a starting point, not the authority — it missed `ChunkStep::with_fault_tolerance`, `JobBuilder::step` and `FaultTolerance::classifier`, the three where `x.with_fault_tolerance(f);` as a statement compiles and throws the config away.**
+  - ☑ `InMemoryJobRepository::new()` (C-CTOR — it had `Default` but no `new`, while `JobLauncher::new` sits beside it in the same expression).
+  - ☐ `ChunkStep::new`'s five arguments / `StepBuilder`; `[package.metadata.docs.rs]`; CHANGELOG; the 0.1.0 version decision.
+- **18b ☐** book-style guide.
+
+**A 2.3% flake in the tracing tests, found and fixed 2026-08-05.** CI failed `a_chunk_event_nests_inside_the_step_and_job_spans` with `["step"]` where `["step", "job"]` was expected. It passed 25× solo, 72× across every `--test-threads` value, and 5× on Linux — so it was not an environment difference. Running the whole binary 300 times reproduced it **7 times, across three different tests**, and the real signature was worse than the reported one: `captured()` sometimes returned an **empty** event vector, and sometimes a partial one.
+
+**Cause: `tracing` caches a callsite's `Interest` globally, the first time that callsite is reached.** The ~113 tests here that install no subscriber reach the framework's `warn!`/`info_span!` callsites too, and with no default dispatcher in place those get cached as `Interest::never()` — after which every later `captured()` test sees nothing from *that callsite*, whatever subscriber it installs. Per-callsite poisoning is why the failure looked like one missing span rather than a dead harness. Fixed with `AlwaysAsk`, a process-wide default subscriber that enables nothing but returns `Interest::sometimes()`, forcing `tracing` to consult the current dispatcher per event; installing it also rebuilds the interest cache, undoing any callsite already poisoned. **Verified by measurement, not inspection: 7/300 before, 0/400 after** (p ≈ 8e-5 under the observed rate).
+
+**This is not a user-facing bug** — an application installs one subscriber at startup, before any callsite is reached. It is specific to a parallel test binary using per-task subscribers, and it is the third instance of the standing lesson that a test which captures nothing passes every assertion about absence. Note what did *not* find it: `--test-threads=1`, a Linux container, and 97 targeted runs all stayed green. **Only running the full binary many times reproduced it, because the interference is between tests, not within one.**
+
+## Phase 18 — remaining ☐
 - **Goals:** complete rustdoc, book-style guide, API-guidelines pass, SemVer/CHANGELOG.
 - **Acceptance:** docs.rs clean; guide covers concepts+recipes. **Docs:** everything.
 

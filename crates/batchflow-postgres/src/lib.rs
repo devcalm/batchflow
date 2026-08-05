@@ -36,6 +36,7 @@ pub struct PostgresJobRepository {
 
 impl PostgresJobRepository {
     /// Wraps an existing pool. Call [`migrate`](Self::migrate) before first use.
+    #[must_use]
     pub fn new(pool: PgPool) -> Self {
         Self { pool }
     }
@@ -309,6 +310,26 @@ impl JobRepository for PostgresJobRepository {
 
         row.map(|row| execution(row.id, row.instance_id, &row.status, row.execution_context))
             .transpose()
+    }
+
+    async fn executions(
+        &self,
+        instance_id: JobInstanceId,
+    ) -> Result<Vec<JobExecution>, BatchError> {
+        let rows = sqlx::query!(
+            "SELECT id, instance_id, status, execution_context
+               FROM job_execution
+              WHERE instance_id = $1
+              ORDER BY id",
+            instance_id.get(),
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db)?;
+
+        rows.into_iter()
+            .map(|row| execution(row.id, row.instance_id, &row.status, row.execution_context))
+            .collect()
     }
 
     async fn abandon_execution(&self, execution_id: JobExecutionId) -> Result<(), BatchError> {

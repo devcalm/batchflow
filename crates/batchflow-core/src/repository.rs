@@ -72,6 +72,21 @@ pub trait JobRepository: Send + Sync {
         instance_id: JobInstanceId,
     ) -> impl Future<Output = Result<Option<JobExecution>, BatchError>> + Send;
 
+    /// Every attempt at `instance_id`, oldest first — so the last element is
+    /// what [`last_execution`](Self::last_execution) returns.
+    ///
+    /// Answers "what did this instance do across all of its attempts?", which
+    /// `last_execution` alone cannot: once a second attempt exists, the first
+    /// one's record is otherwise unreachable.
+    ///
+    /// Unpaged deliberately. An instance's executions are its retry attempts,
+    /// which the domain bounds at a handful; it is listing a *job's instances*
+    /// that would need paging, and that is a different query.
+    fn executions(
+        &self,
+        instance_id: JobInstanceId,
+    ) -> impl Future<Output = Result<Vec<JobExecution>, BatchError>> + Send;
+
     /// Mark `execution_id` as [`BatchStatus::Abandoned`](crate::BatchStatus),
     /// releasing its `JobInstance` so it can be launched again.
     ///

@@ -27,6 +27,14 @@ struct Inner {
     step_executions: Vec<StepExecution>,
 }
 
+impl InMemoryJobRepository {
+    /// An empty store.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
 impl JobRepository for InMemoryJobRepository {
     /// No transactions: this store cannot roll back, so a writer enlisted here
     /// gets at-least-once. Per ADR-007 the abstraction is validated against
@@ -155,6 +163,23 @@ impl JobRepository for InMemoryJobRepository {
             .rev()
             .find(|e| e.instance_id() == instance_id)
             .cloned())
+    }
+
+    async fn executions(
+        &self,
+        instance_id: JobInstanceId,
+    ) -> Result<Vec<JobExecution>, BatchError> {
+        let inner = self
+            .inner
+            .lock()
+            .map_err(|e| BatchError::repository(e.to_string()))?;
+
+        Ok(inner
+            .executions
+            .iter()
+            .filter(|e| e.instance_id() == instance_id)
+            .cloned()
+            .collect())
     }
 
     async fn abandon_execution(&self, execution_id: JobExecutionId) -> Result<(), BatchError> {
@@ -464,6 +489,90 @@ mod tests {
 
         assert_eq!(found.id(), nightly_exec.id());
         assert_ne!(found.id(), hourly_exec.id());
+    }
+
+    /// Oldest first, and the last element agrees with `last_execution` — the
+    /// two orderings are separate queries in a SQL backend, so a `DESC` in one
+    /// of them would otherwise go unnoticed.
+    #[tokio::test]
+    async fn executions_lists_every_attempt_oldest_first() {
+        let repo = InMemoryJobRepository::new();
+        let instance = repo
+            .find_or_create_instance("nightly", &params(&[("date", "d")]))
+            .await
+            .unwrap();
+
+        let first = repo.create_execution(instance.id()).await.unwrap();
+        let second = repo.create_execution(instance.id()).await.unwrap();
+        let third = repo.create_execution(instance.id()).await.unwrap();
+
+        let all = repo.executions(instance.id()).await.unwrap();
+
+        assert_eq!(
+            all.iter().map(JobExecution::id).collect::<Vec<_>>(),
+            vec![first.id(), second.id(), third.id()]
+        );
+        assert_eq!(
+            all.last().unwrap().id(),
+            repo.last_execution(instance.id())
+                .await
+                .unwrap()
+                .unwrap()
+                .id()
+        );
+    }
+
+    /// The gap this method closes: attempt 1 stays reachable after attempt 2
+    /// exists, which `last_execution` alone cannot offer.
+    #[tokio::test]
+    async fn executions_still_reaches_a_superseded_attempt() {
+        let repo = InMemoryJobRepository::new();
+        let instance = repo
+            .find_or_create_instance("nightly", &params(&[("date", "d")]))
+            .await
+            .unwrap();
+
+        let mut failed = repo.create_execution(instance.id()).await.unwrap();
+        failed.set_status(BatchStatus::Failed);
+        repo.update_execution(&failed).await.unwrap();
+        repo.create_execution(instance.id()).await.unwrap();
+
+        let all = repo.executions(instance.id()).await.unwrap();
+
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0].status(), BatchStatus::Failed);
+    }
+
+    #[tokio::test]
+    async fn executions_are_scoped_to_their_instance() {
+        let repo = InMemoryJobRepository::new();
+        let nightly = repo
+            .find_or_create_instance("nightly", &params(&[("date", "d")]))
+            .await
+            .unwrap();
+        let hourly = repo
+            .find_or_create_instance("hourly", &params(&[("date", "d")]))
+            .await
+            .unwrap();
+
+        let nightly_exec = repo.create_execution(nightly.id()).await.unwrap();
+        repo.create_execution(hourly.id()).await.unwrap();
+
+        let all = repo.executions(nightly.id()).await.unwrap();
+
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].id(), nightly_exec.id());
+    }
+
+    #[tokio::test]
+    async fn executions_is_empty_for_an_instance_with_no_attempts() {
+        let repo = InMemoryJobRepository::new();
+        let instance = repo
+            .find_or_create_instance("nightly", &params(&[("date", "d")]))
+            .await
+            .unwrap();
+
+        assert!(repo.executions(instance.id()).await.unwrap().is_empty());
     }
 
     #[tokio::test]

@@ -26,6 +26,7 @@ pub struct StepContribution {
 
 impl StepContribution {
     /// A contribution with every counter at zero.
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
@@ -172,6 +173,7 @@ impl<R, P, W> ChunkStep<R, P, W> {
     /// `NonZeroUsize` because a zero interval would write nothing and report
     /// success - a failure mode worth making unrepresentable rather than
     /// checking for.
+    #[must_use]
     pub fn new(
         name: impl Into<String>,
         reader: R,
@@ -195,6 +197,7 @@ impl<R, P, W> ChunkStep<R, P, W> {
     /// Takes the whole [`FaultTolerance`] rather than a policy and a classifier
     /// separately: the two are one decision, and 10c widens the struct without
     /// touching this signature.
+    #[must_use]
     pub fn with_fault_tolerance(mut self, fault: FaultTolerance) -> Self {
         self.fault = fault;
         self

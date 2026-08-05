@@ -16,6 +16,7 @@ pub struct JobLauncher<R> {
 
 impl<R: JobRepository> JobLauncher<R> {
     /// Takes ownership of the metadata store every launch will record into.
+    #[must_use]
     pub fn new(repository: R) -> Self {
         Self { repository }
     }

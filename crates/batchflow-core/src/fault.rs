@@ -14,6 +14,7 @@ pub struct RetryPolicy {
 
 impl RetryPolicy {
     /// Try once and give up.
+    #[must_use]
     pub fn none() -> Self {
         Self {
             max_attempts: NonZeroU32::MIN,
@@ -27,6 +28,7 @@ impl RetryPolicy {
     ///
     /// `NonZeroU32` for the same reason `chunk_size` is `NonZeroUsize` — zero
     /// attempts would skip the write and report the chunk done.
+    #[must_use]
     pub fn attempts(max_attempts: NonZeroU32) -> Self {
         Self {
             max_attempts,
@@ -35,6 +37,7 @@ impl RetryPolicy {
     }
 
     /// The first wait, doubled on each subsequent attempt up to `max_delay`.
+    #[must_use]
     pub fn min_delay(mut self, min_delay: Duration) -> Self {
         self.min_delay = min_delay;
         self
@@ -42,6 +45,7 @@ impl RetryPolicy {
 
     /// The ceiling on any single wait. Without one, exponential growth turns a
     /// long-lived outage into a job that appears hung.
+    #[must_use]
     pub fn max_delay(mut self, max_delay: Duration) -> Self {
         self.max_delay = max_delay;
         self
@@ -127,17 +131,20 @@ impl std::fmt::Debug for FaultTolerance {
 
 impl FaultTolerance {
     /// A fail-fast policy: no retries, no skips.
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
     /// Sets the classifier that decides retry vs. skip vs. fail.
+    #[must_use]
     pub fn classifier(mut self, classifier: impl Classifier + 'static) -> Self {
         self.classifier = Box::new(classifier);
         self
     }
 
     /// Sets how many attempts a retryable chunk gets, and how long it waits.
+    #[must_use]
     pub fn retry(mut self, retry: RetryPolicy) -> Self {
         self.retry = retry;
         self
@@ -148,6 +155,7 @@ impl FaultTolerance {
     /// Counted across the whole step, not per chunk — one bad row in each of a
     /// thousand chunks is a broken input file, and a per-chunk limit would call
     /// it healthy.
+    #[must_use]
     pub fn skip_limit(mut self, skip_limit: usize) -> Self {
         self.skip_limit = skip_limit;
         self

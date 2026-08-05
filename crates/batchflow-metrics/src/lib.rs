@@ -50,6 +50,7 @@ const STEP_BUCKETS: &[f64] = &[
 ///
 /// Use this when the application needs to customise the builder further; use
 /// [`install`] when it does not.
+#[must_use]
 pub fn builder() -> PrometheusBuilder {
     // The only error `set_buckets_for_metric` reports is an empty bucket list,
     // and both lists are literal constants — an assertion about this file, not

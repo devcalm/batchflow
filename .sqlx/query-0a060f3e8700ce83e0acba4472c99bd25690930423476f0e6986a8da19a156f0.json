@@ -1,0 +1,64 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT id, instance_id, status, execution_context\n               FROM job_execution\n              WHERE instance_id = $1\n              ORDER BY id",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "job_execution",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "instance_id",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "job_execution",
+            "name": "instance_id"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "status",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "job_execution",
+            "name": "status"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "execution_context",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "job_execution",
+            "name": "execution_context"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "0a060f3e8700ce83e0acba4472c99bd25690930423476f0e6986a8da19a156f0"
+}

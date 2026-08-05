@@ -427,3 +427,93 @@ async fn a_negative_skip_count_is_rejected_by_the_database() {
 
     assert!(result.is_err(), "the CHECK constraint must reject this");
 }
+
+/// `executions` and `last_execution` are separate `ORDER BY` clauses, so a
+/// stray `DESC` in one of them is invisible to any test that checks only one.
+#[tokio::test]
+async fn executions_lists_every_attempt_oldest_first() {
+    let (_container, repository) = start().await;
+    let instance = repository
+        .find_or_create_instance("nightly", &params("2026-08-05"))
+        .await
+        .unwrap();
+
+    let first = repository.create_execution(instance.id()).await.unwrap();
+    let second = repository.create_execution(instance.id()).await.unwrap();
+    let third = repository.create_execution(instance.id()).await.unwrap();
+
+    let all = repository.executions(instance.id()).await.unwrap();
+
+    assert_eq!(
+        all.iter().map(|e| e.id()).collect::<Vec<_>>(),
+        vec![first.id(), second.id(), third.id()]
+    );
+    assert_eq!(
+        all.last().unwrap().id(),
+        repository
+            .last_execution(instance.id())
+            .await
+            .unwrap()
+            .unwrap()
+            .id()
+    );
+}
+
+/// The gap the method closes: a superseded attempt stays reachable, with the
+/// status and bookmark it died holding.
+#[tokio::test]
+async fn executions_still_reaches_a_superseded_attempt() {
+    let (_container, repository) = start().await;
+    let instance = repository
+        .find_or_create_instance("nightly", &params("2026-08-05"))
+        .await
+        .unwrap();
+
+    let mut failed = repository.create_execution(instance.id()).await.unwrap();
+    failed.set_status(BatchStatus::Failed);
+    let mut context = ExecutionContext::new();
+    context.put(POSITION, ContextValue::Long(7));
+    failed.set_execution_context(context);
+    repository.update_execution(&failed).await.unwrap();
+
+    repository.create_execution(instance.id()).await.unwrap();
+
+    let all = repository.executions(instance.id()).await.unwrap();
+
+    assert_eq!(all.len(), 2);
+    assert_eq!(all[0].status(), BatchStatus::Failed);
+    assert_eq!(
+        all[0].execution_context().get_long(POSITION).unwrap(),
+        Some(7)
+    );
+    assert_eq!(all[1].status(), BatchStatus::Starting);
+}
+
+#[tokio::test]
+async fn executions_are_scoped_to_their_instance() {
+    let (_container, repository) = start().await;
+    let nightly = repository
+        .find_or_create_instance("nightly", &params("2026-08-05"))
+        .await
+        .unwrap();
+    let hourly = repository
+        .find_or_create_instance("hourly", &params("2026-08-05"))
+        .await
+        .unwrap();
+
+    let nightly_exec = repository.create_execution(nightly.id()).await.unwrap();
+    repository.create_execution(hourly.id()).await.unwrap();
+
+    let all = repository.executions(nightly.id()).await.unwrap();
+
+    assert_eq!(all.len(), 1);
+    assert_eq!(all[0].id(), nightly_exec.id());
+    assert!(
+        repository
+            .executions(hourly.id())
+            .await
+            .unwrap()
+            .iter()
+            .all(|e| e.id() != nightly_exec.id())
+    );
+}
