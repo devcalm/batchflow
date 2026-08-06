@@ -1,0 +1,18 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE job_execution\n                SET status = $2, execution_context = $3,\n                    ended_at = CASE WHEN $4 THEN COALESCE(ended_at, now()) ELSE ended_at END,\n                    exit_message = $5\n              WHERE id = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Text",
+        "Jsonb",
+        "Bool",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "116e565657fcfc92895420467a67799cd99d91f1455ca1240c10a256792462be"
+}

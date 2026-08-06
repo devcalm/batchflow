@@ -8,14 +8,15 @@ Findings keep their audit IDs, so a row here and a row there are the same item.
 | | |
 |---|---:|
 | Findings raised | 68 |
-| **Resolved** | **23** |
+| **Resolved** | **25** |
 | Closed as "no change recommended" (verified at audit time) | 7 |
-| Outstanding | 38 |
+| Outstanding | 35 |
+| Reassessed and dropped | 1 |
 
 Verification for everything below: `cargo fmt --all --check`,
 `cargo clippy --workspace --all-targets --all-features -- -D warnings`,
 `cargo doc` with `RUSTDOCFLAGS=-D warnings`, and `cargo test` over the four
-crates that need no Docker — **214 tests, all green**. `batchflow-postgres` and `batchflow-redis` compile and lint clean but
+crates that need no Docker — **229 tests, all green**. `batchflow-postgres` and `batchflow-redis` compile and lint clean but
 their integration suites were **not** run in this session (no Docker daemon
 available); see [Not verified here](#not-verified-here).
 
@@ -300,6 +301,79 @@ queued, so two replicas are redundancy rather than a way to make one job faster.
 
 ---
 
+## Round 3 — PROD-2 / ERR-1
+
+### PROD-2 + ERR-1 — Time and failure reason in the store ✅
+
+**Was:** `job_execution` held `id, instance_id, status, execution_context` and
+nothing else. Four questions an operator asks after an incident were all
+unanswerable from the store, and the absence compounded — no `last_updated`
+meant no heartbeat, no heartbeat meant no reaper, so a crashed process needed a
+human who had no way to tell a zombie from a slow job.
+
+**Now:** `Timestamps { created_at, ended_at, last_updated }` and `exit_message`
+on both `JobExecution` and `StepExecution`, migration `0003`.
+
+**Design decisions worth recording.**
+
+*The store owns the clock.* Postgres stamps with `now()` — the one clock every
+process writing to a shared store agrees on, so a duration measured across two
+replicas does not depend on their NTP. `Timestamps` is therefore read-only to
+application code, and core needs no time dependency at all: it carries
+`std::time::SystemTime`, and `batchflow-postgres` converts from
+`time::OffsetDateTime`. Redis uses the *client* clock (reading Redis `TIME`
+would cost a round trip per write) — a genuine difference between backends,
+documented rather than hidden.
+
+*A trigger, not a statement.* `last_updated` is maintained by
+`batchflow_touch_last_updated` in Postgres. Two reasons: it cannot be forgotten
+when a statement is added, and — the deciding one — the per-chunk
+`UPDATE step_execution` **is** the heartbeat, so keeping it out of that
+statement means the hottest write in the system did not have to change.
+
+*`COALESCE(ended_at, now())` / `HSETNX`.* The terminal instant is fixed by the
+first write that reaches it, so a later write cannot move it.
+
+*No `started_at`.* It would equal `created_at` for every row the engine
+produces — `start_execution` opens an execution already `Started`, and a step
+execution is created and set `Started` in the same breath. A second column
+carrying the same instant is a second column to keep consistent across three
+backends, for no question it answers alone.
+
+**`exit_message` renders the whole cause chain**, bounded at 2000 bytes with a
+visible ` [truncated]` marker and a char-boundary-safe cut — the chain includes
+a user error whose `Display` this project does not control, and a data error is
+exactly the kind that carries multi-byte text.
+
+**A control test caught a real bug here.** `thiserror` renders the wrapping
+variants as `"Write failed: {cause}"` *and* exposes the cause as `source`, so a
+naive chain walk printed the innermost error twice — while `SkipLimitExceeded`
+does *not* interpolate and genuinely needs the append. The renderer now appends
+a cause only if its text is not already present, and both halves of that rule
+have a test. Without `a_short_message_is_left_alone` asserting an exact string,
+this would have shipped.
+
+**Six conformance cases** plus three end-to-end launcher tests. `docs/Operations.md`
+gains the reaper query (§5) and the "ask the store directly" SQL (§6), and two
+of its known gaps are struck.
+
+### PERF-4 — reassessed and dropped
+
+I had recommended adding a nullable `partition` column in this migration, on the
+grounds that adding it later to a populated table would be expensive. **That was
+wrong, and I am correcting it rather than acting on it.** Since PostgreSQL 11,
+`ALTER TABLE ... ADD COLUMN` with a nullable column or a non-volatile default is
+a metadata-only operation — O(1), no table rewrite — so adding it later costs
+nothing. What is genuinely expensive about partitioned steps is changing the
+semantics of the `last_step_execution` lookup key, and that is a code change
+which a column added today does not make any cheaper.
+
+Adding a column that nothing writes and nothing reads is speculative
+generality; the argument that justified it does not hold. PERF-4 stays open as
+ordinary future work.
+
+---
+
 ## Not verified here
 
 - **`batchflow-postgres` and `batchflow-redis` integration suites.** No Docker
@@ -309,16 +383,29 @@ queued, so two replicas are redundancy rather than a way to make one job faster.
   Docker before releasing.** The six new `start_execution` conformance cases run
   automatically against both backends, so that command is also the verification
   for CONC-1.
-- **The Postgres `.sqlx` cache entry for CONC-1 was authored by hand**, because
-  `cargo sqlx prepare` needs a live database. It is
-  `SELECT id FROM job_instance WHERE id = $1 FOR UPDATE` — one `Int8` parameter,
-  one non-nullable `Int8` column, both derivable from the schema — and the
-  filename is `sha256(query)`, which is how sqlx keys the cache. The macro
-  accepts it and the crate compiles. Everything else in `start_execution`
-  deliberately reuses existing query text **byte-for-byte**, since the cache is
-  keyed on the query string and not on whether it runs against a pool or a
-  transaction. Re-run `cargo sqlx prepare` when a database is available to
-  confirm it round-trips.
+- **The whole Postgres `.sqlx` cache is now generated, not hand-written.**
+  `cargo sqlx prepare` needs a live database, so
+  `crates/batchflow-postgres/tools/generate_sqlx_cache.py` extracts every
+  `sqlx::query!` literal from the source and emits its cache entry from a
+  declarative table of the schema's columns and nullability. Generation rather
+  than transcription is what makes twelve entries tractable. Its docstring says
+  plainly that it is a fallback and that `cargo sqlx prepare` wins any
+  disagreement.
+
+  **This is better verified than it sounds.** `cargo check` passing is a real
+  check, not a formality: if any `nullable` flag or `type_info` were wrong, sqlx
+  would generate a different Rust type — `Option<OffsetDateTime>` instead of
+  `OffsetDateTime`, `String` instead of `Option<String>` — and the code would not
+  compile against the `execution(...)` and `step(...)` signatures. The compiler
+  has therefore confirmed every column's type and nullability against my
+  declared schema.
+
+  **What remains unverified is that the declared schema matches the real
+  database** — i.e. that migration `0003` says what the generator's table says —
+  and that the new SQL executes (the `CASE WHEN $n THEN COALESCE(...)`
+  expressions in particular). Both are covered by running the suite with Docker.
+  Re-run `cargo sqlx prepare` when a database is available; the generated
+  entries should round-trip unchanged.
 - **The Redis eviction path** is a code change with no test behind it; a test
   needs a container that can be made to evict. Worth adding with the rest of
   SEC-2.
@@ -333,13 +420,10 @@ Complete. Both Criticals and every High in phase 1 are resolved.
 
 ### Phase 2
 
-- **PROD-2** — timestamps, heartbeat and `exit_message` in the schema. Migration
-  `0003`. One migration unlocks retention, an automatic reaper, durations and
-  "why did it fail" — four capabilities blocked on one missing column.
-- **ERR-1** — persist the failure reason (falls out of PROD-2).
-- **PROD-3** — retention. Blocked on PROD-2's timestamps. The "do not delete a
-  `Completed` execution while keeping its instance" rule is why the framework
-  should own this rather than leaving it to users' `DELETE` statements.
+- **PROD-3** — retention. **Now unblocked** by PROD-2's `created_at`. The "do
+  not delete a `Completed` execution while keeping its instance" rule is why the
+  framework should own this rather than leaving it to users' `DELETE`
+  statements.
 - **PERF-3** — `FILLFACTOR` migration and skipping the JSONB rewrite when the
   context has not changed. Documented in `docs/Operations.md` as manual DDL in
   the meantime.
@@ -361,9 +445,9 @@ ARCH-1 (decompose `run_step`), ARCH-2 (`Skips` struct), ARCH-3
 (`batchflow-conformance` crate), ARCH-4 (wire or remove
 `JobExecution::execution_context`), API-3 (`read_batch`), API-4 (public test
 doubles — which also resolves DEBT-3), API-8, CONC-2 (fencing token), ERR-2,
-ERR-4, ERR-5, PERF-1, PERF-4 (partition column while the table is empty), MEM-1,
-RUST-1, TEST-2/3/4, DOC-1/2/3, DEBT-1 (the comment-audience pass, best done with
-ARCH-1), DEBT-4, DEBT-7.
+ERR-4, ERR-5, PERF-1, PERF-4 (partitioned steps — see the correction above),
+MEM-1, RUST-1, TEST-2/3/4, DOC-1/2/3, DEBT-1 (the comment-audience pass, best
+done with ARCH-1), DEBT-4, DEBT-7.
 
 ---
 
@@ -373,14 +457,15 @@ ARCH-1), DEBT-4, DEBT-7.
    need it: the six new `start_execution` conformance cases against Postgres and
    Redis, and a `cargo sqlx prepare` to confirm the hand-authored cache entry
    round-trips. Nothing below should be started until that is green.
-2. **PROD-2 is the next real piece of work** — timestamps, heartbeat and
-   `exit_message`. One migration unlocks four capabilities, and PROD-3 and ERR-1
-   both depend on its columns.
-3. **Do PERF-4's partition column with PROD-2's migration.** Adding a nullable
-   column to an empty table is free; adding it to three years of production
-   metadata while changing the restart lookup key is not.
-4. **Reindenting a `sqlx::query!` invalidates the offline cache.** It cost time
-   in this session. `CONTRIBUTING.md` now says so.
-5. **A partial unique index over live executions** is available as defence in
+2. **PROD-3 (retention) is the next real piece of work**, now that
+   `created_at` exists to select on. `docs/Operations.md` §3 carries the manual
+   `DELETE` caveat until it lands.
+3. **Reindenting a `sqlx::query!` invalidates the offline cache.** It cost time
+   in this session. `CONTRIBUTING.md` now says so, and the generator makes
+   regeneration cheap.
+4. **A partial unique index over live executions** is available as defence in
    depth for CONC-1 if `start_execution` is ever bypassed — see the round 2 note
    for why it was not taken now.
+5. **The `time` crate moved in the lock file** (`cargo update -p time`) so sqlx
+   0.9's `time` feature could resolve past a `serde_with` pin. Nothing else
+   needed it; worth knowing if a dependency bump ever fights over it again.

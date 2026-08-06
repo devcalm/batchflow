@@ -39,10 +39,10 @@ pub mod tracing;
 pub use async_trait::async_trait;
 pub use classifier::{Classifier, ErrorAction, FailFast};
 pub use context::{ContextValue, ExecutionContext};
-pub use error::{BatchError, Cause};
+pub use error::{BatchError, Cause, exit_message};
 pub use execution::{
     BatchStatus, JobExecution, JobExecutionId, JobInstance, JobInstanceId, JobParameter,
-    JobParameters, StepExecution, StepExecutionId,
+    JobParameters, StepExecution, StepExecutionId, Timestamps,
 };
 pub use fault::{FaultTolerance, ItemDisposition, RetryPolicy};
 pub use item::{ItemProcessor, ItemReader, ItemWriter, TransactionalWriter, Unmanaged};

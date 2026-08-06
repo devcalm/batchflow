@@ -1,3 +1,4 @@
+use crate::Timestamps;
 use crate::repository::JobRepository;
 use crate::{
     BatchError, BatchStatus, JobExecution, JobExecutionId, JobInstance, JobInstanceId,
@@ -5,6 +6,7 @@ use crate::{
 };
 use std::collections::HashMap;
 use std::sync::Mutex;
+use std::time::SystemTime;
 
 /// A [`JobRepository`] held in memory, for tests and for trying things out.
 ///
@@ -42,6 +44,34 @@ impl InMemoryJobRepository {
     /// own rule is that a cause is preserved, never stringified. There is
     /// nothing here to preserve: the panic is long gone, and what the caller
     /// needs to know is that this store's contents may be half-updated.
+    /// Stamps a record the way a backend's own clock would.
+    ///
+    /// `SystemTime::now()` here, where Postgres uses `now()` — a documented
+    /// divergence rather than a hidden one. This store is single-process by
+    /// construction, so "the process clock" and "the store clock" are the same
+    /// clock and the distinction that matters for a shared backend does not
+    /// arise.
+    fn stamp(previous: Timestamps, status: BatchStatus) -> Timestamps {
+        let now = SystemTime::now();
+        let ended_at = match status {
+            // Terminal: fix the end instant the first time it is reached, so a
+            // later write cannot move it.
+            BatchStatus::Completed
+            | BatchStatus::Failed
+            | BatchStatus::Stopped
+            | BatchStatus::Abandoned => previous.ended_at().or(Some(now)),
+            _ => previous.ended_at(),
+        };
+
+        Timestamps::new(
+            previous.created_at().or(Some(now)),
+            ended_at,
+            // The heartbeat, bumped on every write — what the Postgres trigger
+            // does, done by hand.
+            Some(now),
+        )
+    }
+
     fn lock(&self) -> Result<std::sync::MutexGuard<'_, Inner>, BatchError> {
         self.inner.lock().map_err(|_| {
             BatchError::repository(
@@ -129,7 +159,8 @@ impl JobRepository for InMemoryJobRepository {
         }
 
         inner.next_id += 1;
-        let execution = JobExecution::new(JobExecutionId::new(inner.next_id), instance_id);
+        let mut execution = JobExecution::new(JobExecutionId::new(inner.next_id), instance_id);
+        execution.set_timestamps(Self::stamp(Timestamps::default(), execution.status()));
         inner.executions.push(execution.clone());
         Ok(execution)
     }
@@ -181,6 +212,7 @@ impl JobRepository for InMemoryJobRepository {
         // `Started`, not `Starting`: the row must hold the instance the moment
         // it exists, or the gate has a window it does not cover.
         execution.set_status(BatchStatus::Started);
+        execution.set_timestamps(Self::stamp(Timestamps::default(), execution.status()));
         inner.executions.push(execution.clone());
 
         Ok(execution)
@@ -195,7 +227,12 @@ impl JobRepository for InMemoryJobRepository {
             .find(|e| e.id() == execution.id())
         {
             Some(slot) => {
+                // Stamped from what is *stored*, not from the caller's copy:
+                // the store owns this clock, so a caller cannot rewrite
+                // `created_at` by sending back a stale value.
+                let stamped = Self::stamp(slot.timestamps(), execution.status());
                 *slot = execution.clone();
+                slot.set_timestamps(stamped);
                 Ok(())
             }
             None => Err(BatchError::repository(format!(
@@ -246,6 +283,7 @@ impl JobRepository for InMemoryJobRepository {
                 }
 
                 slot.set_status(BatchStatus::Abandoned);
+                slot.set_timestamps(Self::stamp(slot.timestamps(), BatchStatus::Abandoned));
                 Ok(())
             }
             None => Err(BatchError::repository(format!(
@@ -268,11 +306,12 @@ impl JobRepository for InMemoryJobRepository {
         }
 
         inner.next_id += 1;
-        let step_execution = StepExecution::new(
+        let mut step_execution = StepExecution::new(
             StepExecutionId::new(inner.next_id),
             job_execution_id,
             step_name,
         );
+        step_execution.set_timestamps(Self::stamp(Timestamps::default(), step_execution.status()));
         inner.step_executions.push(step_execution.clone());
         Ok(step_execution)
     }
@@ -289,7 +328,9 @@ impl JobRepository for InMemoryJobRepository {
             .find(|s| s.id() == step_execution.id())
         {
             Some(slot) => {
+                let stamped = Self::stamp(slot.timestamps(), step_execution.status());
                 *slot = step_execution.clone();
+                slot.set_timestamps(stamped);
                 Ok(())
             }
             None => Err(BatchError::repository(format!(

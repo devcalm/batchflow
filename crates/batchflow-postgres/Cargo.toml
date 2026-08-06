@@ -25,6 +25,7 @@ sqlx = { workspace = true, features = [
     "json",
     "macros",
     "migrate",
+    "time",
 ] }
 
 [dev-dependencies]

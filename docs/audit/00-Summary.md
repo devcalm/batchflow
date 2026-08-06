@@ -151,8 +151,9 @@ Everything that turns a correct engine into an operable product.
 
 ## Where the passes live
 
-> **Remediation is under way.** 23 of these findings — including both Criticals
-> and CONC-1, the launcher race — have been fixed. See [PROGRESS.md](PROGRESS.md) for what was done, what it
+> **Remediation is under way.** 25 of these findings — including both Criticals,
+> CONC-1 (the launcher race) and PROD-2 (time and failure reason in the store) —
+> have been fixed, and one was reassessed and dropped. See [PROGRESS.md](PROGRESS.md) for what was done, what it
 > replaced, and what is left. The scores and roadmap below describe the codebase
 > **as audited** at `46f276e` and are deliberately not restated.
 

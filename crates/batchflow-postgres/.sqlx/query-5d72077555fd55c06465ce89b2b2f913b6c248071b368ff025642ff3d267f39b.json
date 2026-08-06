@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT id, job_execution_id, step_name, status,\n                    read_count, write_count, filter_count, skip_count,\n                    execution_context\n               FROM step_execution\n              WHERE job_execution_id = $1\n              ORDER BY id",
+  "query": "SELECT id, job_execution_id, step_name, status,\n                    read_count, write_count, filter_count, skip_count,\n                    execution_context, created_at, ended_at, last_updated,\n                    exit_message\n               FROM step_execution\n              WHERE job_execution_id = $1\n              ORDER BY id",
   "describe": {
     "columns": [
       {
@@ -101,6 +101,50 @@
             "name": "execution_context"
           }
         }
+      },
+      {
+        "ordinal": 9,
+        "name": "created_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "step_execution",
+            "name": "created_at"
+          }
+        }
+      },
+      {
+        "ordinal": 10,
+        "name": "ended_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "step_execution",
+            "name": "ended_at"
+          }
+        }
+      },
+      {
+        "ordinal": 11,
+        "name": "last_updated",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "step_execution",
+            "name": "last_updated"
+          }
+        }
+      },
+      {
+        "ordinal": 12,
+        "name": "exit_message",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "step_execution",
+            "name": "exit_message"
+          }
+        }
       }
     ],
     "parameters": {
@@ -117,8 +161,12 @@
       false,
       false,
       false,
-      false
+      false,
+      false,
+      true,
+      false,
+      true
     ]
   },
-  "hash": "8727adbd6e2b1a4c84c8428b0439bc9c37d0b45fcd98d1f6aaef7e3e151312c4"
+  "hash": "5d72077555fd55c06465ce89b2b2f913b6c248071b368ff025642ff3d267f39b"
 }

@@ -14,8 +14,11 @@ pub use classifier::PostgresClassifier;
 use batchflow_core::{
     BatchError, BatchStatus, ExecutionContext, JobExecution, JobExecutionId, JobInstance,
     JobInstanceId, JobParameters, JobRepository, StepContribution, StepExecution, StepExecutionId,
+    Timestamps,
 };
+use sqlx::types::time::OffsetDateTime;
 use sqlx::{PgPool, Postgres, Transaction};
+use std::time::SystemTime;
 
 const STARTING: &str = "STARTING";
 const STARTED: &str = "STARTED";
@@ -95,6 +98,33 @@ fn status_from(name: &str) -> Result<BatchStatus, BatchError> {
     })
 }
 
+/// Whether a status is terminal, and therefore fixes `ended_at`.
+fn is_terminal(status: BatchStatus) -> bool {
+    matches!(
+        status,
+        BatchStatus::Completed
+            | BatchStatus::Failed
+            | BatchStatus::Stopped
+            | BatchStatus::Abandoned
+    )
+}
+
+/// Rebuilds the three instants a row carries.
+///
+/// `created_at` and `last_updated` are `NOT NULL`, so they are always present;
+/// `ended_at` is NULL until a terminal status is written.
+fn timestamps(
+    created_at: OffsetDateTime,
+    ended_at: Option<OffsetDateTime>,
+    last_updated: OffsetDateTime,
+) -> Timestamps {
+    Timestamps::new(
+        Some(created_at.into()),
+        ended_at.map(SystemTime::from),
+        Some(last_updated.into()),
+    )
+}
+
 fn count(value: i64) -> Result<usize, BatchError> {
     usize::try_from(value)
         .map_err(|_| BatchError::repository(format!("negative counter {value} in step_execution")))
@@ -125,13 +155,19 @@ async fn write_step_execution<'e, E>(
 where
     E: sqlx::Executor<'e, Database = Postgres>,
 {
-    // The indentation of the statement below is byte-identical to the entry in
-    // `.sqlx/`: `sqlx::query!` hashes the literal, so reflowing it invalidates
-    // the offline cache and breaks every build without a live database.
+    // `last_updated` is absent on purpose: the `step_execution_touch` trigger
+    // maintains it. This is the per-chunk write, so keeping the heartbeat out
+    // of it means the hottest statement in the system carries nothing extra and
+    // cannot forget to.
+    //
+    // `COALESCE(ended_at, now())` fixes the terminal instant the first time it
+    // is reached, so a later write cannot move it.
     let affected = sqlx::query!(
         "UPDATE step_execution
                 SET status = $2, read_count = $3, write_count = $4,
-                    filter_count = $5, skip_count = $6, execution_context = $7
+                    filter_count = $5, skip_count = $6, execution_context = $7,
+                    ended_at = CASE WHEN $8 THEN COALESCE(ended_at, now()) ELSE ended_at END,
+                    exit_message = $9
               WHERE id = $1",
         step_execution.id().get(),
         status_name(step_execution.status())?,
@@ -140,6 +176,8 @@ where
         stored(step_execution.filter_count())?,
         stored(step_execution.skip_count())?,
         json(step_execution.execution_context())?,
+        is_terminal(step_execution.status()),
+        step_execution.exit_message(),
     )
     .execute(executor)
     .await
@@ -163,15 +201,22 @@ fn from_json<T: serde::de::DeserializeOwned>(value: serde_json::Value) -> Result
     serde_json::from_value(value).map_err(BatchError::repository)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn execution(
     id: i64,
     instance_id: i64,
     status: &str,
     context: serde_json::Value,
+    created_at: OffsetDateTime,
+    ended_at: Option<OffsetDateTime>,
+    last_updated: OffsetDateTime,
+    exit_message: Option<String>,
 ) -> Result<JobExecution, BatchError> {
     let mut execution = JobExecution::new(JobExecutionId::new(id), JobInstanceId::new(instance_id));
     execution.set_status(status_from(status)?);
     execution.set_execution_context(from_json::<ExecutionContext>(context)?);
+    execution.set_timestamps(timestamps(created_at, ended_at, last_updated));
+    execution.set_exit_message(exit_message);
     Ok(execution)
 }
 
@@ -188,6 +233,7 @@ fn counters(read: i64, write: i64, filter: i64, skip: i64) -> Result<StepContrib
     Ok(counters)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn step(
     id: i64,
     job_execution_id: i64,
@@ -195,6 +241,10 @@ fn step(
     status: &str,
     counters: StepContribution,
     context: serde_json::Value,
+    created_at: OffsetDateTime,
+    ended_at: Option<OffsetDateTime>,
+    last_updated: OffsetDateTime,
+    exit_message: Option<String>,
 ) -> Result<StepExecution, BatchError> {
     let mut step = StepExecution::new(
         StepExecutionId::new(id),
@@ -204,6 +254,8 @@ fn step(
     step.set_status(status_from(status)?);
     step.set_execution_context(from_json::<ExecutionContext>(context)?);
     step.apply(&counters);
+    step.set_timestamps(timestamps(created_at, ended_at, last_updated));
+    step.set_exit_message(exit_message);
 
     Ok(step)
 }
@@ -291,7 +343,7 @@ impl JobRepository for PostgresJobRepository {
         let row = sqlx::query!(
             "INSERT INTO job_execution (instance_id, status, execution_context)
                   VALUES ($1, $2, $3)
-               RETURNING id",
+               RETURNING id, created_at, last_updated",
             instance_id.get(),
             STARTING,
             json(&ExecutionContext::new())?,
@@ -300,7 +352,9 @@ impl JobRepository for PostgresJobRepository {
         .await
         .map_err(db)?;
 
-        Ok(JobExecution::new(JobExecutionId::new(row.id), instance_id))
+        let mut execution = JobExecution::new(JobExecutionId::new(row.id), instance_id);
+        execution.set_timestamps(timestamps(row.created_at, None, row.last_updated));
+        Ok(execution)
     }
 
     /// The gate and the insert in one transaction, serialised by a row lock on
@@ -342,7 +396,8 @@ impl JobRepository for PostgresJobRepository {
         // Same statement `last_execution` runs, against the transaction rather
         // than the pool — so it shares the prepared-query cache entry.
         let last = sqlx::query!(
-            "SELECT id, instance_id, status, execution_context
+            "SELECT id, instance_id, status, execution_context,
+                      created_at, ended_at, last_updated, exit_message
                FROM job_execution
               WHERE instance_id = $1
               ORDER BY id DESC
@@ -382,7 +437,7 @@ impl JobRepository for PostgresJobRepository {
         let row = sqlx::query!(
             "INSERT INTO job_execution (instance_id, status, execution_context)
                   VALUES ($1, $2, $3)
-               RETURNING id",
+               RETURNING id, created_at, last_updated",
             instance_id.get(),
             STARTED,
             json(&ExecutionContext::new())?,
@@ -395,15 +450,22 @@ impl JobRepository for PostgresJobRepository {
 
         let mut execution = JobExecution::new(JobExecutionId::new(row.id), instance_id);
         execution.set_status(BatchStatus::Started);
+        execution.set_timestamps(timestamps(row.created_at, None, row.last_updated));
         Ok(execution)
     }
 
     async fn update_execution(&self, execution: &JobExecution) -> Result<(), BatchError> {
         let affected = sqlx::query!(
-            "UPDATE job_execution SET status = $2, execution_context = $3 WHERE id = $1",
+            "UPDATE job_execution
+                SET status = $2, execution_context = $3,
+                    ended_at = CASE WHEN $4 THEN COALESCE(ended_at, now()) ELSE ended_at END,
+                    exit_message = $5
+              WHERE id = $1",
             execution.id().get(),
             status_name(execution.status())?,
             json(execution.execution_context())?,
+            is_terminal(execution.status()),
+            execution.exit_message(),
         )
         .execute(&self.pool)
         .await
@@ -424,7 +486,8 @@ impl JobRepository for PostgresJobRepository {
         instance_id: JobInstanceId,
     ) -> Result<Option<JobExecution>, BatchError> {
         let row = sqlx::query!(
-            "SELECT id, instance_id, status, execution_context
+            "SELECT id, instance_id, status, execution_context,
+                      created_at, ended_at, last_updated, exit_message
                FROM job_execution
               WHERE instance_id = $1
               ORDER BY id DESC
@@ -435,8 +498,19 @@ impl JobRepository for PostgresJobRepository {
         .await
         .map_err(db)?;
 
-        row.map(|row| execution(row.id, row.instance_id, &row.status, row.execution_context))
-            .transpose()
+        row.map(|row| {
+            execution(
+                row.id,
+                row.instance_id,
+                &row.status,
+                row.execution_context,
+                row.created_at,
+                row.ended_at,
+                row.last_updated,
+                row.exit_message,
+            )
+        })
+        .transpose()
     }
 
     async fn executions(
@@ -444,7 +518,8 @@ impl JobRepository for PostgresJobRepository {
         instance_id: JobInstanceId,
     ) -> Result<Vec<JobExecution>, BatchError> {
         let rows = sqlx::query!(
-            "SELECT id, instance_id, status, execution_context
+            "SELECT id, instance_id, status, execution_context,
+                      created_at, ended_at, last_updated, exit_message
                FROM job_execution
               WHERE instance_id = $1
               ORDER BY id",
@@ -455,7 +530,18 @@ impl JobRepository for PostgresJobRepository {
         .map_err(db)?;
 
         rows.into_iter()
-            .map(|row| execution(row.id, row.instance_id, &row.status, row.execution_context))
+            .map(|row| {
+                execution(
+                    row.id,
+                    row.instance_id,
+                    &row.status,
+                    row.execution_context,
+                    row.created_at,
+                    row.ended_at,
+                    row.last_updated,
+                    row.exit_message,
+                )
+            })
             .collect()
     }
 
@@ -467,7 +553,8 @@ impl JobRepository for PostgresJobRepository {
             r#"WITH locked AS (
                    SELECT id, status FROM job_execution WHERE id = $1 FOR UPDATE
                ), updated AS (
-                   UPDATE job_execution SET status = $2
+                   UPDATE job_execution
+                      SET status = $2, ended_at = COALESCE(ended_at, now())
                     WHERE id = (SELECT id FROM locked WHERE status <> $3)
                 RETURNING id
                )
@@ -504,7 +591,7 @@ impl JobRepository for PostgresJobRepository {
                      read_count, write_count, filter_count, skip_count,
                      execution_context)
                   VALUES ($1, $2, $3, 0, 0, 0, 0, $4)
-               RETURNING id",
+               RETURNING id, created_at, last_updated",
             job_execution_id.get(),
             step_name,
             STARTING,
@@ -514,11 +601,10 @@ impl JobRepository for PostgresJobRepository {
         .await
         .map_err(db)?;
 
-        Ok(StepExecution::new(
-            StepExecutionId::new(row.id),
-            job_execution_id,
-            step_name,
-        ))
+        let mut step =
+            StepExecution::new(StepExecutionId::new(row.id), job_execution_id, step_name);
+        step.set_timestamps(timestamps(row.created_at, None, row.last_updated));
+        Ok(step)
     }
 
     async fn update_step_execution(
@@ -535,8 +621,9 @@ impl JobRepository for PostgresJobRepository {
     ) -> Result<Option<StepExecution>, BatchError> {
         let row = sqlx::query!(
             "SELECT s.id, s.job_execution_id, s.step_name, s.status,
-                    s.read_count, s.write_count, s.filter_count, s.skip_count,
-                    s.execution_context
+s.read_count, s.write_count, s.filter_count, s.skip_count,
+                    s.execution_context, s.created_at, s.ended_at, s.last_updated,
+                    s.exit_message
                FROM step_execution s
                JOIN job_execution e ON e.id = s.job_execution_id
               WHERE e.instance_id = $1 AND s.step_name = $2
@@ -562,6 +649,10 @@ impl JobRepository for PostgresJobRepository {
                     row.skip_count,
                 )?,
                 row.execution_context,
+                row.created_at,
+                row.ended_at,
+                row.last_updated,
+                row.exit_message,
             )
         })
         .transpose()
@@ -574,7 +665,8 @@ impl JobRepository for PostgresJobRepository {
         let rows = sqlx::query!(
             "SELECT id, job_execution_id, step_name, status,
                     read_count, write_count, filter_count, skip_count,
-                    execution_context
+                    execution_context, created_at, ended_at, last_updated,
+                    exit_message
                FROM step_execution
               WHERE job_execution_id = $1
               ORDER BY id",
@@ -598,6 +690,10 @@ impl JobRepository for PostgresJobRepository {
                         row.skip_count,
                     )?,
                     row.execution_context,
+                    row.created_at,
+                    row.ended_at,
+                    row.last_updated,
+                    row.exit_message,
                 )
             })
             .collect()

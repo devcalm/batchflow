@@ -15,6 +15,28 @@ version number and are released together.
 
 **From the engineering audit (`docs/audit/`), phase 1**
 
+- **The metadata store records when an execution ran and why it ended.**
+  `JobExecution` and `StepExecution` carry `Timestamps` (`created_at`,
+  `ended_at`, `last_updated`) and an `exit_message`. Before this the store could
+  answer none of "when did last night's job run", "how long did it take", "is
+  this `STARTED` row a live process or a zombie", or "why did 4712 fail" — the
+  cause existed only in whatever log retention the process happened to have,
+  unjoinable to an execution id and invisible to anything querying the store
+  from another service.
+
+  **The store owns this clock**, not the engine: Postgres stamps with `now()`,
+  so every process writing to a shared store agrees on one clock rather than on
+  how well their NTP is behaving. Redis uses the client clock — a real
+  difference, documented on the trait rather than hidden. `last_updated` is a
+  heartbeat maintained by a trigger in Postgres, so the per-chunk write carries
+  nothing extra and cannot forget to move it; a stale execution is now a query
+  (see `docs/Operations.md` §5) rather than a guess.
+
+  There is deliberately **no `started_at`** — it would equal `created_at` for
+  every row the engine produces, since executions are opened already running.
+
+  New migration `0003`, and six conformance cases so the contract binds every
+  backend.
 - **`JobRepository::start_execution` — the launch gate is now atomic.** It
   decides whether an instance may run *and* opens the execution as one
   indivisible operation, returning it already `Started`. This closes the race

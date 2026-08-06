@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT s.id, s.job_execution_id, s.step_name, s.status,\n                    s.read_count, s.write_count, s.filter_count, s.skip_count,\n                    s.execution_context\n               FROM step_execution s\n               JOIN job_execution e ON e.id = s.job_execution_id\n              WHERE e.instance_id = $1 AND s.step_name = $2\n              ORDER BY s.id DESC\n              LIMIT 1",
+  "query": "SELECT s.id, s.job_execution_id, s.step_name, s.status,\ns.read_count, s.write_count, s.filter_count, s.skip_count,\n                    s.execution_context, s.created_at, s.ended_at, s.last_updated,\n                    s.exit_message\n               FROM step_execution s\n               JOIN job_execution e ON e.id = s.job_execution_id\n              WHERE e.instance_id = $1 AND s.step_name = $2\n              ORDER BY s.id DESC\n              LIMIT 1",
   "describe": {
     "columns": [
       {
@@ -101,6 +101,50 @@
             "name": "execution_context"
           }
         }
+      },
+      {
+        "ordinal": 9,
+        "name": "created_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "step_execution",
+            "name": "created_at"
+          }
+        }
+      },
+      {
+        "ordinal": 10,
+        "name": "ended_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "step_execution",
+            "name": "ended_at"
+          }
+        }
+      },
+      {
+        "ordinal": 11,
+        "name": "last_updated",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "step_execution",
+            "name": "last_updated"
+          }
+        }
+      },
+      {
+        "ordinal": 12,
+        "name": "exit_message",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "step_execution",
+            "name": "exit_message"
+          }
+        }
       }
     ],
     "parameters": {
@@ -118,8 +162,12 @@
       false,
       false,
       false,
-      false
+      false,
+      false,
+      true,
+      false,
+      true
     ]
   },
-  "hash": "f3a70448a39da1428f94b7c97ac5213561d2d8850361f005836f5bd60e8cf74d"
+  "hash": "b8058664d0bad933f3a5ebaba86963bfbcf2f614525a4818a60e370f88edc40a"
 }

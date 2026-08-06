@@ -61,6 +61,13 @@ Two consequences:
   Commit the resulting `.sqlx/` changes with the query change, in the same
   commit.
 
+  Without Docker there is a fallback,
+  `crates/batchflow-postgres/tools/generate_sqlx_cache.py`, which derives the
+  cache from a transcription of the migrations rather than from a live database.
+  It is a stopgap: if it and `cargo sqlx prepare` ever disagree, the database is
+  right. Anything it generates should be confirmed by a real `prepare` before a
+  release.
+
 ## Migrations are append-only
 
 `sqlx` records a checksum for every applied migration. Editing a migration that

@@ -48,8 +48,10 @@ pub enum BatchError {
 
     /// Another execution of this instance is `Starting` or `Started`.
     ///
-    /// With no heartbeat (Phase 12) the repository cannot tell "running" from
-    /// "crashed", so clearing this is an operator decision:
+    /// The store records a heartbeat
+    /// ([`Timestamps::last_updated`](crate::Timestamps::last_updated)), so a
+    /// stale execution is *findable* — but it cannot prove a process is dead,
+    /// so clearing this is still an operator decision:
     /// [`abandon_execution`](crate::JobRepository::abandon_execution).
     #[error(
         "job '{job_name}' already has a running execution ({execution_id:?}); \
@@ -165,6 +167,60 @@ pub enum BatchError {
     },
 }
 
+/// The longest `exit_message` the engine will store.
+///
+/// Bounded because the chain includes a user error whose `Display` this crate
+/// does not control, and the value goes into a database column. Truncation is
+/// marked, so a reader can tell a short message from a clipped one.
+const MAX_EXIT_MESSAGE: usize = 2000;
+
+/// Renders an error and its causes for the metadata store.
+///
+/// The whole chain rather than just the top: the classifier's decision was made
+/// on a nested cause, and an operator reading the store needs to see what it
+/// saw. A `BatchError::Write` whose message is "Write failed" and nothing else
+/// is the situation this exists to end.
+#[must_use]
+pub fn exit_message(error: &BatchError) -> String {
+    use std::error::Error as _;
+    use std::fmt::Write as _;
+
+    let mut rendered = error.to_string();
+    let mut source = error.source();
+
+    while let Some(cause) = source {
+        let text = cause.to_string();
+
+        // Appended only if it is not already there. The wrapping variants
+        // interpolate their cause into their own `Display` *and* expose it as
+        // `source` — `Write(e)` renders as "Write failed: {e}" — so a naive
+        // walk prints the innermost error twice. Others, notably
+        // `SkipLimitExceeded`, do not interpolate and genuinely need the
+        // append. Testing the rendered text is what covers both without
+        // hard-coding which variants behave which way.
+        if !rendered.contains(&text) {
+            // `write!` to a String is infallible; the `let _` is the honest way
+            // to say so without an `unwrap` that implies it might not be.
+            let _ = write!(rendered, ": {text}");
+        }
+
+        source = cause.source();
+    }
+
+    if rendered.len() > MAX_EXIT_MESSAGE {
+        // On a char boundary, or this panics on multi-byte input -- which is
+        // exactly the sort of message a data error tends to carry.
+        let cut = (0..=MAX_EXIT_MESSAGE)
+            .rev()
+            .find(|at| rendered.is_char_boundary(*at))
+            .unwrap_or(0);
+        rendered.truncate(cut);
+        rendered.push_str(" [truncated]");
+    }
+
+    rendered
+}
+
 /// Constructors for the wrapping variants.
 ///
 /// `impl Into<Cause>` accepts a `&str`, a `String` or any concrete error, so
@@ -224,5 +280,99 @@ impl BatchError {
                 during_cleanup: Box::new(during_cleanup),
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod exit_message_tests {
+    use super::*;
+
+    /// The whole point: the classifier's verdict was reached on a *nested*
+    /// cause, so an operator reading the store has to see the same thing it
+    /// saw. Rendering only the top gives "Write failed" and nothing else.
+    #[test]
+    fn the_whole_cause_chain_is_rendered() {
+        let error = BatchError::write(std::io::Error::other("deadlock detected: 40P01"));
+
+        let rendered = exit_message(&error);
+
+        assert!(rendered.contains("Write failed"), "{rendered}");
+        assert!(rendered.contains("deadlock detected: 40P01"), "{rendered}");
+    }
+
+    /// `CleanupFailed` nests a `BatchError` inside a `BatchError`, which is the
+    /// deepest chain the engine builds. Both halves have to survive.
+    #[test]
+    fn a_nested_batch_error_survives() {
+        let error = BatchError::write("boom").with_cleanup(Err(BatchError::repository("reset")));
+
+        let rendered = exit_message(&error);
+
+        assert!(rendered.contains("boom"), "{rendered}");
+        assert!(rendered.contains("reset"), "{rendered}");
+    }
+
+    /// Bounded, because the chain includes a user error whose `Display` this
+    /// crate does not control and the value goes into a database column.
+    #[test]
+    fn an_enormous_message_is_truncated_and_says_so() {
+        let error = BatchError::write("x".repeat(10_000));
+
+        let rendered = exit_message(&error);
+
+        assert!(rendered.len() <= MAX_EXIT_MESSAGE + " [truncated]".len());
+        assert!(
+            rendered.ends_with(" [truncated]"),
+            "truncation must be visible"
+        );
+    }
+
+    /// Truncating by byte index panics mid-character otherwise — and a message
+    /// carrying non-ASCII is exactly what a data-quality error looks like.
+    #[test]
+    fn truncation_lands_on_a_character_boundary() {
+        // 3 bytes per char, so the cut lands mid-character unless it is nudged.
+        let error = BatchError::write("日".repeat(5_000));
+
+        let rendered = exit_message(&error);
+
+        assert!(rendered.ends_with(" [truncated]"));
+        // Reaching here at all is the assertion: `String::truncate` panics on a
+        // non-boundary index.
+        assert!(rendered.len() <= MAX_EXIT_MESSAGE + " [truncated]".len());
+    }
+
+    /// The control: a short message is passed through untouched, so nothing
+    /// carries a truncation marker it did not earn.
+    ///
+    /// It also pins the no-duplication rule. `BatchError::Process` renders as
+    /// `"Process failed: {cause}"` *and* exposes that cause as `source`, so a
+    /// naive chain walk yields "Process failed: bad row 7: bad row 7" — which
+    /// this test caught.
+    #[test]
+    fn a_short_message_is_left_alone() {
+        let rendered = exit_message(&BatchError::process("bad row 7"));
+
+        assert_eq!(rendered, "Process failed: bad row 7");
+        assert!(!rendered.contains("truncated"));
+    }
+
+    /// The other half of that rule: a variant whose `Display` does *not*
+    /// interpolate its cause must still get it appended, or the detail is lost.
+    /// `SkipLimitExceeded` renders only "skip limit of N exceeded".
+    #[test]
+    fn a_cause_the_display_omits_is_still_appended() {
+        let error = BatchError::SkipLimitExceeded {
+            limit: 3,
+            cause: "bad row 7".into(),
+        };
+
+        let rendered = exit_message(&error);
+
+        assert!(rendered.contains("skip limit of 3 exceeded"), "{rendered}");
+        assert!(
+            rendered.contains("bad row 7"),
+            "the tipping error must survive: {rendered}"
+        );
     }
 }

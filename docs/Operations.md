@@ -156,8 +156,7 @@ Kubernetes will SIGKILL before the stop lands and you are back to the stale
 
 A job whose process died without recording a terminal status — SIGKILL, a
 machine loss, an OOM kill, or a panic under `panic = "abort"` — leaves an
-execution at `STARTED`. The framework cannot tell that from a job that is still
-running, because there is no heartbeat, so clearing it is an operator decision:
+execution at `STARTED`. Clearing it is an operator decision:
 
 ```rust
 launcher.repository().abandon_execution(execution_id).await?;
@@ -172,6 +171,27 @@ finished instance from being made relaunchable in two calls.
 
 An ordinary panic in user code does *not* need this — the engine catches it at
 its step and job boundaries and records `Failed`, which restarts normally.
+
+### Finding the candidates
+
+Every record carries a heartbeat, so a stale one is a query rather than a guess:
+
+```sql
+SELECT e.id, e.instance_id, e.created_at, e.last_updated, now() - e.last_updated AS silent_for
+  FROM job_execution e
+ WHERE e.status IN ('STARTING', 'STARTED')
+   AND e.last_updated < now() - interval '15 minutes'
+ ORDER BY e.last_updated;
+```
+
+A chunk commit writes its step execution, and the trigger moves `last_updated`
+with it — so a healthy step keeps its heartbeat moving and a dead process does
+not. Size the interval above your worst-case chunk duration, or you will abandon
+a job that is merely slow.
+
+**This still does not verify the process is gone.** It narrows the candidates;
+the judgement is yours. An automatic reaper is future work — see
+[PROD-4](audit/FINDINGS.md).
 
 ---
 
@@ -199,6 +219,29 @@ let handle = batchflow_metrics::install()?;   // once, at startup
 Counters are only published for work that committed, so
 `sum(batchflow_items_written_total)` reconciles with `sum(write_count)` in the
 metadata store. If they disagree, trust the store.
+
+### Asking the store directly
+
+Metrics are process-local and disappear with the process; the metadata store
+outlives it. Since PROD-2 it can answer the questions that actually get asked
+after an incident:
+
+```sql
+-- What ran last night, how long did it take, and why did anything fail?
+SELECT i.job_name, i.parameters, e.status, e.created_at,
+       e.ended_at - e.created_at AS duration, e.exit_message
+  FROM job_execution e
+  JOIN job_instance i ON i.id = e.instance_id
+ WHERE e.created_at >= current_date - 1
+ ORDER BY e.created_at DESC;
+
+-- Which step was it, and where did its bookmark get to?
+SELECT step_name, status, read_count, write_count, skip_count,
+       ended_at - created_at AS duration, exit_message, execution_context
+  FROM step_execution
+ WHERE job_execution_id = $1
+ ORDER BY id;
+```
 
 For correlating one specific run, use tracing rather than metrics: the `job` and
 `step` spans carry `instance_id`, `execution_id` and `step_execution_id`, which
@@ -288,11 +331,8 @@ Current as of 0.1.1. The full list with severities and proposed fixes is in
 [`docs/audit/FINDINGS.md`](audit/FINDINGS.md); these are the ones that change
 what an operator should do.
 
-- **No timestamps in the metadata store.** You cannot ask the store when a job
-  ran or how long it took; only the process's own metrics and logs know.
-- **No failure reason in the metadata store.** A failed execution records
-  `FAILED` and nothing else. Keep your log retention at least as long as your
-  metadata retention.
+- **No automatic reaper.** The heartbeat makes stale executions findable (§5),
+  but nothing acts on it: `abandon_execution` is still a human decision.
 - **No timeouts.** A writer that hangs hangs the job. Give your clients their
   own timeouts.
 - **No retention API.** See §3.

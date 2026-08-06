@@ -364,6 +364,162 @@ pub async fn only_one_of_two_concurrent_launches_wins<R: JobRepository>(reposito
     );
 }
 
+// -------------------------------------------- timestamps and exit message
+
+/// Every record carries when it was created, and it is the *store's* clock
+/// that says so.
+///
+/// Without this the store cannot answer "when did last night's job run", which
+/// is the first question anyone asks it.
+pub async fn a_new_execution_is_stamped_with_its_creation_time<R: JobRepository>(repository: &R) {
+    let execution = open_execution(repository, "nightly").await;
+
+    let created = execution
+        .timestamps()
+        .created_at()
+        .expect("a persisted execution must know when it was created");
+
+    // Reloaded, because the value returned by the constructor could have been
+    // stamped in this process rather than by the store.
+    let reloaded = repository
+        .last_execution(execution.instance_id())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(reloaded.timestamps().created_at(), Some(created));
+
+    // Not yet finished, so no end instant. This is also how "is it running?"
+    // is asked without parsing a status string.
+    assert_eq!(reloaded.timestamps().ended_at(), None);
+}
+
+/// A terminal status fixes the end instant, and `duration` becomes answerable.
+pub async fn reaching_a_terminal_status_records_when_it_ended<R: JobRepository>(repository: &R) {
+    let mut execution = open_execution(repository, "nightly").await;
+
+    execution.set_status(BatchStatus::Completed);
+    repository.update_execution(&execution).await.unwrap();
+
+    let reloaded = repository
+        .last_execution(execution.instance_id())
+        .await
+        .unwrap()
+        .unwrap();
+
+    let stamps = reloaded.timestamps();
+    assert!(
+        stamps.ended_at().is_some(),
+        "a completed execution must record when it ended"
+    );
+    assert!(
+        stamps.duration().is_some(),
+        "created_at and ended_at together must yield a duration"
+    );
+}
+
+/// The heartbeat. A store that never moves `last_updated` cannot distinguish a
+/// running execution from a crashed one, which is what makes
+/// [`JobRepository::abandon_execution`] a manual judgement today.
+pub async fn a_write_moves_the_heartbeat<R: JobRepository>(repository: &R) {
+    let execution = open_execution(repository, "nightly").await;
+    let opened = execution
+        .timestamps()
+        .last_updated()
+        .expect("a persisted execution must have a heartbeat");
+
+    let mut running = execution.clone();
+    running.set_status(BatchStatus::Started);
+    repository.update_execution(&running).await.unwrap();
+
+    let reloaded = repository
+        .last_execution(execution.instance_id())
+        .await
+        .unwrap()
+        .unwrap();
+    let beat = reloaded.timestamps().last_updated().unwrap();
+
+    assert!(
+        beat >= opened,
+        "the heartbeat must not go backwards: {beat:?} < {opened:?}"
+    );
+    // `created_at` is immutable — a store that reset it on every write would
+    // make every execution look like it had just begun.
+    assert_eq!(
+        reloaded.timestamps().created_at(),
+        execution.timestamps().created_at(),
+        "created_at must not move"
+    );
+}
+
+/// ERR-1: the store records *why*, not only *that*.
+///
+/// A failed execution used to persist `FAILED` and nothing else, leaving the
+/// cause in whatever log retention the process happened to have — unjoinable to
+/// the execution id, and invisible to anything querying the store from another
+/// service.
+pub async fn a_failure_reason_round_trips<R: JobRepository>(repository: &R) {
+    let mut execution = open_execution(repository, "nightly").await;
+
+    execution.set_status(BatchStatus::Failed);
+    execution.set_exit_message(Some("Write failed: deadlock detected: 40P01".to_owned()));
+    repository.update_execution(&execution).await.unwrap();
+
+    let reloaded = repository
+        .last_execution(execution.instance_id())
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(
+        reloaded.exit_message(),
+        Some("Write failed: deadlock detected: 40P01")
+    );
+}
+
+/// The control: a successful execution has nothing to explain, and a store that
+/// invented a message would be worse than one that stored none.
+pub async fn a_successful_execution_records_no_failure_reason<R: JobRepository>(repository: &R) {
+    let mut execution = open_execution(repository, "nightly").await;
+
+    execution.set_status(BatchStatus::Completed);
+    repository.update_execution(&execution).await.unwrap();
+
+    let reloaded = repository
+        .last_execution(execution.instance_id())
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(reloaded.exit_message(), None);
+}
+
+/// Step executions carry the same three instants and the same reason. A chunk
+/// commit writes this row, so its heartbeat is what a reaper would actually
+/// watch.
+pub async fn a_step_execution_carries_timestamps_and_a_reason<R: JobRepository>(repository: &R) {
+    let execution = open_execution(repository, "nightly").await;
+    let mut step = repository
+        .create_step_execution(execution.id(), "load")
+        .await
+        .unwrap();
+
+    assert!(
+        step.timestamps().created_at().is_some(),
+        "a persisted step execution must know when it was created"
+    );
+
+    step.set_status(BatchStatus::Failed);
+    step.set_exit_message(Some("bad row 7".to_owned()));
+    repository.update_step_execution(&step).await.unwrap();
+
+    let reloaded = repository.step_executions(execution.id()).await.unwrap();
+    let stamps = reloaded[0].timestamps();
+
+    assert_eq!(reloaded[0].exit_message(), Some("bad row 7"));
+    assert!(stamps.ended_at().is_some());
+    assert!(stamps.last_updated().is_some());
+}
+
 pub async fn update_execution_persists_a_status_change<R: JobRepository>(repository: &R) {
     let mut execution = open_execution(repository, "nightly").await;
     execution.set_status(BatchStatus::Completed);
@@ -919,6 +1075,12 @@ macro_rules! job_repository_conformance {
             start_execution_allows_a_terminal_unsuccessful_instance,
             start_execution_rejects_an_unknown_instance,
             only_one_of_two_concurrent_launches_wins,
+            a_new_execution_is_stamped_with_its_creation_time,
+            reaching_a_terminal_status_records_when_it_ended,
+            a_write_moves_the_heartbeat,
+            a_failure_reason_round_trips,
+            a_successful_execution_records_no_failure_reason,
+            a_step_execution_carries_timestamps_and_a_reason,
             update_execution_persists_a_status_change,
             update_execution_replaces_rather_than_appending,
             update_execution_rejects_an_unknown_execution,

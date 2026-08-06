@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE step_execution\n                SET status = $2, read_count = $3, write_count = $4,\n                    filter_count = $5, skip_count = $6, execution_context = $7,\n                    ended_at = CASE WHEN $8 THEN COALESCE(ended_at, now()) ELSE ended_at END,\n                    exit_message = $9\n              WHERE id = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Text",
+        "Int8",
+        "Int8",
+        "Int8",
+        "Int8",
+        "Jsonb",
+        "Bool",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "b93752bdd1b1febe9497f2f67792794781dc8bb9565fb82145693cfec25d11a3"
+}

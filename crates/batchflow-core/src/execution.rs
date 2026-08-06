@@ -1,6 +1,7 @@
 use crate::{ExecutionContext, StepContribution};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::time::{Duration, SystemTime};
 
 /// Where an execution is in its lifecycle.
 ///
@@ -161,6 +162,74 @@ impl JobInstance {
     }
 }
 
+/// When an execution was opened, last heard from, and finished.
+///
+/// # The store owns this clock
+///
+/// Every field is written by the [`JobRepository`](crate::JobRepository), never
+/// by the engine, and a backend uses its *own* clock to do it — `now()` in
+/// Postgres, not `SystemTime::now()` in this process. That is deliberate: it is
+/// the one clock every process writing to a shared store agrees on, so a
+/// duration computed across two replicas does not depend on how well their NTP
+/// is behaving.
+///
+/// The consequence for callers: these are read-only, and they are `None` on a
+/// value the engine has built but not yet persisted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Timestamps {
+    created_at: Option<SystemTime>,
+    ended_at: Option<SystemTime>,
+    last_updated: Option<SystemTime>,
+}
+
+impl Timestamps {
+    /// Builds a set, for a [`JobRepository`](crate::JobRepository) rebuilding a
+    /// record from storage. Application code reads these; it does not mint them.
+    #[must_use]
+    pub fn new(
+        created_at: Option<SystemTime>,
+        ended_at: Option<SystemTime>,
+        last_updated: Option<SystemTime>,
+    ) -> Self {
+        Self {
+            created_at,
+            ended_at,
+            last_updated,
+        }
+    }
+
+    /// When the row was inserted.
+    ///
+    /// There is deliberately no separate "started" instant: an execution is
+    /// opened already running, so this *is* when it started. See migration
+    /// `0003`.
+    pub fn created_at(&self) -> Option<SystemTime> {
+        self.created_at
+    }
+
+    /// When a terminal status was recorded, or `None` while it is still
+    /// running. Also how "is this finished?" is asked without parsing a status.
+    pub fn ended_at(&self) -> Option<SystemTime> {
+        self.ended_at
+    }
+
+    /// The heartbeat: when the store last saw a write for this record.
+    ///
+    /// A chunk commit updates its step execution, so a healthy step keeps this
+    /// moving. A `Started` execution whose `last_updated` is far older than its
+    /// chunk duration is a candidate for
+    /// [`abandon_execution`](crate::JobRepository::abandon_execution) — which is
+    /// the judgement a human currently has to make from outside the system.
+    pub fn last_updated(&self) -> Option<SystemTime> {
+        self.last_updated
+    }
+
+    /// How long the execution took, or `None` if it has not finished.
+    pub fn duration(&self) -> Option<Duration> {
+        self.ended_at?.duration_since(self.created_at?).ok()
+    }
+}
+
 /// A single *attempt* at a [`JobInstance`]. A failed instance can have several.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JobExecution {
@@ -168,6 +237,8 @@ pub struct JobExecution {
     instance_id: JobInstanceId,
     status: BatchStatus,
     execution_context: ExecutionContext,
+    timestamps: Timestamps,
+    exit_message: Option<String>,
 }
 
 impl JobExecution {
@@ -180,6 +251,8 @@ impl JobExecution {
             instance_id,
             status: BatchStatus::Starting,
             execution_context: ExecutionContext::new(),
+            timestamps: Timestamps::default(),
+            exit_message: None,
         }
     }
 
@@ -214,6 +287,31 @@ impl JobExecution {
     pub fn set_execution_context(&mut self, context: ExecutionContext) {
         self.execution_context = context;
     }
+
+    /// When this attempt was opened, last heard from, and finished.
+    pub fn timestamps(&self) -> Timestamps {
+        self.timestamps
+    }
+
+    /// Attaches timestamps read back from storage. Called by a
+    /// [`JobRepository`](crate::JobRepository), not by application code — the
+    /// store owns this clock.
+    pub fn set_timestamps(&mut self, timestamps: Timestamps) {
+        self.timestamps = timestamps;
+    }
+
+    /// Why this attempt failed, if it did and the store recorded it.
+    ///
+    /// The first question anyone asks about a failed batch job, and until
+    /// PROD-2 the store's only answer was the status.
+    pub fn exit_message(&self) -> Option<&str> {
+        self.exit_message.as_deref()
+    }
+
+    /// Records why this attempt ended. Persisting it is the caller's job.
+    pub fn set_exit_message(&mut self, message: Option<String>) {
+        self.exit_message = message;
+    }
 }
 
 /// One step's run within a [`JobExecution`]: its status, its counters and its
@@ -233,6 +331,8 @@ pub struct StepExecution {
     filter_count: usize,
     skip_count: usize,
     execution_context: ExecutionContext,
+    timestamps: Timestamps,
+    exit_message: Option<String>,
 }
 
 impl StepExecution {
@@ -254,6 +354,8 @@ impl StepExecution {
             filter_count: 0,
             skip_count: 0,
             execution_context: ExecutionContext::new(),
+            timestamps: Timestamps::default(),
+            exit_message: None,
         }
     }
 
@@ -312,6 +414,30 @@ impl StepExecution {
     /// Replaces the bookmark.
     pub fn set_execution_context(&mut self, context: ExecutionContext) {
         self.execution_context = context;
+    }
+
+    /// When this step execution was opened, last heard from, and finished.
+    ///
+    /// `last_updated` is the useful one here: a chunk commit writes this row,
+    /// so a healthy step keeps it moving and a stalled one does not.
+    pub fn timestamps(&self) -> Timestamps {
+        self.timestamps
+    }
+
+    /// Attaches timestamps read back from storage. Called by a
+    /// [`JobRepository`](crate::JobRepository), not by application code.
+    pub fn set_timestamps(&mut self, timestamps: Timestamps) {
+        self.timestamps = timestamps;
+    }
+
+    /// Why this step failed, if it did and the store recorded it.
+    pub fn exit_message(&self) -> Option<&str> {
+        self.exit_message.as_deref()
+    }
+
+    /// Records why this step ended. Persisting it is the caller's job.
+    pub fn set_exit_message(&mut self, message: Option<String>) {
+        self.exit_message = message;
     }
 
     /// Fold a step's reported deltas into this record.

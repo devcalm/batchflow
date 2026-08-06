@@ -155,6 +155,7 @@ impl<R: JobRepository> JobLauncher<R> {
 
         let status = crate::job::terminal_status(&outcome);
         execution.set_status(status);
+        execution.set_exit_message(outcome.as_ref().err().map(crate::exit_message));
         let recorded = self.repository.update_execution(&execution).await;
 
         if recorded.is_ok() {
@@ -510,6 +511,93 @@ mod tests {
             .await;
 
         assert!(matches!(result, Err(BatchError::Repository(_))));
+    }
+
+    // ---- timestamps and failure reason (audit PROD-2 / ERR-1) ----
+
+    /// End to end: a failed run leaves the store able to say *why*, not only
+    /// that it failed.
+    ///
+    /// Before this the answer was `FAILED` and nothing else, and the cause
+    /// existed only in whatever log retention the process happened to have —
+    /// unjoinable to the execution id without a tracing subscriber, and
+    /// invisible to anything querying the store from another service.
+    #[tokio::test]
+    async fn a_failed_run_records_why_it_failed() {
+        let launcher = JobLauncher::new(InMemoryJobRepository::default());
+        let mut job = failing_job();
+
+        launcher
+            .run(&mut job, &params("2026-08-06"))
+            .await
+            .unwrap_err();
+
+        let attempt = reload_last(&launcher, "2026-08-06").await;
+        assert_eq!(attempt.status(), BatchStatus::Failed);
+
+        let reason = attempt
+            .exit_message()
+            .expect("a failed execution must record its reason");
+        assert!(reason.contains("boom"), "{reason}");
+
+        // The step records its own, so an operator can tell *which* step failed
+        // without reading the job-level message.
+        let steps = launcher
+            .repository()
+            .step_executions(attempt.id())
+            .await
+            .unwrap();
+        assert!(steps[0].exit_message().unwrap().contains("boom"));
+    }
+
+    /// The control: a successful run explains nothing, because there is nothing
+    /// to explain. A store that invented a message would be worse than one that
+    /// stored none.
+    #[tokio::test]
+    async fn a_successful_run_records_no_reason_and_a_duration() {
+        let launcher = JobLauncher::new(InMemoryJobRepository::default());
+        let mut job = ok_job();
+
+        launcher.run(&mut job, &params("2026-08-06")).await.unwrap();
+
+        let attempt = reload_last(&launcher, "2026-08-06").await;
+        assert_eq!(attempt.exit_message(), None);
+
+        // "How long did last night's run take?" — unanswerable from the store
+        // before PROD-2.
+        let stamps = attempt.timestamps();
+        assert!(stamps.created_at().is_some());
+        assert!(stamps.ended_at().is_some());
+        assert!(
+            stamps.duration().is_some(),
+            "a finished execution must yield a duration"
+        );
+    }
+
+    /// A stop is not a failure, so it carries a reason that says so rather than
+    /// looking like a broken input file to whoever reads the store next.
+    #[tokio::test]
+    async fn a_stopped_run_records_its_reason_as_stopped() {
+        let stop = StopSignal::new();
+        stop.request();
+
+        let launcher =
+            JobLauncher::new(InMemoryJobRepository::default()).with_stop_signal(stop.clone());
+        let sink = SharedSink::new();
+        let mut job = stoppable_job(&sink, &StopSignal::new(), usize::MAX);
+
+        launcher
+            .run(&mut job, &params("2026-08-06"))
+            .await
+            .unwrap_err();
+
+        let attempt = reload_last(&launcher, "2026-08-06").await;
+        assert_eq!(attempt.status(), BatchStatus::Stopped);
+        assert!(
+            attempt.exit_message().unwrap().contains("stopped"),
+            "{:?}",
+            attempt.exit_message()
+        );
     }
 
     // ---- the launch gate is atomic (audit CONC-1) ----

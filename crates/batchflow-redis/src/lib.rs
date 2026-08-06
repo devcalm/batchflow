@@ -58,10 +58,12 @@
 use batchflow_core::{
     BatchError, BatchStatus, ExecutionContext, JobExecution, JobExecutionId, JobInstance,
     JobInstanceId, JobParameters, JobRepository, StepContribution, StepExecution, StepExecutionId,
+    Timestamps,
 };
 use redis::aio::ConnectionManager;
 use redis::{AsyncCommands, Script};
 use std::sync::LazyLock;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const STARTING: &str = "STARTING";
 const STARTED: &str = "STARTED";
@@ -186,6 +188,53 @@ fn encode_parameters(parameters: &JobParameters) -> Result<String, BatchError> {
     serde_json::to_string(parameters).map_err(BatchError::repository)
 }
 
+/// Milliseconds since the Unix epoch, which is how every instant is stored.
+///
+/// Redis has no timestamp type, so the representation is chosen here rather
+/// than by the server. Milliseconds because a chunk commit is the unit being
+/// timed and seconds would round most of them to zero.
+///
+/// Unlike Postgres, this is the *client's* clock — Redis offers `TIME`, but
+/// reading it would cost a round trip on every write. Two processes writing to
+/// one Redis therefore depend on their clocks agreeing, which is a real
+/// difference from the Postgres backend and is documented on the trait.
+fn now_millis() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |since| {
+            i64::try_from(since.as_millis()).unwrap_or(i64::MAX)
+        })
+}
+
+fn to_system_time(millis: i64) -> Option<SystemTime> {
+    u64::try_from(millis)
+        .ok()
+        .map(|millis| UNIX_EPOCH + Duration::from_millis(millis))
+}
+
+/// Reads the three stored instants back off a hash.
+fn timestamps_from(fields: &std::collections::HashMap<String, String>) -> Timestamps {
+    let at = |name: &str| {
+        fields
+            .get(name)
+            .and_then(|raw| raw.parse::<i64>().ok())
+            .and_then(to_system_time)
+    };
+
+    Timestamps::new(at("created_at"), at("ended_at"), at("last_updated"))
+}
+
+/// Whether a status is terminal, and therefore fixes `ended_at`.
+fn is_terminal(status: BatchStatus) -> bool {
+    matches!(
+        status,
+        BatchStatus::Completed
+            | BatchStatus::Failed
+            | BatchStatus::Stopped
+            | BatchStatus::Abandoned
+    )
+}
+
 fn count(value: i64) -> Result<usize, BatchError> {
     usize::try_from(value).map_err(|_| BatchError::repository(format!("negative counter {value}")))
 }
@@ -217,7 +266,8 @@ static CREATE_EXECUTION: LazyLock<Script> = LazyLock::new(|| {
     if redis.call('EXISTS', KEYS[2]) == 0 then return -1 end
     local id = redis.call('INCR', KEYS[1])
     redis.call('HSET', ARGV[4] .. ':execution:' .. id,
-               'instance_id', ARGV[1], 'status', ARGV[2], 'context', ARGV[3])
+               'instance_id', ARGV[1], 'status', ARGV[2], 'context', ARGV[3],
+               'created_at', ARGV[5], 'last_updated', ARGV[5])
     redis.call('RPUSH', KEYS[3], id)
     return id
 ",
@@ -245,7 +295,8 @@ static START_EXECUTION: LazyLock<Script> = LazyLock::new(|| {
 
     local id = redis.call('INCR', KEYS[1])
     redis.call('HSET', ARGV[4] .. ':execution:' .. id,
-               'instance_id', ARGV[1], 'status', ARGV[2], 'context', ARGV[3])
+               'instance_id', ARGV[1], 'status', ARGV[2], 'context', ARGV[3],
+               'created_at', ARGV[7], 'last_updated', ARGV[7])
     redis.call('RPUSH', KEYS[3], id)
     return {'ok', tostring(id)}
 ",
@@ -258,7 +309,19 @@ static UPDATE_EXECUTION: LazyLock<Script> = LazyLock::new(|| {
     Script::new(
         r"
     if redis.call('EXISTS', KEYS[1]) == 0 then return 0 end
-    redis.call('HSET', KEYS[1], 'status', ARGV[1], 'context', ARGV[2])
+    redis.call('HSET', KEYS[1], 'status', ARGV[1], 'context', ARGV[2],
+               'last_updated', ARGV[3])
+
+    -- `HSETNX`, so the first terminal write fixes the instant and a later one
+    -- cannot move it. The Postgres trigger gets the same property from
+    -- `ended_at` being written only when it is still NULL.
+    if ARGV[4] == '1' then redis.call('HSETNX', KEYS[1], 'ended_at', ARGV[3]) end
+
+    if ARGV[5] == '' then
+        redis.call('HDEL', KEYS[1], 'exit_message')
+    else
+        redis.call('HSET', KEYS[1], 'exit_message', ARGV[5])
+    end
     return 1
 ",
     )
@@ -273,7 +336,8 @@ static ABANDON_EXECUTION: LazyLock<Script> = LazyLock::new(|| {
     if redis.call('EXISTS', KEYS[1]) == 0 then return 'missing' end
     local status = redis.call('HGET', KEYS[1], 'status')
     if status == ARGV[1] then return status end
-    redis.call('HSET', KEYS[1], 'status', ARGV[2])
+    redis.call('HSET', KEYS[1], 'status', ARGV[2], 'last_updated', ARGV[3])
+    redis.call('HSETNX', KEYS[1], 'ended_at', ARGV[3])
     return 'ok'
 ",
     )
@@ -287,7 +351,8 @@ static CREATE_STEP_EXECUTION: LazyLock<Script> = LazyLock::new(|| {
     local id = redis.call('INCR', KEYS[1])
     redis.call('HSET', ARGV[4] .. ':step:' .. id,
                'job_execution_id', ARGV[1], 'step_name', ARGV[2], 'status', ARGV[3],
-               'context', '{}', 'read', 0, 'write', 0, 'filter', 0, 'skip', 0)
+               'context', '{}', 'read', 0, 'write', 0, 'filter', 0, 'skip', 0,
+               'created_at', ARGV[5], 'last_updated', ARGV[5])
     redis.call('RPUSH', KEYS[3], id)
     redis.call('RPUSH', ARGV[4] .. ':instance:' .. instance_id .. ':step:' .. ARGV[2], id)
     return id
@@ -300,7 +365,16 @@ static UPDATE_STEP_EXECUTION: LazyLock<Script> = LazyLock::new(|| {
         r"
     if redis.call('EXISTS', KEYS[1]) == 0 then return 0 end
     redis.call('HSET', KEYS[1], 'status', ARGV[1], 'context', ARGV[2],
-               'read', ARGV[3], 'write', ARGV[4], 'filter', ARGV[5], 'skip', ARGV[6])
+               'read', ARGV[3], 'write', ARGV[4], 'filter', ARGV[5], 'skip', ARGV[6],
+               'last_updated', ARGV[7])
+
+    if ARGV[8] == '1' then redis.call('HSETNX', KEYS[1], 'ended_at', ARGV[7]) end
+
+    if ARGV[9] == '' then
+        redis.call('HDEL', KEYS[1], 'exit_message')
+    else
+        redis.call('HSET', KEYS[1], 'exit_message', ARGV[9])
+    end
     return 1
 ",
     )
@@ -354,6 +428,8 @@ fn execution_from(
     execution.set_execution_context(decode_context(
         fields.get("context").map_or("{}", String::as_str),
     )?);
+    execution.set_timestamps(timestamps_from(fields));
+    execution.set_exit_message(fields.get("exit_message").cloned());
     Ok(execution)
 }
 
@@ -397,6 +473,9 @@ fn step_from(
     contribution.increment_filter(count(filter)?);
     contribution.increment_skip(count(skip)?);
     step.apply(&contribution);
+
+    step.set_timestamps(timestamps_from(fields));
+    step.set_exit_message(fields.get("exit_message").cloned());
 
     Ok(step)
 }
@@ -452,6 +531,10 @@ impl JobRepository for RedisJobRepository {
             .arg(step_execution.filter_count())
             .arg("skip")
             .arg(step_execution.skip_count())
+            // The heartbeat. This is the per-chunk write, so it is what a
+            // reaper would actually watch move.
+            .arg("last_updated")
+            .arg(now_millis())
             .ignore();
         Ok(())
     }
@@ -506,6 +589,7 @@ impl JobRepository for RedisJobRepository {
             .arg(STARTING)
             .arg("{}")
             .arg(NS)
+            .arg(now_millis())
             .invoke_async(&mut self.conn())
             .await
             .map_err(re)?;
@@ -515,7 +599,9 @@ impl JobRepository for RedisJobRepository {
                 "unknown instance {instance_id:?}"
             )));
         }
-        Ok(JobExecution::new(JobExecutionId::new(id), instance_id))
+        // Read back rather than stamped here, so the value a caller sees is the
+        // one the store actually holds.
+        self.load_execution(id).await
     }
 
     /// One script, so the gate and the insert cannot interleave. Redis's
@@ -535,6 +621,7 @@ impl JobRepository for RedisJobRepository {
             .arg(NS)
             .arg(COMPLETED)
             .arg(STARTING)
+            .arg(now_millis())
             .invoke_async(&mut self.conn())
             .await
             .map_err(re)?;
@@ -557,11 +644,7 @@ impl JobRepository for RedisJobRepository {
         };
 
         match tag {
-            "ok" => {
-                let mut execution = JobExecution::new(parsed()?, instance_id);
-                execution.set_status(BatchStatus::Started);
-                Ok(execution)
-            }
+            "ok" => self.load_execution(parsed()?.get()).await,
             "complete" => Err(BatchError::JobInstanceAlreadyComplete {
                 job_name: job_name.to_owned(),
                 instance_id,
@@ -584,6 +667,9 @@ impl JobRepository for RedisJobRepository {
             .key(execution_key(execution.id().get()))
             .arg(status_name(execution.status())?)
             .arg(encode_context(execution.execution_context())?)
+            .arg(now_millis())
+            .arg(i32::from(is_terminal(execution.status())))
+            .arg(execution.exit_message().unwrap_or_default())
             .invoke_async(&mut self.conn())
             .await
             .map_err(re)?;
@@ -635,6 +721,7 @@ impl JobRepository for RedisJobRepository {
             .key(execution_key(execution_id.get()))
             .arg(COMPLETED)
             .arg(ABANDONED)
+            .arg(now_millis())
             .invoke_async(&mut self.conn())
             .await
             .map_err(re)?;
@@ -664,6 +751,7 @@ impl JobRepository for RedisJobRepository {
             .arg(step_name)
             .arg(STARTING)
             .arg(NS)
+            .arg(now_millis())
             .invoke_async(&mut self.conn())
             .await
             .map_err(re)?;
@@ -673,11 +761,7 @@ impl JobRepository for RedisJobRepository {
                 "unknown job execution {job_execution_id:?}"
             )));
         }
-        Ok(StepExecution::new(
-            StepExecutionId::new(id),
-            job_execution_id,
-            step_name,
-        ))
+        self.load_step(id).await
     }
 
     async fn update_step_execution(
@@ -692,6 +776,9 @@ impl JobRepository for RedisJobRepository {
             .arg(step_execution.write_count())
             .arg(step_execution.filter_count())
             .arg(step_execution.skip_count())
+            .arg(now_millis())
+            .arg(i32::from(is_terminal(step_execution.status())))
+            .arg(step_execution.exit_message().unwrap_or_default())
             .invoke_async(&mut self.conn())
             .await
             .map_err(re)?;

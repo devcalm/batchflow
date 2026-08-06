@@ -145,7 +145,10 @@ pub trait JobRepository: Send + Sync {
     /// releasing its `JobInstance` so it can be launched again.
     ///
     /// An operator action: it asserts the process is dead, which the repository
-    /// cannot verify.
+    /// cannot verify. [`Timestamps::last_updated`](crate::Timestamps::last_updated)
+    /// narrows the candidates — an execution silent for far longer than its
+    /// chunk duration is a likely zombie — but a slow job and a dead one look
+    /// the same to the store.
     ///
     /// # Errors
     ///

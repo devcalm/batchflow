@@ -6,7 +6,7 @@ by pass order. Effort: XS < 1h · S ≈ 1d · M ≈ 2–3d · L > 1w.
 > **Status is tracked separately.** This file is the audit as taken at `46f276e`
 > and is left unedited so it stays a fixed reference point.
 > [PROGRESS.md](PROGRESS.md) records which of these have since been resolved —
-> 23 at the last update, including both Criticals and CONC-1.
+> 25 at the last update — and which were reassessed on closer inspection.
 
 ## Critical
 

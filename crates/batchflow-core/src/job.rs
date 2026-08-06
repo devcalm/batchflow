@@ -265,6 +265,11 @@ impl<Tx> Job<Tx> {
 
             let status = terminal_status(&outcome);
             step_execution.set_status(status);
+            // Recorded *before* the write below, so the store carries the
+            // reason and not just the status. Until PROD-2 a failed step said
+            // `FAILED` and nothing else, and the cause existed only in whatever
+            // log retention the process happened to have.
+            step_execution.set_exit_message(outcome.as_ref().err().map(crate::exit_message));
             let recorded = repository.update_step_execution(&step_execution).await;
 
             // After the write, so the metric cannot claim a terminal status the
