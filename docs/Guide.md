@@ -314,9 +314,32 @@ The three actions:
 **Retry is per chunk; skip is per item.** That is a consequence of the trait
 signatures, not a policy choice: `read` and `process` are per item, so the
 failing item is known and can be dropped. `write(&[Item])` is per chunk, so a
-write error names N items rather than one — which is why a skippable *write*
-error currently fails the step. Chunk scanning would close that; it is not
-implemented.
+write error names N items rather than one.
+
+To skip on the *write* side you have to find which item is bad, which is what
+chunk scanning does — off by default:
+
+```rust
+let fault = FaultTolerance::new()
+    .classifier(FeedClassifier)
+    .skip_limit(50)
+    .scan_on_write_failure(true);
+```
+
+On a write failure the chunk is re-written one item at a time in throwaway
+transactions that are always rolled back, and the survivors are then written
+once for real. It costs `N + 1` transactions and writes every good item twice —
+on the failure path only.
+
+**Think before enabling it with an `Unmanaged` writer.** The identifying pass
+rolls back, which for a writer that cannot enlist in a transaction means
+nothing: its rows were already sent. A thousand-item chunk with one bad row
+delivers roughly two thousand items. `Unmanaged` already means at-least-once, so
+nothing is promised and then broken — but that is a lot of duplicates to
+discover by accident.
+
+Note that scanning applies to a failed *write*, not a failed *commit*. A commit
+error names the transaction, not a row, so there is nothing in it to isolate.
 
 The `skip_limit` is **step-wide, not per chunk**: one bad row in each of a
 thousand chunks is a broken input file, and a per-chunk limit would call it

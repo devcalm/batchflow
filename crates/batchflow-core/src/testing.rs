@@ -242,6 +242,59 @@ impl ItemWriter for CollectingWriter {
     }
 }
 
+/// Fails any batch containing `poison`, and records every batch it was asked
+/// to write.
+///
+/// Writing a *batch* is what fails, so a chunk containing the poison item
+/// cannot succeed however often it is retried — only isolating the item can.
+/// `attempts` exposes the two passes a scan makes, which is otherwise invisible.
+pub(crate) struct PoisonWriter {
+    pub poison: u32,
+    pub attempts: Vec<Vec<u32>>,
+}
+
+impl PoisonWriter {
+    pub(crate) fn new(poison: u32) -> Self {
+        Self {
+            poison,
+            attempts: Vec::new(),
+        }
+    }
+}
+
+impl ItemWriter for PoisonWriter {
+    type Item = u32;
+
+    async fn write(&mut self, items: &[u32]) -> Result<(), BatchError> {
+        self.attempts.push(items.to_vec());
+        if items.contains(&self.poison) {
+            return Err(BatchError::write(format!(
+                "row {} is malformed",
+                self.poison
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// Succeeds on a single item and fails on any batch — so every item survives
+/// the identifying pass and the survivors still cannot be written together.
+///
+/// A real shape, not a contrived one: a unique constraint spanning two rows in
+/// the same chunk behaves exactly like this.
+pub(crate) struct BatchHostileWriter;
+
+impl ItemWriter for BatchHostileWriter {
+    type Item = u32;
+
+    async fn write(&mut self, items: &[u32]) -> Result<(), BatchError> {
+        if items.len() > 1 {
+            return Err(BatchError::write("this batch cannot be written together"));
+        }
+        Ok(())
+    }
+}
+
 /// Fails every write — pins the rule that counters are recorded only once the
 /// write has succeeded.
 pub(crate) struct FailingWriter;

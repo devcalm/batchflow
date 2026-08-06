@@ -54,6 +54,12 @@ rather than a diff.
 - Retry with exponential backoff (`RetryPolicy`), scoped to a chunk and always
   in a fresh transaction — reusing a rolled-back one fails to compile.
 - Skip with a step-wide `skip_limit`, counted in `skip_count` and persisted.
+- Chunk scanning (`FaultTolerance::scan_on_write_failure`), off by default: on a
+  write failure the chunk is re-written one item at a time to isolate the bad
+  row, then the survivors are committed. Costs `N + 1` transactions and writes
+  every good item twice, on the failure path only — and with an `Unmanaged`
+  writer the identifying pass really delivers, so read its docs before enabling
+  it.
 
 **Observability**
 - `tracing`: `job` and `step` spans, plus events for skips, retries and failed
@@ -88,9 +94,6 @@ rather than a diff.
 
 ### Known limitations
 
-- **Chunk scanning is not implemented.** A write failure names a chunk, not an
-  item, so `ErrorAction::Skip` cannot apply to the write phase; a skippable
-  write error currently fails the step.
 - **The launcher's gate is not race-free.** Instance identity is enforced by a
   unique constraint in Postgres, but reading the last execution and creating
   the next one are two statements outside a transaction, so two processes

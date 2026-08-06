@@ -18,8 +18,8 @@ against either the in-memory store or PostgreSQL.
 
 Pre-1.0, so the API may still change; breaking changes will be a minor version
 bump and are recorded in [CHANGELOG.md](CHANGELOG.md), which also lists the
-known limitations — chunk scanning, the launcher's gate race, and the absence
-of parallel steps.
+known limitations — the launcher's gate race and the absence of parallel
+steps.
 
 ```toml
 [dependencies]
@@ -44,12 +44,13 @@ cargo run -p batchflow --example hello_batch
 - Trait-based `ItemReader` / `ItemProcessor` / `ItemWriter`
 - Durable job metadata behind a `JobRepository` trait (in-memory, PostgreSQL, Redis)
 - Restart: skip completed steps, reopen the reader at the last committed chunk
-- Retry and skip driven by a `Classifier` over your own error type
+- Retry and skip driven by a `Classifier` over your own error type, including
+  optional chunk scanning to isolate a poison row on write failure
 - Metrics (`metrics`/Prometheus) and tracing (`tracing`/OpenTelemetry)
 - Integration with external schedulers (cron, Kubernetes CronJobs) rather than
   a bespoke scheduler
 
-Not yet: parallel or partitioned steps, chunk scanning, scheduling adapters.
+Not yet: parallel or partitioned steps, scheduling adapters.
 
 ## Crates
 

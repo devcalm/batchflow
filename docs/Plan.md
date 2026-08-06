@@ -114,12 +114,12 @@
 - **Narrow error variant over a general one.** `CannotAbandon { execution_id, status }` rather than `IllegalStatusTransition { from, to }` — there is exactly one status rule today, and generalising from one example guesses at what Phase 10 needs. Merge when a second real case appears.
 - **The ordering requirement became self-enforcing.** Create-then-check used to merely litter the store; with the `Starting` arm in place the launcher now rejects *its own* freshly-created execution (it is the most recent, and it is `Starting`). Mutation-tested: reordering fails 9 tests, not 1.
 
-## Phase 10 — Retry & Skip ☑ (10d chunk-scanning still `[OPEN]`)
+## Phase 10 — Retry & Skip ☑ (10d closed 2026-08-05)
 > **10a ☑** `Classifier` / `ErrorAction{Retry,Skip,Fail}` / `FailFast`; `BatchError`'s wrapping variants carry a `Cause` instead of a `String`.
 > **10b ☑** retry. Processing split from writing; the retry loop wraps `begin → write → commit`; `backon` supplies the backoff schedule; `ChunkStep::with_fault_tolerance` exposes it.
 > **10c ☑** skip. `skip_limit` + `ItemDisposition`; `skip_count` on `StepContribution`/`StepExecution`, persisted by migration `0002_skip_count.sql`.
 > **10e ☑** `PostgresClassifier` (SQLSTATE) + whole jobs through retry and skip against a real Postgres.
-> **10d ☐** chunk-scanning to isolate a poison item on write failure (FR-6.4) — a decision, not a task. See below.
+> **10d ☑** chunk-scanning to isolate a poison item on write failure (FR-6.4). Decided *for*, opt-in, off by default. See below.
 
 - **Goals:** retry classified transient errors with backoff; tolerate classified bad items up to a limit.
 - **Acceptance:** transient errors retried, bad items skipped and counted, fatal errors fail fast. **Testing:** injected failures in core; real SQLSTATEs and whole jobs in `batchflow-postgres`.
@@ -224,11 +224,17 @@ kept the failed transaction's work yields `[1,1,2,2,3,4]`. Verified by mutating 
 chunk before retrying. **The order of operations inside a test double decides whether a test is real or
 decorative, and only mutation testing tells you which one you wrote.**
 
-**10d is a decision, not a task `[OPEN]`.** Chunk-scanning means: on a write failure, re-run the chunk one item at
-a time to find the poison row. It buys write-level skip — the only way `ErrorAction::Skip` can ever apply to a
-write — and costs a second pass, N transactions instead of one, and a hard question about writers that are not
-idempotent (an `Unmanaged` writer has already sent its rows somewhere). Spring inherits it. Decide deliberately
-before writing any of it.
+**10d closed 2026-08-05: chunk-scanning inherited, opt-in, off by default.** `FaultTolerance::scan_on_write_failure(true)`. On a write failure the classifier calls skippable, the chunk is re-written one item at a time to find the poison row, and the survivors are committed.
+
+**The two-pass shape is forced by `ItemReader`, not chosen.** Each item is written alone in a throwaway transaction that is **always rolled back**, and only then are the survivors written once through the ordinary commit point. Committing item by item would be cheaper and wrong: `ItemReader::update` reports the reader's position, which after a chunk is read sits *past the whole chunk*, so there is no way to express "bookmark after item three". A crash midway through per-item commits would leave the bookmark at the previous chunk boundary with some items already durable, and the restart would write them again — breaking the exactly-once property the framework exists for. Paying `N + 1` transactions on the failure path is the cheaper side of that trade. Same lesson as 10b-1 and 10c-1: **read the trait signature to find where the policy boundary must go.**
+
+**The non-idempotent-writer question, answered rather than dodged.** For a `TransactionalWriter` the identifying pass rolls back and is invisible. For an `Unmanaged` writer it really delivers: a 1000-item chunk with one bad row sends roughly 2000 items. **No promise is broken** — `Unmanaged` is already an explicit acceptance of at-least-once — but the amplification is severe enough that scanning is opt-in and the rustdoc says so where the person switching it on will read it. That is why the default is `false`.
+
+**Scanning triggers on a failed *write*, never a failed *commit*.** A commit error names the transaction, not a row; there is nothing in it to isolate. `should_scan` is deliberately not consulted on that path.
+
+**A `scanned` flag bounds the loop.** The survivors each wrote cleanly alone, so if the batch still fails the failure is real (a unique constraint spanning two rows in one chunk behaves exactly this way) and rescanning would find nothing to skip. **Mutation-verified, and the signature is worth remembering: removing the guard makes the test *hang*, not fail** — it compiles clean, prints `running 1 test`, and dies to SIGALRM. A missing loop bound does not announce itself as a failure. (`timeout` does not exist on macOS; `perl -e 'alarm shift; exec @ARGV'` is the portable substitute, and an earlier run that appeared to confirm the hang had in fact exited 127, command-not-found — absence of output is not evidence.)
+
+Two other mutations, both caught: committing instead of rolling back in the identifying pass fails 3 tests including `the_identifying_pass_commits_nothing`, and ignoring the opt-in flag fails `scanning_is_off_by_default`. New metric `batchflow_chunk_scans_total`, and skips from this phase are labelled `phase="write"` alongside the existing `read` and `process`.
 
 ## Phase 11 — Transactions ☑
 > **11a ☑** the commit point exists. `StepCommit` trait; `run_step` commits per chunk; `Job::run` supplies a `RepositoryCommit` owning the `StepExecution`.
@@ -472,7 +478,7 @@ at all three `with_cleanup` sites. Nothing from the original Phase 13 sketch is 
 
 **Phase 18 acceptance.** Guide covers concepts and recipes ☑; `#![warn(missing_docs)]` reports zero across all four crates and `RUSTDOCFLAGS="-D warnings" cargo doc` is clean ☑; CHANGELOG and SemVer metadata ☑. **Not met: "docs.rs clean" cannot be verified before publishing** — the crate-local `.sqlx` fix is what makes it plausible, and it stays a claim until a real docs.rs build runs.
 
-**Still open for a release:** publish itself (core-first), a `v0.1.0` tag, and release automation. 10d chunk-scanning remains `[OPEN]`; Phases 14 (scheduling adapters) and 15 (Redis, backend conformance suite) are unstarted and both additive, so neither blocks 0.1.0.
+**Still open for a release:** publish itself (core-first), a `v0.1.0` tag, and release automation. Phase 14 (scheduling adapters) is the only untouched phase and is additive, so it does not block 0.1.0.
 
 ---
 
@@ -486,9 +492,9 @@ Postgres integration tests need Docker running. They are part of the gate, not a
 ## Current position (2026-08-03)
 **Version bumped to 0.1.0 in the manifests on 2026-08-05, and nothing is published.** Publish order is `batchflow-core` → wait for the index → `batchflow` → `batchflow-postgres` / `batchflow-redis` / `batchflow-metrics`.
 
-Phase 0 ◐ docs (tech-eval open items) · 1 ☑ workspace · 2 ☑ traits · 3 ☑ Job + typestate `JobBuilder` · 4 ◐ step model (tasklet trait pending) · 5 ☑ engine · 6 ◐ chunk processing (property tests pending; **tuning guide closed by `docs/Performance.md`**) · 7 ☑ JobRepository · 8 ☑ ExecutionContext · 9 ☑ restart · **10 ☑ retry & skip** (10d chunk-scanning `[OPEN]`) · 11 ☑ transactions · 12 ☑ metrics · 12.5 ☑ CI · 13 ☑ tracing · 14 ☐ scheduling · **15 ☑ storage backends** · **16 ☑ examples** · **17 ☑ performance** · **18 ☑ documentation**.
+Phase 0 ◐ docs (tech-eval open items) · 1 ☑ workspace · 2 ☑ traits · 3 ☑ Job + typestate `JobBuilder` · 4 ◐ step model (tasklet trait pending) · 5 ☑ engine · 6 ◐ chunk processing (property tests pending; **tuning guide closed by `docs/Performance.md`**) · 7 ☑ JobRepository · 8 ☑ ExecutionContext · 9 ☑ restart · **10 ☑ retry & skip** · 11 ☑ transactions · 12 ☑ metrics · 12.5 ☑ CI · 13 ☑ tracing · 14 ☐ scheduling · **15 ☑ storage backends** · **16 ☑ examples** · **17 ☑ performance** · **18 ☑ documentation**.
 
-**The roadmap was completed out of order, and that is worth stating rather than hiding behind a row of ticks.** 16, 17 and 18 were promoted past 14 (scheduling adapters) and 15 (Redis + backend conformance suite) because those two are *additive* — a new crate and a new `JobRepository` impl break nothing — while 17 and 18 had to land before the API froze at 0.1.0. So the release path is complete and two numbered phases behind it are untouched. Remaining work, none of it blocking a release: publish · 14 scheduling adapters · 10d chunk-scanning `[OPEN]` · Phase 4's tasklet trait · Phase 6's property tests · Phase 0's tech-eval items.
+**The roadmap was completed out of order, and that is worth stating rather than hiding behind a row of ticks.** 16, 17 and 18 were promoted past 14 (scheduling adapters) and 15 (Redis + backend conformance suite) because those two are *additive* — a new crate and a new `JobRepository` impl break nothing — while 17 and 18 had to land before the API froze at 0.1.0. So the release path is complete and two numbered phases behind it are untouched. Remaining work, none of it blocking a release: publish · 14 scheduling adapters · Phase 4's tasklet trait · Phase 6's property tests · Phase 0's tech-eval items.
 
 **151 tests green across the whole workspace, Docker up, 2026-08-05** — 116 `batchflow-core` unit · **2 `batchflow-core` integration (`tests/allocations.rs`, new in 17)** · 3 `batchflow` integration · 3 `batchflow-metrics` unit · 2 `batchflow-postgres` unit · 18 Postgres integration (6 classifier · 3 fault-tolerance · 9 repository) · 7 doctests across five crates. Exactly the previous 149 plus the two new allocation tests, which confirms Phase 17 left the Postgres path untouched — worth checking rather than assuming, since core's `Cargo.toml` gained a dev-dependency and a `[[bench]]` target. `cargo fmt --check`, `cargo clippy --workspace --all-targets -D warnings` and `RUSTDOCFLAGS="-D warnings" cargo doc` all clean.
 

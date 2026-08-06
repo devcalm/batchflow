@@ -1,6 +1,6 @@
 use crate::metrics::{
-    CHUNK_DURATION, CHUNK_RETRIES, CHUNKS_COMMITTED, ITEMS_FILTERED, ITEMS_READ, ITEMS_SKIPPED,
-    ITEMS_WRITTEN, LABEL_JOB, LABEL_PHASE, LABEL_STEP,
+    CHUNK_DURATION, CHUNK_RETRIES, CHUNK_SCANS, CHUNKS_COMMITTED, ITEMS_FILTERED, ITEMS_READ,
+    ITEMS_SKIPPED, ITEMS_WRITTEN, LABEL_JOB, LABEL_PHASE, LABEL_STEP,
 };
 use crate::{BatchError, ExecutionContext, FaultTolerance, ItemDisposition};
 use crate::{ItemProcessor, ItemReader, TransactionalWriter};
@@ -26,8 +26,10 @@ pub(crate) struct ChunkMetrics {
     items_filtered: Counter,
     skipped_reading: Counter,
     skipped_processing: Counter,
+    skipped_writing: Counter,
     chunks_committed: Counter,
     retries: Counter,
+    scans: Counter,
     chunk_duration: Histogram,
 }
 
@@ -41,6 +43,8 @@ impl ChunkMetrics {
             items_filtered: counter!(ITEMS_FILTERED, LABEL_JOB => job.clone(), LABEL_STEP => step.clone()),
             skipped_reading: counter!(ITEMS_SKIPPED, LABEL_JOB => job.clone(), LABEL_STEP => step.clone(), LABEL_PHASE => "read"),
             skipped_processing: counter!(ITEMS_SKIPPED, LABEL_JOB => job.clone(), LABEL_STEP => step.clone(), LABEL_PHASE => "process"),
+            skipped_writing: counter!(ITEMS_SKIPPED, LABEL_JOB => job.clone(), LABEL_STEP => step.clone(), LABEL_PHASE => "write"),
+            scans: counter!(CHUNK_SCANS, LABEL_JOB => job.clone(), LABEL_STEP => step.clone()),
             chunks_committed: counter!(CHUNKS_COMMITTED, LABEL_JOB => job.clone(), LABEL_STEP => step.clone()),
             retries: counter!(CHUNK_RETRIES, LABEL_JOB => job.clone(), LABEL_STEP => step.clone()),
             chunk_duration: histogram!(CHUNK_DURATION, LABEL_JOB => job, LABEL_STEP => step),
@@ -162,6 +166,62 @@ async fn back_off(backoff: &mut impl Iterator<Item = Duration>) {
     }
 }
 
+/// Finds the poison items in a failed chunk, returning the ones that survive.
+///
+/// Two passes, and the split is forced rather than chosen. Each item is written
+/// **alone in a throwaway transaction that is always rolled back**, so this pass
+/// commits nothing and a crash inside it is invisible. The survivors are then
+/// written once, for real, through the ordinary commit point.
+///
+/// Committing item by item instead would be cheaper and wrong:
+/// [`ItemReader::update`] reports the reader's position, which after a chunk is
+/// read sits *past the whole chunk*. There is no way to express "bookmark after
+/// item three", so a crash midway would leave the bookmark at the previous
+/// chunk boundary with some items already durable — and the restart would write
+/// them again. Exactly-once is the framework's reason to exist; paying `N + 1`
+/// transactions on the failure path is the cheaper side of that trade.
+async fn scan_chunk<W, Tx>(
+    writer: &mut W,
+    commit: &mut dyn StepCommit<Tx>,
+    items: Vec<W::Item>,
+    fault: &FaultTolerance,
+    skipped: &mut usize,
+) -> Result<Vec<W::Item>, BatchError>
+where
+    W: TransactionalWriter<Tx>,
+    Tx: Send,
+{
+    let mut survivors = Vec::with_capacity(items.len());
+
+    for item in items {
+        let mut tx = commit.begin().await?;
+        let outcome = writer.write(&mut tx, std::slice::from_ref(&item)).await;
+
+        // Rolled back whether or not the write succeeded: this pass exists to
+        // ask a question, never to answer it durably.
+        if let Err(rollback_error) = commit.rollback(tx).await {
+            tracing::error!(
+                error = %rollback_error,
+                "rollback failed during chunk scan; the transaction is in an unknown state"
+            );
+            return Err(rollback_error);
+        }
+
+        match outcome {
+            Ok(()) => survivors.push(item),
+            Err(error) => match fault.disposition(error, *skipped) {
+                ItemDisposition::Skip(error) => {
+                    *skipped += 1;
+                    tracing::warn!(phase = "write", skipped = *skipped, error = %error, "item skipped");
+                }
+                ItemDisposition::Fail(error) => return Err(error),
+            },
+        }
+    }
+
+    Ok(survivors)
+}
+
 pub(crate) async fn run_step<R, P, W, Tx>(
     reader: &mut R,
     processor: &mut P,
@@ -208,17 +268,20 @@ where
         // has only the outputs to work with, never the inputs.
         let processed = process_chunk(processor, chunk, fault, &mut skipped).await?;
         let skipped_processing = skipped - skipped_before - skipped_reading;
+        let skipped_after_process = skipped;
 
-        let mut chunk_contribution = StepContribution::new();
-        chunk_contribution.increment_read(read);
-        chunk_contribution.increment_write(processed.items.len());
-        chunk_contribution.increment_filter(processed.filtered);
-        chunk_contribution.increment_skip(skipped - skipped_before);
+        // Owned rather than borrowed: a chunk scan replaces this list with the
+        // items that survived it.
+        let mut items = processed.items;
 
         // 1-based, counting total attempts rather than retries after the first.
         let mut attempt = 1u32;
         // Fresh per chunk: each chunk's backoff starts from `min_delay` again.
         let mut backoff = fault.backoff();
+        // A scan yields items that each wrote cleanly on their own. If writing
+        // them together still fails, that is a genuine failure of the batch -
+        // rescanning would find nothing and loop forever.
+        let mut scanned = false;
 
         loop {
             // The commit interval is the transaction boundary: the items
@@ -231,7 +294,7 @@ where
             // rejects every further statement on it (Postgres: 25P02).
             let mut tx = commit.begin().await?;
 
-            if let Err(error) = writer.write(&mut tx, &processed.items).await {
+            if let Err(error) = writer.write(&mut tx, &items).await {
                 // Roll back *before* backing off. Sleeping on an open
                 // transaction holds its row locks and its pooled connection for
                 // the whole delay, which is how one deadlock becomes a pile-up
@@ -256,10 +319,35 @@ where
                     attempt += 1;
                     continue;
                 }
+
+                // A retry re-writes the same chunk, so it cannot help when one
+                // item in it is bad. Scanning is what turns "this chunk failed"
+                // into "this item failed" (FR-6.4).
+                if !scanned && fault.should_scan(&error) {
+                    items = scan_chunk(writer, commit, items, fault, &mut skipped).await?;
+                    scanned = true;
+                    metrics.scans.increment(1);
+                    if items.is_empty() {
+                        // Every item was poison. There is nothing left to write,
+                        // but the skips still have to be counted and the
+                        // bookmark still has to advance past them - otherwise a
+                        // restart re-reads the same doomed chunk forever.
+                        tracing::warn!("every item in the chunk was skipped");
+                    }
+                    continue;
+                }
                 return Err(error);
             }
 
             reader.update(context);
+
+            // Built here rather than before the loop: a scan changes both the
+            // number of items written and the number skipped.
+            let mut chunk_contribution = StepContribution::new();
+            chunk_contribution.increment_read(read);
+            chunk_contribution.increment_write(items.len());
+            chunk_contribution.increment_filter(processed.filtered);
+            chunk_contribution.increment_skip(skipped - skipped_before);
 
             match commit.commit(tx, &chunk_contribution, context).await {
                 Ok(()) => break,
@@ -295,14 +383,15 @@ where
             .record(chunk_start.elapsed().as_secs_f64());
         metrics.chunks_committed.increment(1);
         metrics.items_read.increment(read as u64);
-        metrics
-            .items_written
-            .increment(processed.items.len() as u64);
+        metrics.items_written.increment(items.len() as u64);
         metrics.items_filtered.increment(processed.filtered as u64);
         metrics.skipped_reading.increment(skipped_reading as u64);
         metrics
             .skipped_processing
             .increment(skipped_processing as u64);
+        metrics
+            .skipped_writing
+            .increment((skipped - skipped_after_process) as u64);
     }
 
     Ok(())
@@ -1262,5 +1351,201 @@ mod tests {
             "rollback failed; the transaction is in an unknown state",
         );
         assert_eq!(failures.len(), 1, "{events:#?}");
+    }
+}
+
+#[cfg(test)]
+mod scan_tests {
+    use super::*;
+    use crate::metrics::{CHUNK_SCANS, ITEMS_SKIPPED};
+    use crate::testing::{
+        BatchHostileWriter, CommitEvent, PoisonWriter, RecordingCommit, SkipAll, VecReader,
+        counter, nz, recorded,
+    };
+    use crate::{ExecutionContext, Unmanaged};
+
+    struct Identity;
+
+    impl ItemProcessor for Identity {
+        type In = u32;
+        type Out = u32;
+
+        async fn process(&mut self, item: u32) -> Result<Option<u32>, BatchError> {
+            Ok(Some(item))
+        }
+    }
+
+    fn scanning(skip_limit: usize) -> FaultTolerance {
+        FaultTolerance::new()
+            .classifier(SkipAll)
+            .skip_limit(skip_limit)
+            .scan_on_write_failure(true)
+    }
+
+    async fn run(
+        items: Vec<u32>,
+        poison: u32,
+        fault: FaultTolerance,
+        chunk_size: usize,
+    ) -> (Result<(), BatchError>, RecordingCommit, Vec<Vec<u32>>) {
+        let mut reader = VecReader::new(items);
+        let mut processor = Identity;
+        let mut writer = Unmanaged(PoisonWriter::new(poison));
+        let mut commit = RecordingCommit::new();
+        let mut context = ExecutionContext::new();
+        let config = ChunkConfig {
+            chunk_size: nz(chunk_size),
+            fault: &fault,
+            metrics: ChunkMetrics::new("nightly", "load"),
+        };
+
+        let result = run_step(
+            &mut reader,
+            &mut processor,
+            &mut writer,
+            &config,
+            &mut context,
+            &mut commit,
+        )
+        .await;
+
+        (result, commit, writer.0.attempts)
+    }
+
+    /// FR-6.4: one bad row no longer costs the whole chunk.
+    #[tokio::test]
+    async fn a_poison_item_is_isolated_and_the_rest_of_the_chunk_commits() {
+        let (result, commit, _) = run(vec![1, 2, 3], 2, scanning(5), 3).await;
+
+        result.unwrap();
+        assert_eq!(commit.total.write_count(), 2);
+        assert_eq!(commit.total.skip_count(), 1);
+        assert_eq!(commit.total.read_count(), 3);
+    }
+
+    /// The crash-safety property, and the reason the scan is two passes rather
+    /// than a stream of per-item commits: every transaction the identifying
+    /// pass opens is rolled back, and exactly one commit happens at the end.
+    #[tokio::test]
+    async fn the_identifying_pass_commits_nothing() {
+        let (result, commit, _) = run(vec![1, 2, 3], 2, scanning(5), 3).await;
+        result.unwrap();
+
+        // batch attempt + 3 single-item probes + the real write.
+        assert_eq!(commit.begins, 5);
+        assert_eq!(commit.rollbacks, 4);
+        assert_eq!(commit.commits, 1);
+        assert_eq!(*commit.events.last().unwrap(), CommitEvent::Commit);
+        assert_eq!(
+            commit
+                .events
+                .iter()
+                .filter(|e| **e == CommitEvent::Commit)
+                .count(),
+            1
+        );
+    }
+
+    /// The cost, asserted rather than described: every good item is written
+    /// twice — once to ask whether it is the poison one, once for real.
+    #[tokio::test]
+    async fn a_scan_writes_every_good_item_twice() {
+        let (result, _, attempts) = run(vec![1, 2, 3], 2, scanning(5), 3).await;
+        result.unwrap();
+
+        assert_eq!(
+            attempts,
+            vec![
+                vec![1, 2, 3], // the batch that failed
+                vec![1],       // identifying pass
+                vec![2],       // the poison item
+                vec![3],
+                vec![1, 3], // the survivors, for real
+            ]
+        );
+    }
+
+    /// Off unless asked for. Scanning costs a second pass and, with an
+    /// `Unmanaged` writer, real duplicate delivery.
+    #[tokio::test]
+    async fn scanning_is_off_by_default() {
+        let fault = FaultTolerance::new().classifier(SkipAll).skip_limit(5);
+        let (result, commit, _) = run(vec![1, 2, 3], 2, fault, 3).await;
+
+        result.unwrap_err();
+        assert_eq!(commit.commits, 0);
+    }
+
+    #[tokio::test]
+    async fn a_scan_that_exceeds_the_skip_limit_fails_the_step() {
+        let (result, _, _) = run(vec![1, 2, 3], 2, scanning(0), 3).await;
+
+        let error = result.unwrap_err();
+        assert!(
+            matches!(error, BatchError::SkipLimitExceeded { limit: 0, .. }),
+            "expected SkipLimitExceeded, got {error:?}"
+        );
+    }
+
+    /// A scanned chunk's survivors each wrote cleanly alone, so if the batch
+    /// still fails the failure is real — rescanning would find nothing to skip
+    /// and spin forever.
+    ///
+    /// Removing the `scanned` guard makes this **hang** rather than fail, which
+    /// is the honest signature of a missing loop bound.
+    #[tokio::test]
+    async fn a_chunk_is_scanned_at_most_once() {
+        let fault = scanning(5);
+        let mut reader = VecReader::new(vec![1, 2, 3]);
+        let mut processor = Identity;
+        let mut writer = Unmanaged(BatchHostileWriter);
+        let mut commit = RecordingCommit::new();
+        let mut context = ExecutionContext::new();
+        let config = ChunkConfig {
+            chunk_size: nz(3),
+            fault: &fault,
+            metrics: ChunkMetrics::new("nightly", "load"),
+        };
+
+        let result = run_step(
+            &mut reader,
+            &mut processor,
+            &mut writer,
+            &config,
+            &mut context,
+            &mut commit,
+        )
+        .await;
+
+        result.unwrap_err();
+        assert_eq!(commit.commits, 0);
+        // One batch attempt, three probes, one retry of the survivors: five.
+        assert_eq!(commit.begins, 5, "a second scan would push this higher");
+    }
+
+    #[tokio::test]
+    async fn a_fully_poisoned_chunk_skips_everything_and_still_advances() {
+        let (result, commit, _) = run(vec![2, 2], 2, scanning(5), 2).await;
+
+        result.unwrap();
+        assert_eq!(commit.total.write_count(), 0);
+        assert_eq!(commit.total.skip_count(), 2);
+        assert_eq!(commit.commits, 1, "the bookmark must still advance");
+    }
+
+    /// Sync, not `#[tokio::test]`: `recorded` scopes a thread-local recorder
+    /// and `block_on` builds its own runtime, so an outer one would nest.
+    #[test]
+    fn a_write_skip_is_counted_under_its_own_phase() {
+        let snapshot = recorded(|| {
+            crate::testing::block_on(async {
+                run(vec![1, 2, 3], 2, scanning(5), 3).await.0.unwrap();
+            });
+        });
+
+        assert_eq!(counter(&snapshot, ITEMS_SKIPPED, Some("write")), Some(1));
+        assert_eq!(counter(&snapshot, ITEMS_SKIPPED, Some("read")), Some(0));
+        assert_eq!(counter(&snapshot, ITEMS_SKIPPED, Some("process")), Some(0));
+        assert_eq!(counter(&snapshot, CHUNK_SCANS, None), Some(1));
     }
 }

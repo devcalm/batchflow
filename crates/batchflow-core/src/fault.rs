@@ -101,6 +101,7 @@ pub struct FaultTolerance {
     classifier: Box<dyn Classifier>,
     retry: RetryPolicy,
     skip_limit: usize,
+    scan_on_write_failure: bool,
 }
 
 impl Default for FaultTolerance {
@@ -111,6 +112,7 @@ impl Default for FaultTolerance {
             classifier: Box::new(FailFast),
             retry: RetryPolicy::none(),
             skip_limit: 0,
+            scan_on_write_failure: false,
         }
     }
 }
@@ -125,6 +127,7 @@ impl std::fmt::Debug for FaultTolerance {
             .field("classifier", &format_args!("<dyn Classifier>"))
             .field("retry", &self.retry)
             .field("skip_limit", &self.skip_limit)
+            .field("scan_on_write_failure", &self.scan_on_write_failure)
             .finish()
     }
 }
@@ -161,11 +164,34 @@ impl FaultTolerance {
         self
     }
 
+    /// Isolate the poison item when a *write* fails and the classifier calls
+    /// the error skippable (FR-6.4).
+    ///
+    /// Off by default, and the cost is why. The chunk is re-written one item at
+    /// a time in throwaway transactions to find which item is bad, then the
+    /// survivors are written again for real — so every good item in a failed
+    /// chunk is written **twice**, in `N + 1` transactions instead of one. That
+    /// happens only on the failure path.
+    ///
+    /// # With an [`Unmanaged`](crate::Unmanaged) writer
+    ///
+    /// The identifying pass rolls back, which for a writer that cannot enlist
+    /// in a transaction means nothing at all: its rows have already been sent.
+    /// A thousand-item chunk with one bad row delivers roughly two thousand
+    /// items. `Unmanaged` is already an acceptance of at-least-once, so no
+    /// promise is broken — but the amplification is severe enough to decide
+    /// deliberately rather than switch on out of optimism.
+    #[must_use]
+    pub fn scan_on_write_failure(mut self, scan: bool) -> Self {
+        self.scan_on_write_failure = scan;
+        self
+    }
+
     /// Whether `error`, seen on 1-based `attempt`, gets another try.
     ///
-    /// [`ErrorAction::Skip`] answers `false` here. A write error names a whole
-    /// chunk, not an item, so there is nothing this can single out to skip —
-    /// isolating the poison item needs chunk-scanning (FR-6.4, Phase 10d).
+    /// [`ErrorAction::Skip`] answers `false` here: a retry re-writes the same
+    /// chunk, which cannot help when one item in it is bad. That case is
+    /// [`scan_on_write_failure`](Self::scan_on_write_failure)'s.
     pub fn should_retry(&self, error: &BatchError, attempt: u32) -> bool {
         self.classifier.classify(error) == ErrorAction::Retry && attempt < self.retry.max_attempts()
     }
@@ -192,6 +218,14 @@ impl FaultTolerance {
                 cause: error.into(),
             })
         }
+    }
+
+    /// Whether a failed *write* should be scanned item by item.
+    ///
+    /// Deliberately not consulted for a failed **commit**: a commit error names
+    /// the transaction, not a row, so there is nothing in it to isolate.
+    pub(crate) fn should_scan(&self, error: &BatchError) -> bool {
+        self.scan_on_write_failure && self.classifier.classify(error) == ErrorAction::Skip
     }
 
     pub(crate) fn backoff(&self) -> impl Iterator<Item = Duration> {

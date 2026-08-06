@@ -61,10 +61,16 @@ everything else (async runtime, DB, serialization, tracing, metrics).
   is opt-in per step. Requires errors to *carry* their cause: the wrapping `BatchError` variants hold a boxed
   `Cause`, since a stringified `sqlx::Error` cannot be classified. `PostgresClassifier` maps SQLSTATE and lives in
   `batchflow-postgres` — core never learns a SQLSTATE.
-- FR-6.4 Chunk-scanning on write failure to isolate a poison item. `[OPEN]` — decide whether to inherit.
-  Now the *only* gap in FR-6: a write error names N items, so `ErrorAction::Skip` cannot apply to one. Isolating the
-  poison row means a second one-at-a-time pass — N transactions instead of one, and an unresolved question about
-  writers that are not idempotent (an `Unmanaged` writer has already sent its rows somewhere).
+- FR-6.4 **Chunk-scanning** on write failure to isolate a poison item. `[BUILT]` — inherited, opt-in via
+  `FaultTolerance::scan_on_write_failure(true)`, off by default.
+  A write error names N items, so `ErrorAction::Skip` could not apply to one. The scan is **two passes, and the split
+  is forced rather than chosen**: each item is written alone in a throwaway transaction that is *always rolled back*,
+  then the survivors are written once through the ordinary commit point. Committing item by item would be cheaper and
+  wrong — `ItemReader::update` reports a position *past the whole chunk*, so there is no way to express "bookmark
+  after item three", and a crash midway would leave the bookmark behind items already durable. Cost: `N + 1`
+  transactions and every good item written twice, on the failure path only. With an `Unmanaged` writer the
+  identifying pass really delivers, so a 1000-item chunk with one bad row sends ~2000 items — no promise is broken
+  (`Unmanaged` is already at-least-once) but it is documented as a reason to opt in deliberately.
 - FR-6.5 Dead-letter routing for skipped items. `[FUTURE]`
   Note the gap this leaves today: a skipped item is counted and then **gone**. `skip_count` says how many rows were
   discarded and nothing says which.

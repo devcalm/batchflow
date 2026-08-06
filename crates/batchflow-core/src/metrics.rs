@@ -52,6 +52,13 @@ pub const LABEL_STATUS: &str = "status";
 /// Where an item was dropped: `read` or `process`.
 pub const LABEL_PHASE: &str = "phase";
 
+/// Counter: chunks re-written one item at a time to isolate a poison row.
+///
+/// Labels: [`LABEL_JOB`], [`LABEL_STEP`]. A non-zero rate means chunks are
+/// failing on a single bad item and every good item in them is being written
+/// twice — worth an alert, not just a graph.
+pub const CHUNK_SCANS: &str = "batchflow_chunk_scans_total";
+
 /// The label value for a status.
 ///
 /// Spelled out per variant rather than with a wildcard: `BatchStatus` is
