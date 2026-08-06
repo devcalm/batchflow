@@ -3,6 +3,7 @@
 //! Core traits and execution engine for BatchFlow.
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
+#![warn(missing_debug_implementations)]
 
 mod chunk;
 mod error;
@@ -11,7 +12,9 @@ mod fault;
 mod item;
 mod job;
 mod launcher;
+mod panic;
 mod step;
+mod stop;
 mod tasklet;
 
 mod classifier;
@@ -48,4 +51,5 @@ pub use launcher::JobLauncher;
 pub use memory::InMemoryJobRepository;
 pub use repository::JobRepository;
 pub use step::{ChunkStep, Step, StepCommit, StepContribution, StepIdentity};
+pub use stop::StopSignal;
 pub use tasklet::{RepeatStatus, Tasklet, TaskletStep, TransactionalTasklet};

@@ -84,6 +84,33 @@ impl ExecutionContext {
         self.0.is_empty()
     }
 
+    /// How many keys are stored.
+    ///
+    /// Worth knowing because this map is serialized into the metadata store on
+    /// **every chunk commit** — a context that grows without bound makes every
+    /// commit interval more expensive, and a reader that accumulates rather
+    /// than overwrites its bookmark is the usual cause.
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Removes `key`, returning what was there.
+    ///
+    /// For a reader that has finished with a bookmark: leaving a stale one
+    /// behind means the next attempt reads a position that no longer describes
+    /// anything.
+    pub fn remove(&mut self, key: &str) -> Option<ContextValue> {
+        self.0.remove(key)
+    }
+
+    /// Every entry, in key order.
+    ///
+    /// For diagnostics — dumping what a step recorded — rather than for the
+    /// read path, where the typed getters tell "absent" from "wrong type".
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &ContextValue)> {
+        self.0.iter().map(|(key, value)| (key.as_str(), value))
+    }
+
     /// Read `key` as an `i64`.
     ///
     /// Three outcomes that must stay distinct:

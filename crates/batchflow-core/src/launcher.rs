@@ -1,6 +1,6 @@
 use crate::metrics::{JOBS_FINISHED, JOBS_STARTED, LABEL_JOB, LABEL_STATUS, status_label};
 use crate::tracing::SPAN_JOB;
-use crate::{BatchError, BatchStatus, Job, JobExecution, JobParameters, JobRepository};
+use crate::{BatchError, BatchStatus, Job, JobExecution, JobParameters, JobRepository, StopSignal};
 use ::metrics::counter;
 use ::tracing::Instrument;
 
@@ -12,18 +12,42 @@ use ::tracing::Instrument;
 #[derive(Debug)]
 pub struct JobLauncher<R> {
     repository: R,
+    stop: StopSignal,
 }
 
 impl<R: JobRepository> JobLauncher<R> {
     /// Takes ownership of the metadata store every launch will record into.
+    ///
+    /// The launcher starts with a [`StopSignal`] nobody holds a handle to, so
+    /// jobs run to completion unless [`with_stop_signal`](Self::with_stop_signal)
+    /// hands one in.
     #[must_use]
     pub fn new(repository: R) -> Self {
-        Self { repository }
+        Self {
+            repository,
+            stop: StopSignal::new(),
+        }
+    }
+
+    /// Lets `stop` end running jobs at their next commit boundary.
+    ///
+    /// Shared rather than owned: the point is that something else — a signal
+    /// handler, an admin endpoint — holds the other half. See [`StopSignal`]
+    /// for why this is not the same as dropping the job's future.
+    #[must_use]
+    pub fn with_stop_signal(mut self, stop: StopSignal) -> Self {
+        self.stop = stop;
+        self
     }
 
     /// The repository, for callers that need to query metadata directly.
     pub fn repository(&self) -> &R {
         &self.repository
+    }
+
+    /// The signal this launcher's jobs check at their commit boundaries.
+    pub fn stop_signal(&self) -> &StopSignal {
+        &self.stop
     }
 
     /// A job may only run against a repository whose transaction type it was
@@ -105,14 +129,26 @@ impl<R: JobRepository> JobLauncher<R> {
             execution_id = execution.id().get(),
         );
 
-        let outcome = job.run(&execution, &self.repository).instrument(span).await;
+        // The second panic boundary. `Job::run` already guards each step, so
+        // what is left here is a panic in the repository itself or in the
+        // job's own bookkeeping — which would skip the terminal status write
+        // below just as surely.
+        let outcome = crate::panic::guarded(
+            Box::pin(job.run(&execution, &self.repository, &self.stop)),
+            |detail| BatchError::Panic { detail },
+        )
+        .instrument(span)
+        .await;
 
-        let status = if outcome.is_ok() {
-            BatchStatus::Completed
-        } else {
-            BatchStatus::Failed
-        };
+        if let Err(BatchError::Panic { ref detail }) = outcome {
+            tracing::error!(
+                job = %job.name(),
+                panic = %detail,
+                "job panicked; failing the execution so the instance is not left blocked"
+            );
+        }
 
+        let status = crate::job::terminal_status(&outcome);
         execution.set_status(status);
         let recorded = self.repository.update_execution(&execution).await;
 
@@ -149,9 +185,9 @@ mod tests {
     use super::*;
     use crate::metrics::{LABEL_STEP, STEP_DURATION, STEPS_FINISHED, STEPS_STARTED};
     use crate::testing::{
-        BookmarkReader, CollectingWriter, EvenDoubler, FailingStep, LogStep, PoisonProcessor,
-        Recorded, SharedSink, SkipAll, StatusWriteFails, VecReader, block_on, captured, counter,
-        events_named, labels_of, nz, recorded,
+        BookmarkReader, CollectingWriter, EvenDoubler, FailingStep, LogStep, PanickingStep,
+        PoisonProcessor, Recorded, SharedSink, SkipAll, StatusWriteFails, VecReader, block_on,
+        captured, counter, events_named, labels_of, nz, recorded, without_panic_output,
     };
     use crate::tracing::SPAN_STEP;
     use crate::{
@@ -468,6 +504,220 @@ mod tests {
             .await;
 
         assert!(matches!(result, Err(BatchError::Repository(_))));
+    }
+
+    // ---- graceful stop (audit PROD-1) ----
+
+    /// A writer that raises the stop signal partway, standing in for a SIGTERM
+    /// arriving mid-job.
+    struct StopAfter {
+        sink: SharedSink,
+        stop: StopSignal,
+        after: usize,
+        writes: usize,
+    }
+
+    impl crate::ItemWriter for StopAfter {
+        type Item = u32;
+
+        async fn write(&mut self, items: &[u32]) -> Result<(), BatchError> {
+            self.writes += 1;
+            self.sink.record(items);
+
+            if self.writes == self.after {
+                self.stop.request();
+            }
+            Ok(())
+        }
+    }
+
+    fn stoppable_job(sink: &SharedSink, stop: &StopSignal, after: usize) -> Job {
+        Job::new(
+            "nightly",
+            vec![Box::new(ChunkStep::new(
+                "load",
+                BookmarkReader::new(vec![2, 4, 6, 8]),
+                EvenDoubler,
+                Unmanaged(StopAfter {
+                    sink: sink.clone(),
+                    stop: stop.clone(),
+                    after,
+                    writes: 0,
+                }),
+                nz(2),
+            ))],
+        )
+    }
+
+    /// The whole feature in one test: a stop mid-job leaves a `Stopped`
+    /// execution whose committed work is durable, and a relaunch finishes the
+    /// job without re-writing anything.
+    ///
+    /// Without the signal the only way to end this job is to drop its future,
+    /// which leaves `Started` behind and makes the relaunch below fail with
+    /// `JobExecutionAlreadyRunning`.
+    #[tokio::test]
+    async fn a_stopped_job_records_stopped_and_resumes_where_it_left_off() {
+        let stop = StopSignal::new();
+        let launcher =
+            JobLauncher::new(InMemoryJobRepository::default()).with_stop_signal(stop.clone());
+        let sink = SharedSink::new();
+
+        // The first chunk commits, then the stop lands; the second chunk is
+        // never read.
+        let mut first = stoppable_job(&sink, &stop, 1);
+        let error = launcher
+            .run(&mut first, &params("2026-08-06"))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, BatchError::Stopped), "{error:?}");
+        assert_eq!(sink.written(), vec![4, 8], "one chunk, committed");
+
+        let stopped = reload_last(&launcher, "2026-08-06").await;
+        assert_eq!(stopped.status(), BatchStatus::Stopped);
+
+        // The step is Stopped too, so the restart re-runs it rather than
+        // skipping it as complete.
+        let steps = launcher
+            .repository()
+            .step_executions(stopped.id())
+            .await
+            .unwrap();
+        assert_eq!(steps[0].status(), BatchStatus::Stopped);
+        assert_eq!(steps[0].read_count(), 2);
+
+        // A new process would build a fresh signal against the same store; here
+        // that is the same launcher with the raised signal swapped out. No
+        // `abandon_execution` in between — `Stopped` is already restartable.
+        let launcher = launcher.with_stop_signal(StopSignal::new());
+        let mut second = stoppable_job(&sink, &StopSignal::new(), usize::MAX);
+        let execution = launcher
+            .run(&mut second, &params("2026-08-06"))
+            .await
+            .unwrap();
+
+        assert_eq!(execution.status(), BatchStatus::Completed);
+        // Ignoring the bookmark would give [4, 8, 4, 8, 12, 16].
+        assert_eq!(sink.written(), vec![4, 8, 12, 16]);
+    }
+
+    /// A stop raised before the launch does no work at all, rather than one
+    /// chunk's worth. The check sits before the read for exactly this.
+    #[tokio::test]
+    async fn a_stop_raised_before_the_first_chunk_writes_nothing() {
+        let stop = StopSignal::new();
+        stop.request();
+
+        let launcher =
+            JobLauncher::new(InMemoryJobRepository::default()).with_stop_signal(stop.clone());
+        let sink = SharedSink::new();
+
+        let mut job = stoppable_job(&sink, &StopSignal::new(), usize::MAX);
+        let error = launcher
+            .run(&mut job, &params("2026-08-06"))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, BatchError::Stopped));
+        assert!(sink.written().is_empty());
+        assert_eq!(
+            reload_last(&launcher, "2026-08-06").await.status(),
+            BatchStatus::Stopped
+        );
+    }
+
+    /// The control: an unraised signal changes nothing. Without it, a stop
+    /// check that always fired would still pass the tests above.
+    #[tokio::test]
+    async fn an_unraised_signal_lets_the_job_complete() {
+        let launcher =
+            JobLauncher::new(InMemoryJobRepository::default()).with_stop_signal(StopSignal::new());
+        let sink = SharedSink::new();
+
+        let mut job = stoppable_job(&sink, &StopSignal::new(), usize::MAX);
+        let execution = launcher.run(&mut job, &params("2026-08-06")).await.unwrap();
+
+        assert_eq!(execution.status(), BatchStatus::Completed);
+        assert_eq!(sink.written(), vec![4, 8, 12, 16]);
+    }
+
+    /// `Stopped` is a distinct label, not folded into `failed`: a routine
+    /// deploy and a broken input file must not read the same on a dashboard.
+    #[test]
+    fn a_stopped_run_publishes_finished_as_stopped() {
+        let snapshot = recorded(|| {
+            block_on(async {
+                let stop = StopSignal::new();
+                stop.request();
+
+                let launcher = JobLauncher::new(InMemoryJobRepository::default())
+                    .with_stop_signal(stop.clone());
+                let sink = SharedSink::new();
+                let mut job = stoppable_job(&sink, &StopSignal::new(), usize::MAX);
+
+                assert!(launcher.run(&mut job, &params("2026-08-06")).await.is_err());
+            });
+        });
+
+        assert_eq!(with_status(&snapshot, JOBS_FINISHED, "stopped"), Some(1));
+        assert_eq!(with_status(&snapshot, JOBS_FINISHED, "failed"), None);
+        assert_eq!(with_status(&snapshot, STEPS_FINISHED, "stopped"), Some(1));
+    }
+
+    // ---- the panic boundary (audit SEC-1) ----
+
+    /// The whole point of the boundary: an `unwrap()` in user code must leave
+    /// an execution that can be *restarted*, not one stuck at `Started`.
+    ///
+    /// Without it the unwind skips both terminal status writes, the store keeps
+    /// showing `Started`, and every later launch of this instance is refused
+    /// with `JobExecutionAlreadyRunning` naming a process that has already
+    /// died — recoverable only by an operator calling `abandon_execution`.
+    ///
+    /// Sync, not `#[tokio::test]`: the panic hook has to be suppressed around
+    /// the poll that panics, and a hook swap cannot span an `.await`.
+    #[test]
+    fn a_panicking_step_is_recorded_as_failed_rather_than_left_started() {
+        let launcher = JobLauncher::new(InMemoryJobRepository::default());
+        let mut job = Job::new("nightly", vec![Box::new(PanickingStep)]);
+
+        let error =
+            without_panic_output(|| block_on(launcher.run(&mut job, &params("2026-08-06"))))
+                .unwrap_err();
+
+        // The panic reaches the caller as an error, with its message.
+        let BatchError::Panic { detail } = &error else {
+            panic!("expected BatchError::Panic, got {error:?}");
+        };
+        assert!(detail.contains("Option::unwrap()"), "{detail}");
+
+        // ...and, the actual point, the execution is terminal.
+        let attempt = block_on(reload_last(&launcher, "2026-08-06"));
+        assert_eq!(attempt.status(), BatchStatus::Failed);
+
+        // The step's own record is terminal too, so a restart re-runs it
+        // rather than skipping it as complete.
+        let steps = block_on(launcher.repository().step_executions(attempt.id())).unwrap();
+        assert_eq!(steps.len(), 1);
+        assert_eq!(steps[0].status(), BatchStatus::Failed);
+    }
+
+    /// The consequence that matters operationally: the instance is not blocked.
+    /// A relaunch is accepted and can succeed, with no `abandon_execution` in
+    /// between — which is exactly what would be required without the boundary.
+    #[test]
+    fn an_instance_whose_step_panicked_can_be_relaunched() {
+        let launcher = JobLauncher::new(InMemoryJobRepository::default());
+
+        let mut panicking = Job::new("nightly", vec![Box::new(PanickingStep)]);
+        without_panic_output(|| block_on(launcher.run(&mut panicking, &params("2026-08-06"))))
+            .unwrap_err();
+
+        let mut retry = ok_job();
+        let execution = block_on(launcher.run(&mut retry, &params("2026-08-06"))).unwrap();
+
+        assert_eq!(execution.status(), BatchStatus::Completed);
     }
 
     // ---- restart (FR-5) ----

@@ -5,7 +5,7 @@ use crate::metrics::{
 use crate::tracing::SPAN_STEP;
 use crate::{
     BatchStatus, ExecutionContext, JobExecution, JobRepository, Step, StepCommit, StepContribution,
-    StepExecution, StepIdentity,
+    StepExecution, StepIdentity, StopSignal,
 };
 use ::metrics::{counter, histogram};
 use ::tracing::Instrument;
@@ -22,10 +22,15 @@ struct RepositoryCommit<'a, R> {
     repository: &'a R,
     step_execution: &'a mut StepExecution,
     job_name: &'a str,
+    stop: &'a StopSignal,
 }
 
 #[async_trait]
 impl<R: JobRepository> StepCommit<R::Tx> for RepositoryCommit<'_, R> {
+    fn stop_requested(&self) -> bool {
+        self.stop.is_requested()
+    }
+
     fn identity(&self) -> StepIdentity<'_> {
         StepIdentity {
             job_name: self.job_name,
@@ -167,10 +172,17 @@ impl<Tx> Job<Tx> {
     ///
     /// The first failing step stops the job, after its own record is persisted
     /// as `Failed`.
+    ///
+    /// `stop` is checked by each step at its commit boundaries; a step that
+    /// honours it is recorded as `Stopped` and the job returns
+    /// [`BatchError::Stopped`] without running the steps after it. Pass
+    /// `&StopSignal::new()` for a job that cannot be stopped —
+    /// [`JobLauncher::run`](crate::JobLauncher::run) passes its own.
     pub async fn run<R>(
         &mut self,
         job_execution: &JobExecution,
         repository: &R,
+        stop: &StopSignal,
     ) -> Result<(), BatchError>
     where
         R: JobRepository<Tx = Tx>,
@@ -223,20 +235,35 @@ impl<Tx> Job<Tx> {
             // Counters and bookmark are now persisted by the step at each of
             // its commit points, not here — so a crash mid-step leaves the work
             // that did commit recorded.
+            //
+            // Wrapped in the panic boundary because everything below this line
+            // is what records the terminal status: an unwind through here skips
+            // it and leaves the step `Started` forever. `Step::run` is
+            // `#[async_trait]`, so the future is already boxed and `Unpin`.
             let outcome = {
                 let mut commit = RepositoryCommit {
                     repository,
                     step_execution: &mut step_execution,
                     job_name,
+                    stop,
                 };
-                step.run(&mut context, &mut commit).instrument(span).await
+
+                crate::panic::guarded(step.run(&mut context, &mut commit), |detail| {
+                    BatchError::Panic { detail }
+                })
+                .instrument(span)
+                .await
             };
 
-            let status = if outcome.is_ok() {
-                BatchStatus::Completed
-            } else {
-                BatchStatus::Failed
-            };
+            if let Err(BatchError::Panic { ref detail }) = outcome {
+                tracing::error!(
+                    step = %step.name(),
+                    panic = %detail,
+                    "step panicked; failing it so the execution does not stay Started"
+                );
+            }
+
+            let status = terminal_status(&outcome);
             step_execution.set_status(status);
             let recorded = repository.update_step_execution(&step_execution).await;
 
@@ -267,6 +294,26 @@ impl<Tx> Job<Tx> {
     /// The job's name. Half of the identity key, with its parameters.
     pub fn name(&self) -> &str {
         &self.name
+    }
+}
+
+/// The status to persist for an outcome.
+///
+/// Three-way rather than ok/failed: a stop is *not success*, so it cannot be
+/// `Completed` — a `Completed` step is skipped on restart, and the whole point
+/// of stopping is that the restart finishes it. It is also not a failure, and
+/// recording it as one would put a routine deploy in the same bucket as a
+/// broken input file for anyone reading `batchflow_steps_finished_total`.
+///
+/// Only the outermost error is inspected. A [`BatchError::CleanupFailed`]
+/// wrapping a stop means the stop happened *and* the tidying up after it
+/// failed, which is a failure — the metadata is stale and needs an operator,
+/// not a relaunch.
+pub(crate) fn terminal_status(outcome: &Result<(), BatchError>) -> BatchStatus {
+    match outcome {
+        Ok(()) => BatchStatus::Completed,
+        Err(BatchError::Stopped) => BatchStatus::Stopped,
+        Err(_) => BatchStatus::Failed,
     }
 }
 
@@ -308,6 +355,24 @@ pub struct JobBuilder<State = NoSteps, Tx = ()> {
     name: String,
     steps: Vec<Box<dyn Step<Tx>>>,
     _state: PhantomData<State>,
+}
+
+/// Hand-written for the same reason [`Job`]'s is: the steps are
+/// `Box<dyn Step<Tx>>`, which carries no `Debug` bound.
+impl<State, Tx> std::fmt::Debug for JobBuilder<State, Tx> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("JobBuilder")
+            .field("name", &self.name)
+            .field(
+                "steps",
+                &self
+                    .steps
+                    .iter()
+                    .map(|step| step.name())
+                    .collect::<Vec<_>>(),
+            )
+            .finish()
+    }
 }
 
 impl<State, Tx> JobBuilder<State, Tx> {
@@ -377,7 +442,9 @@ mod tests {
         );
         let mut job = Job::new("test-name", vec![Box::new(chunk_step), Box::new(LogStep)]);
 
-        job.run(&execution, &repository).await.unwrap();
+        job.run(&execution, &repository, &StopSignal::new())
+            .await
+            .unwrap();
 
         let steps = repository.step_executions(execution.id()).await.unwrap();
 
@@ -402,7 +469,11 @@ mod tests {
 
         let mut job = Job::new("test-name", vec![Box::new(FailingStep), Box::new(LogStep)]);
 
-        assert!(job.run(&execution, &repository).await.is_err());
+        assert!(
+            job.run(&execution, &repository, &StopSignal::new())
+                .await
+                .is_err()
+        );
 
         let steps = repository.step_executions(execution.id()).await.unwrap();
 
@@ -425,7 +496,9 @@ mod tests {
         );
         let mut job = Job::new("test-name", vec![Box::new(chunk_step)]);
 
-        job.run(&execution, &repository).await.unwrap();
+        job.run(&execution, &repository, &StopSignal::new())
+            .await
+            .unwrap();
 
         let steps = repository.step_executions(execution.id()).await.unwrap();
 
@@ -450,7 +523,11 @@ mod tests {
         );
         let mut job = Job::new("test-name", vec![Box::new(chunk_step)]);
 
-        assert!(job.run(&execution, &repository).await.is_err());
+        assert!(
+            job.run(&execution, &repository, &StopSignal::new())
+                .await
+                .is_err()
+        );
 
         let steps = repository.step_executions(execution.id()).await.unwrap();
 
@@ -477,7 +554,9 @@ mod tests {
         );
         let mut job = Job::new("test-name", vec![Box::new(chunk_step)]);
 
-        job.run(&execution, &repository).await.unwrap();
+        job.run(&execution, &repository, &StopSignal::new())
+            .await
+            .unwrap();
 
         let steps = repository.step_executions(execution.id()).await.unwrap();
         assert_eq!(
@@ -507,7 +586,9 @@ mod tests {
 
         assert_eq!(job.name(), "test-name");
 
-        job.run(&execution, &repository).await.unwrap();
+        job.run(&execution, &repository, &StopSignal::new())
+            .await
+            .unwrap();
 
         let steps = repository.step_executions(execution.id()).await.unwrap();
         let names: Vec<&str> = steps.iter().map(|s| s.step_name()).collect();
@@ -574,7 +655,9 @@ mod tests {
         );
         let mut job = Job::new("test-name", vec![Box::new(step)]);
 
-        job.run(&execution, &*repository).await.unwrap();
+        job.run(&execution, &*repository, &StopSignal::new())
+            .await
+            .unwrap();
 
         // Two items read and a bookmark at 2 — the first chunk, already durable.
         // Before this change the snapshot was `(0, None)`.
@@ -603,7 +686,11 @@ mod tests {
         );
         let mut job = Job::new("test-name", vec![Box::new(step)]);
 
-        assert!(job.run(&execution, &repository).await.is_err());
+        assert!(
+            job.run(&execution, &repository, &StopSignal::new())
+                .await
+                .is_err()
+        );
 
         let steps = repository.step_executions(execution.id()).await.unwrap();
 
@@ -636,6 +723,6 @@ mod tests {
         let mut job = Job::new("test-name", vec![]);
         let execution = JobExecution::new(JobExecutionId::new(1), JobInstanceId::new(1));
 
-        assert_send(job.run(&execution, &repository));
+        assert_send(job.run(&execution, &repository, &StopSignal::new()));
     }
 }

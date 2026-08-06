@@ -48,6 +48,8 @@ cargo run -p batchflow --example hello_batch
 - Restart: skip completed steps, reopen the reader at the last committed chunk
 - Retry and skip driven by a `Classifier` over your own error type, including
   optional chunk scanning to isolate a poison row on write failure
+- Graceful stop at a committed chunk boundary, so a rolling deploy leaves a
+  restartable job rather than a wedged one
 - Metrics (`metrics`/Prometheus) and tracing (`tracing`/OpenTelemetry)
 - Adapters for external schedulers (cron, Kubernetes CronJobs) rather than a
   bespoke scheduler — the framework classifies what a firing produced and lets
@@ -62,16 +64,26 @@ Not yet: parallel or partitioned steps, built-in CSV/JSON/SQL readers.
 | [`batchflow`](crates/batchflow) | The facade — depend on this | 1.85 |
 | [`batchflow-core`](crates/batchflow-core) | Traits and execution engine | 1.85 |
 | [`batchflow-postgres`](crates/batchflow-postgres) | PostgreSQL metadata store | 1.94 |
-| [`batchflow-redis`](crates/batchflow-redis) | Redis metadata store (needs `appendfsync always`) | 1.88 |
+| [`batchflow-redis`](crates/batchflow-redis) | Redis metadata store (needs `appendfsync always`, `noeviction`) | 1.88 |
 | [`batchflow-metrics`](crates/batchflow-metrics) | Prometheus exporter | 1.85 |
 | [`batchflow-scheduler`](crates/batchflow-scheduler) | Trigger semantics; `cron` feature for in-process cron | 1.85 |
 
 ## Documentation
 
 - [Guide](docs/Guide.md) — concepts and recipes
-- [Examples](docs/Examples.md) — four runnable programs
+- [Operations](docs/Operations.md) — deploying, sizing, stopping, and what to alert on
+- [Examples](docs/Examples.md) — five runnable programs
 - [Performance](docs/Performance.md) — measured overhead and how to pick a chunk size
 - [Architecture](docs/Architecture.md) · [Requirements](docs/Requirements.md)
+- [Audit](docs/audit/00-Summary.md) — engineering review and what has been acted on
+
+## Contributing
+
+[CONTRIBUTING.md](CONTRIBUTING.md) covers the two non-obvious prerequisites:
+the backend test suites need Docker, and `DATABASE_URL` must stay unset so that
+`sqlx` validates against the committed offline cache. Participation is governed
+by the [Code of Conduct](CODE_OF_CONDUCT.md); vulnerabilities go through
+[SECURITY.md](SECURITY.md), not the issue tracker.
 
 ## License
 

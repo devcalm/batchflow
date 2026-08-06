@@ -222,6 +222,13 @@ where
     Ok(survivors)
 }
 
+/// Opens the reader, drives the chunk loop, and closes the collaborators
+/// whatever the loop did.
+///
+/// `close` runs on the failure path too, because a writer that buffers still
+/// holds part of the last chunk when the step gives up — and a flush error
+/// there is data reported written that is not. It is paired with `open`: a
+/// reader whose `open` failed never opened, so nothing is closed.
 pub(crate) async fn run_step<R, P, W, Tx>(
     reader: &mut R,
     processor: &mut P,
@@ -236,14 +243,51 @@ where
     W: TransactionalWriter<Tx, Item = P::Out>, // writer consumes what the processor produces
     Tx: Send,
 {
+    reader.open(context).await?;
+
+    let outcome = chunk_loop(reader, processor, writer, config, context, commit).await;
+
+    // Reverse acquisition order, and both are attempted even if the first
+    // fails: a reader left holding a file handle because the writer's flush
+    // errored is a leak with no upside.
+    let closed = match (writer.close().await, reader.close().await) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+        (Err(error), Err(during_reader_close)) => Err(error.with_cleanup(Err(during_reader_close))),
+    };
+
+    match (outcome, closed) {
+        (Ok(()), Ok(())) => Ok(()),
+        // A flush that failed is data the step reported written and did not
+        // write, so a clean loop with a failed close is still a failed step.
+        (Ok(()), Err(error)) => Err(error),
+        (Err(error), Ok(())) => Err(error),
+        // The loop's failure is the cause; failing to close while handling it
+        // is a consequence — the same precedence as a failed rollback.
+        (Err(error), Err(during_close)) => Err(error.with_cleanup(Err(during_close))),
+    }
+}
+
+async fn chunk_loop<R, P, W, Tx>(
+    reader: &mut R,
+    processor: &mut P,
+    writer: &mut W,
+    config: &ChunkConfig<'_>,
+    context: &mut ExecutionContext,
+    commit: &mut dyn StepCommit<Tx>,
+) -> Result<(), BatchError>
+where
+    R: ItemReader,
+    P: ItemProcessor<In = R::Item>,
+    W: TransactionalWriter<Tx, Item = P::Out>,
+    Tx: Send,
+{
     let ChunkConfig {
         chunk_size,
         fault,
         metrics,
     } = config;
     let chunk_size = *chunk_size;
-
-    reader.open(context).await?;
 
     // Step-wide, because the skip limit is step-wide: one bad row in each of a
     // thousand chunks is a broken input, and a per-chunk counter would never
@@ -252,6 +296,16 @@ where
     let mut skipped = 0usize;
 
     loop {
+        // Between chunks, which is the only place a stop can be honoured: the
+        // previous chunk is committed and durable, the bookmark sits just past
+        // it, and nothing is in flight. Checked *before* the read rather than
+        // after the commit so that a job told to stop before it began does no
+        // work at all.
+        if commit.stop_requested() {
+            tracing::info!("stop requested; ending the step at a committed chunk boundary");
+            return Err(BatchError::Stopped);
+        }
+
         let skipped_before = skipped;
         let chunk_start = Instant::now();
 
@@ -423,10 +477,10 @@ where
 mod tests {
     use super::*;
     use crate::testing::{
-        BookmarkReader, CollectingWriter, CommitEvent, EvenDoubler, FailingReader, FailingWriter,
-        FlakyWriter, POSITION, PoisonProcessor, PoisonReader, RecordingCommit, RetryAll, SkipAll,
-        TransientWriter, VecReader, block_on, captured, counter, events_named, labels_of, nz, nz32,
-        recorded,
+        BookmarkReader, BufferingWriter, ClosingReader, CollectingWriter, CommitEvent, EvenDoubler,
+        FailingReader, FailingWriter, FlakyWriter, POSITION, PoisonProcessor, PoisonReader,
+        RecordingCommit, RetryAll, SkipAll, TransientWriter, UnopenableReader, VecReader, block_on,
+        captured, counter, events_named, labels_of, nz, nz32, recorded,
     };
     use crate::tracing::{FIELD_ATTEMPT, FIELD_ERROR, FIELD_PHASE, FIELD_SKIPPED};
     use crate::{ContextValue, RetryPolicy, Unmanaged};
@@ -1278,6 +1332,151 @@ mod tests {
             node = current.source();
         }
         assert_eq!(depth, 2, "chain: Box<BatchError::Write> -> its Cause");
+    }
+
+    // ---- the close lifecycle (audit API-1) ----
+
+    /// The failure `close` exists to prevent: a buffered writer holds part of
+    /// the output when `write` returns, so without a flush hook the step
+    /// reports success having written a truncated result.
+    #[tokio::test]
+    async fn a_buffering_writer_flushes_when_the_step_ends() {
+        let mut reader = VecReader::new(vec![2, 4, 6]);
+        let mut processor = EvenDoubler;
+        let mut writer = Unmanaged(BufferingWriter::new());
+        let mut commit = RecordingCommit::new();
+        let mut context = ExecutionContext::new();
+
+        // chunk_size 2, so the third item is a partial chunk still in the
+        // buffer when the loop ends.
+        run_step(
+            &mut reader,
+            &mut processor,
+            &mut writer,
+            &ChunkConfig::new(nz(2), &FaultTolerance::default(), "test-job", "test-step"),
+            &mut context,
+            &mut commit,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(writer.0.closes(), 1);
+        assert_eq!(
+            writer.0.flushed(),
+            vec![4, 8, 12],
+            "the tail must reach the sink, not stay in the buffer"
+        );
+    }
+
+    /// A flush that failed is data the step reported written and did not
+    /// write, so a clean loop with a failed close is still a failed step.
+    #[tokio::test]
+    async fn a_failed_flush_fails_an_otherwise_successful_step() {
+        let mut reader = VecReader::new(vec![2, 4]);
+        let mut processor = EvenDoubler;
+        let mut writer = Unmanaged(BufferingWriter::failing());
+        let mut commit = RecordingCommit::new();
+        let mut context = ExecutionContext::new();
+
+        let error = run_step(
+            &mut reader,
+            &mut processor,
+            &mut writer,
+            &ChunkConfig::new(nz(2), &FaultTolerance::default(), "test-job", "test-step"),
+            &mut context,
+            &mut commit,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(error, BatchError::Write(_)), "{error:?}");
+        assert!(error.to_string().contains("no space left"), "{error}");
+
+        // The chunk itself did commit — the counters describe work that really
+        // did reach the transaction, and only the buffered tail was lost.
+        assert_eq!(commit.commits, 1);
+    }
+
+    /// `close` runs on the failure path too. A writer that gave up mid-step
+    /// still holds a buffer, and a reader still holds its handle.
+    #[tokio::test]
+    async fn both_collaborators_are_closed_when_the_step_fails() {
+        let mut reader = ClosingReader::new(vec![2, 4]);
+        let mut processor = EvenDoubler;
+        let mut writer = Unmanaged(BufferingWriter::new());
+        let mut commit = RecordingCommit::failing_commits(1);
+        let mut context = ExecutionContext::new();
+
+        let result = run_step(
+            &mut reader,
+            &mut processor,
+            &mut writer,
+            &ChunkConfig::new(nz(2), &FaultTolerance::default(), "test-job", "test-step"),
+            &mut context,
+            &mut commit,
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert_eq!(reader.closes(), 1, "a failed step must still close");
+        assert_eq!(writer.0.closes(), 1);
+    }
+
+    /// The step's own failure is the cause; failing to close while handling it
+    /// is a consequence — the same precedence ADR-009 gives a failed rollback.
+    #[tokio::test]
+    async fn a_failed_close_does_not_hide_the_step_error() {
+        let mut reader = VecReader::new(vec![2, 4]);
+        let mut processor = EvenDoubler;
+        let mut writer = Unmanaged(BufferingWriter::failing());
+        let mut commit = RecordingCommit::failing_commits(1);
+        let mut context = ExecutionContext::new();
+
+        let error = run_step(
+            &mut reader,
+            &mut processor,
+            &mut writer,
+            &ChunkConfig::new(nz(2), &FaultTolerance::default(), "test-job", "test-step"),
+            &mut context,
+            &mut commit,
+        )
+        .await
+        .unwrap_err();
+
+        let BatchError::CleanupFailed {
+            cause,
+            during_cleanup,
+        } = &error
+        else {
+            panic!("expected both failures to survive, got {error:?}");
+        };
+        assert!(matches!(**cause, BatchError::Repository(_)), "{cause:?}");
+        assert!(matches!(**during_cleanup, BatchError::Write(_)));
+    }
+
+    /// `close` is paired with `open`, not with the call to `run_step`: a reader
+    /// whose `open` failed never opened, so closing it would be asking it to
+    /// release something it does not hold. `UnopenableReader::close` panics, so
+    /// this fails loudly rather than silently.
+    #[tokio::test]
+    async fn a_reader_whose_open_failed_is_not_closed() {
+        let mut reader = UnopenableReader;
+        let mut processor = EvenDoubler;
+        let mut writer = Unmanaged(CollectingWriter::new());
+        let mut commit = RecordingCommit::new();
+        let mut context = ExecutionContext::new();
+
+        let result = run_step(
+            &mut reader,
+            &mut processor,
+            &mut writer,
+            &ChunkConfig::new(nz(2), &FaultTolerance::default(), "test-job", "test-step"),
+            &mut context,
+            &mut commit,
+        )
+        .await;
+
+        assert!(matches!(result, Err(BatchError::Read(_))));
     }
 
     // ---- tracing (Phase 13b) ----

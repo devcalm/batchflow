@@ -16,7 +16,7 @@
 //!    work to do - leaving the table, the counters and the bookmark agreeing;
 //! 3. a second launch that resumes at the bookmark and finishes the file.
 
-use batchflow::batchflow_core::{
+use batchflow::{
     BatchError, ChunkStep, Classifier, ContextValue, ErrorAction, ExecutionContext, FaultTolerance,
     ItemProcessor, ItemReader, Job, JobLauncher, JobParameter, JobParameters, JobRepository,
     RetryPolicy, TransactionalWriter,

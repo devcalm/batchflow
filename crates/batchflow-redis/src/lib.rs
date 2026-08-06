@@ -34,8 +34,26 @@
 //! execution, abandoning one — runs as a Lua script, so the check and the write
 //! share one round trip and cannot interleave. Redis's single-threaded command
 //! execution is what makes this sufficient.
+//!
+//! # Eviction
+//!
+//! **Run Redis with `maxmemory-policy noeviction`.** Under `allkeys-lru` or
+//! `allkeys-random` Redis will evict any key under memory pressure, including a
+//! step execution — and `HGETALL` on an evicted key returns an empty hash
+//! rather than an error. An evicted record is detected and reported here rather
+//! than read back as a step that has never run, but the run still fails:
+//! eviction of batch metadata has no safe interpretation.
+//!
+//! # Redis Cluster is not supported
+//!
+//! Not merely untested — structurally impossible as written. The scripts
+//! declare keys that hash to different slots (a lookup key and the shared
+//! sequence counter), and they construct further keys inside the script from
+//! `ARGV`, which Cluster rejects as non-local. Use a single instance, or
+//! [`batchflow-postgres`](https://docs.rs/batchflow-postgres).
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
+#![warn(missing_debug_implementations)]
 
 use batchflow_core::{
     BatchError, BatchStatus, ExecutionContext, JobExecution, JobExecutionId, JobInstance,
@@ -43,6 +61,7 @@ use batchflow_core::{
 };
 use redis::aio::ConnectionManager;
 use redis::{AsyncCommands, Script};
+use std::sync::LazyLock;
 
 const STARTING: &str = "STARTING";
 const STARTED: &str = "STARTED";
@@ -171,9 +190,14 @@ fn count(value: i64) -> Result<usize, BatchError> {
     usize::try_from(value).map_err(|_| BatchError::repository(format!("negative counter {value}")))
 }
 
+/// Hashed once at first use rather than on every call: `Script::new` computes
+/// the script's SHA-1 eagerly, and `invoke_async` sends `EVALSHA` against it.
+///
 /// Resolve-or-create in one round trip. Check-then-act across two commands is a
 /// TOCTOU race two schedulers would both win.
-const FIND_OR_CREATE_INSTANCE: &str = r"
+static FIND_OR_CREATE_INSTANCE: LazyLock<Script> = LazyLock::new(|| {
+    Script::new(
+        r"
     local id = redis.call('GET', KEYS[1])
     if id then return tonumber(id) end
     id = redis.call('INCR', KEYS[2])
@@ -181,39 +205,55 @@ const FIND_OR_CREATE_INSTANCE: &str = r"
     redis.call('HSET', ARGV[3] .. ':instance:' .. id,
                'job_name', ARGV[1], 'parameters', ARGV[2])
     return id
-";
+",
+    )
+});
 
 /// Returns -1 when the instance does not exist, so an unknown parent is an
 /// error rather than an orphan row.
-const CREATE_EXECUTION: &str = r"
+static CREATE_EXECUTION: LazyLock<Script> = LazyLock::new(|| {
+    Script::new(
+        r"
     if redis.call('EXISTS', KEYS[2]) == 0 then return -1 end
     local id = redis.call('INCR', KEYS[1])
     redis.call('HSET', ARGV[4] .. ':execution:' .. id,
                'instance_id', ARGV[1], 'status', ARGV[2], 'context', ARGV[3])
     redis.call('RPUSH', KEYS[3], id)
     return id
-";
+",
+    )
+});
 
 /// Returns 0 when the execution is unknown, so an update cannot silently
 /// insert.
-const UPDATE_EXECUTION: &str = r"
+static UPDATE_EXECUTION: LazyLock<Script> = LazyLock::new(|| {
+    Script::new(
+        r"
     if redis.call('EXISTS', KEYS[1]) == 0 then return 0 end
     redis.call('HSET', KEYS[1], 'status', ARGV[1], 'context', ARGV[2])
     return 1
-";
+",
+    )
+});
 
 /// Returns the current status so the caller can distinguish "no such
 /// execution" from "that one is already finished" — different operator
 /// responses.
-const ABANDON_EXECUTION: &str = r"
+static ABANDON_EXECUTION: LazyLock<Script> = LazyLock::new(|| {
+    Script::new(
+        r"
     if redis.call('EXISTS', KEYS[1]) == 0 then return 'missing' end
     local status = redis.call('HGET', KEYS[1], 'status')
     if status == ARGV[1] then return status end
     redis.call('HSET', KEYS[1], 'status', ARGV[2])
     return 'ok'
-";
+",
+    )
+});
 
-const CREATE_STEP_EXECUTION: &str = r"
+static CREATE_STEP_EXECUTION: LazyLock<Script> = LazyLock::new(|| {
+    Script::new(
+        r"
     if redis.call('EXISTS', KEYS[2]) == 0 then return -1 end
     local instance_id = redis.call('HGET', KEYS[2], 'instance_id')
     local id = redis.call('INCR', KEYS[1])
@@ -223,20 +263,56 @@ const CREATE_STEP_EXECUTION: &str = r"
     redis.call('RPUSH', KEYS[3], id)
     redis.call('RPUSH', ARGV[4] .. ':instance:' .. instance_id .. ':step:' .. ARGV[2], id)
     return id
-";
+",
+    )
+});
 
-const UPDATE_STEP_EXECUTION: &str = r"
+static UPDATE_STEP_EXECUTION: LazyLock<Script> = LazyLock::new(|| {
+    Script::new(
+        r"
     if redis.call('EXISTS', KEYS[1]) == 0 then return 0 end
     redis.call('HSET', KEYS[1], 'status', ARGV[1], 'context', ARGV[2],
                'read', ARGV[3], 'write', ARGV[4], 'filter', ARGV[5], 'skip', ARGV[6])
     return 1
-";
+",
+    )
+});
+
+/// Refuses a record the engine believes exists but Redis does not have.
+///
+/// `HGETALL` on an absent key returns an *empty hash*, not an error. Every
+/// field lookup below has a default, so without this check an evicted or
+/// flushed record reads back as a pristine `STARTING` with an empty bookmark —
+/// indistinguishable from a step that has never run. The restart would then
+/// re-read the input from the beginning and re-write every already-committed
+/// item, which is exactly the duplicate delivery this framework exists to
+/// prevent, and it would do it silently.
+///
+/// Failing loudly is the right trade: the run stops, and the operator learns
+/// that `maxmemory-policy` is not `noeviction` before the data is duplicated
+/// rather than after.
+fn missing(
+    fields: &std::collections::HashMap<String, String>,
+    kind: &str,
+    id: i64,
+) -> Result<(), BatchError> {
+    if fields.is_empty() {
+        return Err(BatchError::repository(format!(
+            "{kind} {id} is missing from redis: it was evicted or the store was flushed, \
+             so restart safety cannot be guaranteed. Check `maxmemory-policy noeviction` \
+             and `appendfsync always`"
+        )));
+    }
+    Ok(())
+}
 
 /// Rebuilds a [`JobExecution`] from its hash fields.
 fn execution_from(
     id: i64,
     fields: &std::collections::HashMap<String, String>,
 ) -> Result<JobExecution, BatchError> {
+    missing(fields, "execution", id)?;
+
     let instance_id: i64 = fields
         .get("instance_id")
         .ok_or_else(|| BatchError::repository("execution has no instance_id"))?
@@ -258,6 +334,8 @@ fn step_from(
     id: i64,
     fields: &std::collections::HashMap<String, String>,
 ) -> Result<StepExecution, BatchError> {
+    missing(fields, "step execution", id)?;
+
     let job_execution_id: i64 = fields
         .get("job_execution_id")
         .ok_or_else(|| BatchError::repository("step execution has no job_execution_id"))?
@@ -356,7 +434,7 @@ impl JobRepository for RedisJobRepository {
         parameters: &JobParameters,
     ) -> Result<JobInstance, BatchError> {
         let encoded = encode_parameters(parameters)?;
-        let id: i64 = Script::new(FIND_OR_CREATE_INSTANCE)
+        let id: i64 = FIND_OR_CREATE_INSTANCE
             .key(instance_lookup_key(job_name, &encoded))
             .key(seq_key())
             .arg(job_name)
@@ -392,7 +470,7 @@ impl JobRepository for RedisJobRepository {
         &self,
         instance_id: JobInstanceId,
     ) -> Result<JobExecution, BatchError> {
-        let id: i64 = Script::new(CREATE_EXECUTION)
+        let id: i64 = CREATE_EXECUTION
             .key(seq_key())
             .key(instance_key(instance_id.get()))
             .key(executions_key(instance_id.get()))
@@ -413,7 +491,7 @@ impl JobRepository for RedisJobRepository {
     }
 
     async fn update_execution(&self, execution: &JobExecution) -> Result<(), BatchError> {
-        let updated: i64 = Script::new(UPDATE_EXECUTION)
+        let updated: i64 = UPDATE_EXECUTION
             .key(execution_key(execution.id().get()))
             .arg(status_name(execution.status())?)
             .arg(encode_context(execution.execution_context())?)
@@ -464,7 +542,7 @@ impl JobRepository for RedisJobRepository {
     }
 
     async fn abandon_execution(&self, execution_id: JobExecutionId) -> Result<(), BatchError> {
-        let outcome: String = Script::new(ABANDON_EXECUTION)
+        let outcome: String = ABANDON_EXECUTION
             .key(execution_key(execution_id.get()))
             .arg(COMPLETED)
             .arg(ABANDONED)
@@ -489,7 +567,7 @@ impl JobRepository for RedisJobRepository {
         job_execution_id: JobExecutionId,
         step_name: &str,
     ) -> Result<StepExecution, BatchError> {
-        let id: i64 = Script::new(CREATE_STEP_EXECUTION)
+        let id: i64 = CREATE_STEP_EXECUTION
             .key(seq_key())
             .key(execution_key(job_execution_id.get()))
             .key(execution_steps_key(job_execution_id.get()))
@@ -517,7 +595,7 @@ impl JobRepository for RedisJobRepository {
         &self,
         step_execution: &StepExecution,
     ) -> Result<(), BatchError> {
-        let updated: i64 = Script::new(UPDATE_STEP_EXECUTION)
+        let updated: i64 = UPDATE_STEP_EXECUTION
             .key(step_key(step_execution.id().get()))
             .arg(status_name(step_execution.status())?)
             .arg(encode_context(step_execution.execution_context())?)

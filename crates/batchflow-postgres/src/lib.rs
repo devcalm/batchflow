@@ -5,6 +5,7 @@
 //! rows, its counters and its bookmark commit together or not at all.
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
+#![warn(missing_debug_implementations)]
 
 mod classifier;
 
@@ -99,6 +100,61 @@ fn count(value: i64) -> Result<usize, BatchError> {
         .map_err(|_| BatchError::repository(format!("negative counter {value} in step_execution")))
 }
 
+/// A counter on its way *into* the database.
+///
+/// `try_from` rather than `as`, mirroring [`count`] on the read path: `as`
+/// reinterprets a `usize` above `i64::MAX` as negative, which the
+/// `step_execution_counts_non_negative` constraint would then reject with a
+/// message claiming corruption. Unreachable in practice — that many items is
+/// not a batch — but the constraint's meaning should stay true.
+fn stored(value: usize) -> Result<i64, BatchError> {
+    i64::try_from(value)
+        .map_err(|_| BatchError::repository(format!("counter {value} does not fit in i64")))
+}
+
+/// The one `UPDATE step_execution`, against a pool or a transaction.
+///
+/// Generic over [`sqlx::Executor`] rather than written twice: the transactional
+/// and non-transactional paths differ only in where the statement runs, and two
+/// copies is two chances for the chunk-commit path and the terminal-status path
+/// to drift apart.
+async fn write_step_execution<'e, E>(
+    executor: E,
+    step_execution: &StepExecution,
+) -> Result<(), BatchError>
+where
+    E: sqlx::Executor<'e, Database = Postgres>,
+{
+    // The indentation of the statement below is byte-identical to the entry in
+    // `.sqlx/`: `sqlx::query!` hashes the literal, so reflowing it invalidates
+    // the offline cache and breaks every build without a live database.
+    let affected = sqlx::query!(
+        "UPDATE step_execution
+                SET status = $2, read_count = $3, write_count = $4,
+                    filter_count = $5, skip_count = $6, execution_context = $7
+              WHERE id = $1",
+        step_execution.id().get(),
+        status_name(step_execution.status())?,
+        stored(step_execution.read_count())?,
+        stored(step_execution.write_count())?,
+        stored(step_execution.filter_count())?,
+        stored(step_execution.skip_count())?,
+        json(step_execution.execution_context())?,
+    )
+    .execute(executor)
+    .await
+    .map_err(db)?
+    .rows_affected();
+
+    if affected == 0 {
+        return Err(BatchError::repository(format!(
+            "unknown step execution {:?}",
+            step_execution.id()
+        )));
+    }
+    Ok(())
+}
+
 fn json<T: serde::Serialize>(value: &T) -> Result<serde_json::Value, BatchError> {
     serde_json::to_value(value).map_err(BatchError::repository)
 }
@@ -172,31 +228,7 @@ impl JobRepository for PostgresJobRepository {
         tx: &mut Self::Tx,
         step_execution: &StepExecution,
     ) -> Result<(), BatchError> {
-        let affected = sqlx::query!(
-            "UPDATE step_execution
-                SET status = $2, read_count = $3, write_count = $4,
-                    filter_count = $5, skip_count = $6, execution_context = $7
-              WHERE id = $1",
-            step_execution.id().get(),
-            status_name(step_execution.status())?,
-            step_execution.read_count() as i64,
-            step_execution.write_count() as i64,
-            step_execution.filter_count() as i64,
-            step_execution.skip_count() as i64,
-            json(step_execution.execution_context())?,
-        )
-        .execute(&mut **tx)
-        .await
-        .map_err(db)?
-        .rows_affected();
-
-        if affected == 0 {
-            return Err(BatchError::repository(format!(
-                "unknown step execution {:?}",
-                step_execution.id()
-            )));
-        }
-        Ok(())
+        write_step_execution(&mut **tx, step_execution).await
     }
 
     async fn find_or_create_instance(
@@ -398,31 +430,7 @@ impl JobRepository for PostgresJobRepository {
         &self,
         step_execution: &StepExecution,
     ) -> Result<(), BatchError> {
-        let affected = sqlx::query!(
-            "UPDATE step_execution
-                SET status = $2, read_count = $3, write_count = $4,
-                    filter_count = $5, skip_count = $6, execution_context = $7
-              WHERE id = $1",
-            step_execution.id().get(),
-            status_name(step_execution.status())?,
-            step_execution.read_count() as i64,
-            step_execution.write_count() as i64,
-            step_execution.filter_count() as i64,
-            step_execution.skip_count() as i64,
-            json(step_execution.execution_context())?,
-        )
-        .execute(&self.pool)
-        .await
-        .map_err(db)?
-        .rows_affected();
-
-        if affected == 0 {
-            return Err(BatchError::repository(format!(
-                "unknown step execution {:?}",
-                step_execution.id()
-            )));
-        }
-        Ok(())
+        write_step_execution(&self.pool, step_execution).await
     }
 
     async fn last_step_execution(

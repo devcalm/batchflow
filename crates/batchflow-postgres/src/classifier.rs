@@ -29,6 +29,7 @@ use std::error::Error;
 /// below, is [`ErrorAction::Fail`]. A classifier that guesses is worse than one
 /// that gives up: guessing `Retry` re-runs work of unknown status, and guessing
 /// `Skip` silently discards rows.
+#[derive(Debug, Clone, Copy, Default)]
 pub struct PostgresClassifier;
 
 impl Classifier for PostgresClassifier {

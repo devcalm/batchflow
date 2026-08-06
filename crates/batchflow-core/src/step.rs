@@ -129,6 +129,21 @@ pub trait StepCommit<Tx = ()>: Send {
     /// Discards the chunk's work. Taking `tx` by value is what makes reusing a
     /// rolled-back transaction fail to compile.
     async fn rollback(&mut self, tx: Tx) -> Result<(), BatchError>;
+
+    /// Whether a [`StopSignal`](crate::StopSignal) has been raised.
+    ///
+    /// It lives here rather than as an argument to [`Step::run`] because the
+    /// only place a stop may be honoured *is* a commit boundary, and this trait
+    /// is the commit boundary. A [`Step`] that drives its own loop should
+    /// consult it after each commit and return
+    /// [`BatchError::Stopped`](crate::BatchError::Stopped) if it is set; one
+    /// that does not is simply not stoppable, which is the same bargain
+    /// [`ItemReader::open`](crate::ItemReader::open) makes about restartability.
+    ///
+    /// Default: never stopped, so an existing implementation keeps compiling.
+    fn stop_requested(&self) -> bool {
+        false
+    }
 }
 
 /// One unit of work in a [`Job`](crate::Job).

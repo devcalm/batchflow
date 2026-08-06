@@ -134,3 +134,144 @@ pub trait JobRepository: Send + Sync {
         job_execution_id: JobExecutionId,
     ) -> impl Future<Output = Result<Vec<StepExecution>, BatchError>> + Send;
 }
+
+/// So a store that is not [`Clone`] can still be shared.
+///
+/// [`JobLauncher`](crate::JobLauncher) takes its repository by value.
+/// [`PostgresJobRepository`] is `Clone` because a `PgPool` is an `Arc` inside,
+/// but [`InMemoryJobRepository`](crate::InMemoryJobRepository) is not — and
+/// without this impl, wrapping it in an `Arc` to share it produces something
+/// that is no longer a `JobRepository`.
+///
+/// [`PostgresJobRepository`]: https://docs.rs/batchflow-postgres
+impl<R: JobRepository> JobRepository for std::sync::Arc<R> {
+    type Tx = R::Tx;
+
+    fn begin(&self) -> impl Future<Output = Result<Self::Tx, BatchError>> + Send {
+        (**self).begin()
+    }
+
+    fn commit(&self, tx: Self::Tx) -> impl Future<Output = Result<(), BatchError>> + Send {
+        (**self).commit(tx)
+    }
+
+    fn rollback(&self, tx: Self::Tx) -> impl Future<Output = Result<(), BatchError>> + Send {
+        (**self).rollback(tx)
+    }
+
+    fn update_step_execution_in(
+        &self,
+        tx: &mut Self::Tx,
+        step_execution: &StepExecution,
+    ) -> impl Future<Output = Result<(), BatchError>> + Send {
+        (**self).update_step_execution_in(tx, step_execution)
+    }
+
+    fn find_or_create_instance(
+        &self,
+        job_name: &str,
+        parameters: &JobParameters,
+    ) -> impl Future<Output = Result<JobInstance, BatchError>> + Send {
+        (**self).find_or_create_instance(job_name, parameters)
+    }
+
+    fn find_instance(
+        &self,
+        job_name: &str,
+        parameters: &JobParameters,
+    ) -> impl Future<Output = Result<Option<JobInstance>, BatchError>> + Send {
+        (**self).find_instance(job_name, parameters)
+    }
+
+    fn create_execution(
+        &self,
+        instance_id: JobInstanceId,
+    ) -> impl Future<Output = Result<JobExecution, BatchError>> + Send {
+        (**self).create_execution(instance_id)
+    }
+
+    fn update_execution(
+        &self,
+        execution: &JobExecution,
+    ) -> impl Future<Output = Result<(), BatchError>> + Send {
+        (**self).update_execution(execution)
+    }
+
+    fn last_execution(
+        &self,
+        instance_id: JobInstanceId,
+    ) -> impl Future<Output = Result<Option<JobExecution>, BatchError>> + Send {
+        (**self).last_execution(instance_id)
+    }
+
+    fn executions(
+        &self,
+        instance_id: JobInstanceId,
+    ) -> impl Future<Output = Result<Vec<JobExecution>, BatchError>> + Send {
+        (**self).executions(instance_id)
+    }
+
+    fn abandon_execution(
+        &self,
+        execution_id: JobExecutionId,
+    ) -> impl Future<Output = Result<(), BatchError>> + Send {
+        (**self).abandon_execution(execution_id)
+    }
+
+    fn create_step_execution(
+        &self,
+        job_execution_id: JobExecutionId,
+        step_name: &str,
+    ) -> impl Future<Output = Result<StepExecution, BatchError>> + Send {
+        (**self).create_step_execution(job_execution_id, step_name)
+    }
+
+    fn update_step_execution(
+        &self,
+        step_execution: &StepExecution,
+    ) -> impl Future<Output = Result<(), BatchError>> + Send {
+        (**self).update_step_execution(step_execution)
+    }
+
+    fn last_step_execution(
+        &self,
+        instance_id: JobInstanceId,
+        step_name: &str,
+    ) -> impl Future<Output = Result<Option<StepExecution>, BatchError>> + Send {
+        (**self).last_step_execution(instance_id, step_name)
+    }
+
+    fn step_executions(
+        &self,
+        job_execution_id: JobExecutionId,
+    ) -> impl Future<Output = Result<Vec<StepExecution>, BatchError>> + Send {
+        (**self).step_executions(job_execution_id)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{InMemoryJobRepository, Job, JobLauncher, JobParameters};
+    use std::sync::Arc;
+
+    /// `InMemoryJobRepository` is not `Clone`, so before the blanket impl this
+    /// was the one way to share it — and it did not compile.
+    #[tokio::test]
+    async fn a_launcher_can_own_a_shared_repository() {
+        let repository = Arc::new(InMemoryJobRepository::new());
+        let launcher = JobLauncher::new(Arc::clone(&repository));
+
+        let mut job: Job = Job::new("nightly", vec![]);
+        let execution = launcher.run(&mut job, &JobParameters::new()).await.unwrap();
+
+        // The other handle observes what the launcher recorded.
+        use crate::JobRepository;
+        assert!(
+            repository
+                .last_execution(execution.instance_id())
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+}

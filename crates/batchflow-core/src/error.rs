@@ -114,6 +114,41 @@ pub enum BatchError {
         during_cleanup: Box<BatchError>,
     },
 
+    /// A [`StopSignal`](crate::StopSignal) was raised and the step ended at a
+    /// commit boundary.
+    ///
+    /// Not a failure: the work that committed is durable and the bookmark sits
+    /// just past it, so relaunching the same instance resumes rather than
+    /// repeats. It is an `Err` because it is *not success* — a step that
+    /// stopped did not finish, and returning `Ok` would let
+    /// [`Job::run`](crate::Job::run) mark it `Completed` and skip it on the
+    /// restart that is supposed to finish it.
+    ///
+    /// The execution is persisted as
+    /// [`BatchStatus::Stopped`](crate::BatchStatus::Stopped), which the
+    /// launcher's gate already accepts as restartable.
+    #[error("stopped at a commit boundary on request")]
+    Stopped,
+
+    /// User code panicked and the engine caught it at its boundary.
+    ///
+    /// A panic is a bug, never a signal — this variant exists so that one bad
+    /// row cannot wedge an instance. Without the boundary the unwind skips the
+    /// write that records a terminal status, and the metadata store is left
+    /// showing `Started` for a process that has died, which no later launch can
+    /// get past without an operator calling
+    /// [`abandon_execution`](crate::JobRepository::abandon_execution).
+    ///
+    /// Carries the panic message rather than the payload: a `Box<dyn Any>` is
+    /// neither `Sync` nor `Error`, so it cannot be a [`Cause`].
+    ///
+    /// Inert under `panic = "abort"`, where there is no unwinding to catch.
+    #[error("panicked: {detail}")]
+    Panic {
+        /// What `panic!` was called with, if it was a string.
+        detail: String,
+    },
+
     /// A bookmark held the wrong type — a garbled context, not a missing one.
     ///
     /// Kept distinct from "key absent" so a corrupt bookmark aborts the run

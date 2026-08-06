@@ -58,6 +58,46 @@ jobs:
           # exits 0 on links that docs.rs then ships broken.
           RUSTDOCFLAGS: -D warnings
 
+      # `crates/batchflow/README.md` is what crates.io renders for the flagship
+      # crate, and it once shipped a release claiming the crate was "not yet
+      # usable". Nothing else would have caught that: a README is not compiled,
+      # and it is the one file no test reads.
+      - name: crate READMEs must not claim the crate is unreleased
+        run: |
+          if grep -rniE '0\.0\.0|not yet usable|reserves the crate name' crates/*/README.md; then
+            echo "::error::a crate README still describes the pre-release placeholder"
+            exit 1
+          fi
+
+  # A published RUSTSEC advisory in sqlx, redis, tokio or their trees is
+  # otherwise invisible here until somebody notices. Runs on pull requests too,
+  # not only on the schedule: advisories appear between releases, so a
+  # push-only trigger misses exactly the window that matters.
+  deny:
+    name: cargo-deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories bans licenses sources
+
+  # Catches a missing `include`/`exclude` or an unpublishable path dependency
+  # before a release rather than during one — which matters more than usual
+  # here, because six crates publish in lockstep and in dependency order.
+  publish-dry-run:
+    name: publish (dry run)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # `--no-verify` because the unpublished sibling versions are not on
+      # crates.io yet, so a full verification build of the dependents cannot
+      # resolve them. Packaging is what this job is checking.
+      - run: cargo publish -p batchflow-core --dry-run --no-verify --locked
+      - run: cargo package --workspace --no-verify --locked
+
   # `rust-version` promises that the *library* builds, not that the test suite
   # does: dev-dependencies carry their own MSRVs we make no promise about. So
   # this is `check`, without `--all-targets`.

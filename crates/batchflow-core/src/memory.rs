@@ -33,6 +33,23 @@ impl InMemoryJobRepository {
     pub fn new() -> Self {
         Self::default()
     }
+
+    /// The guard, or a repository error.
+    ///
+    /// One helper rather than twelve copies of the same `map_err`. The message
+    /// is written out instead of `PoisonError::to_string()` because that
+    /// renders the poisoning, not the panic that caused it — and the crate's
+    /// own rule is that a cause is preserved, never stringified. There is
+    /// nothing here to preserve: the panic is long gone, and what the caller
+    /// needs to know is that this store's contents may be half-updated.
+    fn lock(&self) -> Result<std::sync::MutexGuard<'_, Inner>, BatchError> {
+        self.inner.lock().map_err(|_| {
+            BatchError::repository(
+                "in-memory repository lock is poisoned: a previous caller panicked while \
+                 holding it, so the store may be half-updated",
+            )
+        })
+    }
 }
 
 impl JobRepository for InMemoryJobRepository {
@@ -66,10 +83,7 @@ impl JobRepository for InMemoryJobRepository {
         job_name: &str,
         parameters: &JobParameters,
     ) -> Result<JobInstance, BatchError> {
-        let mut inner = self
-            .inner
-            .lock()
-            .map_err(|e| BatchError::repository(e.to_string()))?;
+        let mut inner = self.lock()?;
         let key = (job_name.to_string(), parameters.clone());
 
         if let Some(existing) = inner.instances.get(&key) {
@@ -90,10 +104,7 @@ impl JobRepository for InMemoryJobRepository {
         job_name: &str,
         parameters: &JobParameters,
     ) -> Result<Option<JobInstance>, BatchError> {
-        let inner = self
-            .inner
-            .lock()
-            .map_err(|e| BatchError::repository(e.to_string()))?;
+        let inner = self.lock()?;
 
         let key = (job_name.to_string(), parameters.clone());
 
@@ -108,10 +119,7 @@ impl JobRepository for InMemoryJobRepository {
         &self,
         instance_id: JobInstanceId,
     ) -> Result<JobExecution, BatchError> {
-        let mut inner = self
-            .inner
-            .lock()
-            .map_err(|e| BatchError::repository(e.to_string()))?;
+        let mut inner = self.lock()?;
 
         if !inner.instances.values().any(|i| i.id() == instance_id) {
             return Err(BatchError::repository(format!(
@@ -127,10 +135,7 @@ impl JobRepository for InMemoryJobRepository {
     }
 
     async fn update_execution(&self, execution: &JobExecution) -> Result<(), BatchError> {
-        let mut inner = self
-            .inner
-            .lock()
-            .map_err(|e| BatchError::repository(e.to_string()))?;
+        let mut inner = self.lock()?;
 
         match inner
             .executions
@@ -152,10 +157,7 @@ impl JobRepository for InMemoryJobRepository {
         &self,
         instance_id: JobInstanceId,
     ) -> Result<Option<JobExecution>, BatchError> {
-        let inner = self
-            .inner
-            .lock()
-            .map_err(|e| BatchError::repository(e.to_string()))?;
+        let inner = self.lock()?;
 
         Ok(inner
             .executions
@@ -169,10 +171,7 @@ impl JobRepository for InMemoryJobRepository {
         &self,
         instance_id: JobInstanceId,
     ) -> Result<Vec<JobExecution>, BatchError> {
-        let inner = self
-            .inner
-            .lock()
-            .map_err(|e| BatchError::repository(e.to_string()))?;
+        let inner = self.lock()?;
 
         Ok(inner
             .executions
@@ -183,10 +182,7 @@ impl JobRepository for InMemoryJobRepository {
     }
 
     async fn abandon_execution(&self, execution_id: JobExecutionId) -> Result<(), BatchError> {
-        let mut inner = self
-            .inner
-            .lock()
-            .map_err(|e| BatchError::repository(e.to_string()))?;
+        let mut inner = self.lock()?;
 
         match inner.executions.iter_mut().find(|e| e.id() == execution_id) {
             Some(slot) => {
@@ -211,10 +207,7 @@ impl JobRepository for InMemoryJobRepository {
         job_execution_id: JobExecutionId,
         step_name: &str,
     ) -> Result<StepExecution, BatchError> {
-        let mut inner = self
-            .inner
-            .lock()
-            .map_err(|e| BatchError::repository(e.to_string()))?;
+        let mut inner = self.lock()?;
 
         if !inner.executions.iter().any(|e| e.id() == job_execution_id) {
             return Err(BatchError::repository(format!(
@@ -236,10 +229,7 @@ impl JobRepository for InMemoryJobRepository {
         &self,
         step_execution: &StepExecution,
     ) -> Result<(), BatchError> {
-        let mut inner = self
-            .inner
-            .lock()
-            .map_err(|e| BatchError::repository(e.to_string()))?;
+        let mut inner = self.lock()?;
 
         match inner
             .step_executions
@@ -262,10 +252,7 @@ impl JobRepository for InMemoryJobRepository {
         instance_id: JobInstanceId,
         step_name: &str,
     ) -> Result<Option<StepExecution>, BatchError> {
-        let inner = self
-            .inner
-            .lock()
-            .map_err(|e| BatchError::repository(e.to_string()))?;
+        let inner = self.lock()?;
 
         // `.rev()`: step executions are ordered by insertion, so the last match
         // is the most recent attempt.
@@ -287,10 +274,7 @@ impl JobRepository for InMemoryJobRepository {
         &self,
         job_execution_id: JobExecutionId,
     ) -> Result<Vec<StepExecution>, BatchError> {
-        let inner = self
-            .inner
-            .lock()
-            .map_err(|e| BatchError::repository(e.to_string()))?;
+        let inner = self.lock()?;
 
         Ok(inner
             .step_executions

@@ -1,0 +1,48 @@
+# cargo-deny configuration. Run by CI on every pull request and weekly.
+#
+#     cargo deny check advisories bans licenses sources
+
+[advisories]
+# RUSTSEC advisories are a hard failure. An unmaintained dependency is worth
+# knowing about but is not a reason to fail a build on a Tuesday, so it is a
+# warning that shows up in the log.
+yanked = "deny"
+ignore = []
+
+[licenses]
+# The project is MIT OR Apache-2.0, so anything permissive is fine and anything
+# copyleft is not — a batch framework linked into a proprietary pipeline must
+# not carry an obligation its user did not choose.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+    "MPL-2.0",
+]
+confidence-threshold = 0.9
+
+[bans]
+# `warn`, not `deny`: two major versions of a transitive dependency is common
+# in a graph this size and is usually harmless. It is called out because of
+# ADR-010's specific worry — two semver-incompatible copies of a tracing or
+# telemetry crate mean two global registries, and spans silently going nowhere.
+multiple-versions = "warn"
+wildcards = "deny"
+highlight = "all"
+
+# Denied outright. `openssl-sys` because sqlx and redis are configured for
+# rustls; a build that pulls it has picked up a feature we did not intend and
+# has quietly added a C dependency to a workspace that otherwise has none.
+deny = [{ name = "openssl-sys" }]
+
+[sources]
+# Everything comes from crates.io. A git dependency in a published crate is
+# unpublishable anyway, so this catches it before `cargo publish` does.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

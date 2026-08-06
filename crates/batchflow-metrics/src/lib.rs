@@ -25,6 +25,7 @@
 //! explicit that a breaking release there is a breaking release here.
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
+#![warn(missing_debug_implementations)]
 
 use batchflow_core::metrics::{CHUNK_DURATION, STEP_DURATION};
 

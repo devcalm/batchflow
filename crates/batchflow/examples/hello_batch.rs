@@ -4,7 +4,7 @@
 //!
 //! Run with: `cargo run -p batchflow --example hello_batch`
 
-use batchflow::batchflow_core::{
+use batchflow::{
     BatchError, ChunkStep, InMemoryJobRepository, ItemProcessor, ItemReader, ItemWriter, Job,
     JobLauncher, JobParameter, JobParameters, JobRepository, Unmanaged,
 };

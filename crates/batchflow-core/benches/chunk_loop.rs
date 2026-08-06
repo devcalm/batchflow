@@ -9,7 +9,7 @@ use batchflow_core::{
     BatchError, ChunkStep, ExecutionContext, ItemProcessor, ItemReader, ItemWriter, JobExecutionId,
     Step, StepCommit, StepContribution, StepExecutionId, StepIdentity, Unmanaged, async_trait,
 };
-use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
+use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
 use std::hint::black_box;
 use std::num::NonZeroUsize;
 
@@ -111,19 +111,19 @@ fn commit_interval(c: &mut Criterion) {
     let runtime = tokio::runtime::Runtime::new().expect("runtime");
     let mut group = c.benchmark_group("commit_interval");
 
-    // TODO(you) #1 — the sweep. Which chunk sizes actually answer the tuning
-    // question, and how many items do you hold fixed across them? Consider:
-    // the interesting region is where per-chunk cost stops dominating, and
-    // criterion runs ~100 samples of every point, so ITEMS * sizes.len() is
-    // your wall-clock bill.
+    // The sweep spans the region where per-chunk cost stops dominating: at 1
+    // every item pays a full commit boundary, and by 10,000 the boundary has
+    // amortised to nothing. Five points at ~100 samples each is the wall-clock
+    // bill, which is why the item count is held at 10,000 rather than higher —
+    // the shape of the curve is what is being measured, not the absolute time.
     const ITEMS: u64 = 10_000;
     const CHUNK_SIZES: &[usize] = &[1, 10, 100, 1000, 10_000];
 
-    // TODO(you) #2 — declare throughput, or don't. `group.throughput(..)`
-    // makes criterion print items/sec alongside the time. Decide what the
-    // element is here: is one "element" an item or a chunk? Whichever you
-    // pick, the number printed must be the one you would quote in the perf
-    // report.
+    // The element is an **item**, so criterion prints items/sec and ns/item
+    // directly. That is the figure `docs/Performance.md` quotes, and declaring
+    // it here is what stops the document and the harness from drifting: before
+    // this, the ns/item column was arithmetic done by hand outside the tool.
+    group.throughput(Throughput::Elements(ITEMS));
 
     for &chunk_size in CHUNK_SIZES {
         group.bench_function(format!("{chunk_size}"), |b| {

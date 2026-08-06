@@ -225,6 +225,19 @@ where
             if status == RepeatStatus::Finished {
                 return Ok(());
             }
+
+            // After the commit and only between passes, for the same reason the
+            // chunk loop checks between chunks: this pass's work and the
+            // bookmark it left are durable, so a restart resumes at the next
+            // pass rather than redoing this one.
+            //
+            // `Finished` wins over a stop — a tasklet that has completed its
+            // unit of work has nothing left to resume, and reporting it stopped
+            // would make a restart run it again.
+            if commit.stop_requested() {
+                tracing::info!("stop requested; ending the tasklet between passes");
+                return Err(BatchError::Stopped);
+            }
         }
     }
 }

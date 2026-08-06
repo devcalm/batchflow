@@ -1,0 +1,25 @@
+version: 2
+updates:
+  # The MSRV matrix in ci.yml is what makes this safe to automate: a dependency
+  # bump that raises one of the three MSRV tiers fails its lane on the PR rather
+  # than being discovered by a user on 1.85.
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    groups:
+      # One PR for the patch noise. Minor and major stay individual, because
+      # those are the ones that can move an MSRV or change behaviour.
+      patch:
+        update-types: ["patch"]
+    commit-message:
+      prefix: "chore(deps)"
+
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: monthly
+    commit-message:
+      prefix: "chore(ci)"

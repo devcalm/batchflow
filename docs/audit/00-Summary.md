@@ -151,6 +151,11 @@ Everything that turns a correct engine into an operable product.
 
 ## Where the passes live
 
+> **Remediation is under way.** 21 of these findings — including both Criticals
+> — have been fixed. See [PROGRESS.md](PROGRESS.md) for what was done, what it
+> replaced, and what is left. The scores and roadmap below describe the codebase
+> **as audited** at `46f276e` and are deliberately not restated.
+
 | File | Passes |
 |---|---|
 | [01-Architecture-and-API.md](01-Architecture-and-API.md) | 1 — Architecture · 2 — Public API |

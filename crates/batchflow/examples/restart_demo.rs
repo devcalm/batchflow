@@ -6,7 +6,7 @@
 //! This is `hello_batch` with three changes: the reader records its position,
 //! the writer fails once, and the job is launched twice.
 
-use batchflow::batchflow_core::{
+use batchflow::{
     BatchError, ChunkStep, ContextValue, ExecutionContext, InMemoryJobRepository, ItemProcessor,
     ItemReader, ItemWriter, Job, JobLauncher, JobParameter, JobParameters, JobRepository,
     Unmanaged,

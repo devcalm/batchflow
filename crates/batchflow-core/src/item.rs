@@ -36,6 +36,22 @@ pub trait ItemReader {
     ///
     /// Default: record nothing, matching the default `open`.
     fn update(&self, _context: &mut ExecutionContext) {}
+
+    /// Release whatever [`open`](Self::open) acquired.
+    ///
+    /// Called once when the step ends, on both the success and the failure
+    /// path, and paired with `open`: a reader whose `open` failed is never
+    /// closed, because it never opened.
+    ///
+    /// An error here fails the step. A reader that cannot release a file handle
+    /// or a cursor is reporting that something is wrong with the resource, and
+    /// swallowing it would hide it — the bookmark is already durable by this
+    /// point, so a restart resumes correctly either way.
+    ///
+    /// Default: nothing, which is correct for a reader that holds nothing.
+    fn close(&mut self) -> impl Future<Output = Result<(), BatchError>> + Send {
+        async { Ok(()) }
+    }
 }
 
 /// Writes a whole chunk at once.
@@ -52,6 +68,46 @@ pub trait ItemWriter {
         &mut self,
         items: &[Self::Item],
     ) -> impl Future<Output = Result<(), BatchError>> + Send;
+
+    /// Flush anything buffered and release resources.
+    ///
+    /// Called once when the step ends, on both the success and the failure
+    /// path. **An error here fails the step**, and that is the point: a writer
+    /// that buffers — `BufWriter`, a batching HTTP client, a `csv::Writer` —
+    /// still holds part of the last chunk when `write` returns, and flushing
+    /// only on `Drop` makes the resulting `io::Error` unobservable. A full disk
+    /// would then produce a job that reported success and wrote a truncated
+    /// file.
+    ///
+    /// Default: nothing, which is correct for a writer that buffers nothing.
+    ///
+    /// ```
+    /// # use batchflow_core::{BatchError, ItemWriter};
+    /// # use std::io::Write;
+    /// struct CsvWriter<W: Write + Send> {
+    ///     out: std::io::BufWriter<W>,
+    /// }
+    ///
+    /// impl<W: Write + Send> ItemWriter for CsvWriter<W> {
+    ///     type Item = String;
+    ///
+    ///     async fn write(&mut self, items: &[String]) -> Result<(), BatchError> {
+    ///         for line in items {
+    ///             writeln!(self.out, "{line}").map_err(BatchError::write)?;
+    ///         }
+    ///         Ok(())
+    ///     }
+    ///
+    ///     // Without this, the last partial buffer is flushed by `Drop`, where
+    ///     // a failure has nowhere to go.
+    ///     async fn close(&mut self) -> Result<(), BatchError> {
+    ///         self.out.flush().map_err(BatchError::write)
+    ///     }
+    /// }
+    /// ```
+    fn close(&mut self) -> impl Future<Output = Result<(), BatchError>> + Send {
+        async { Ok(()) }
+    }
 }
 
 /// An [`ItemWriter`] that enlists in the step's transaction, so its writes
@@ -70,6 +126,20 @@ pub trait TransactionalWriter<Tx>: Send {
         tx: &mut Tx,
         items: &[Self::Item],
     ) -> impl Future<Output = Result<(), BatchError>> + Send;
+
+    /// Release resources at the end of the step.
+    ///
+    /// No transaction is passed, and that is deliberate: the last chunk's
+    /// transaction has already committed or rolled back by the time this runs,
+    /// and opening another one here would write outside every commit interval —
+    /// data with no counters and no bookmark. A transactional writer normally
+    /// has nothing to do here, since its durability is the transaction's.
+    ///
+    /// Default: nothing. See [`ItemWriter::close`] for the buffered case this
+    /// exists for.
+    fn close(&mut self) -> impl Future<Output = Result<(), BatchError>> + Send {
+        async { Ok(()) }
+    }
 }
 
 /// Adapts a plain [`ItemWriter`] — or a plain [`Tasklet`](crate::Tasklet) — to
@@ -97,6 +167,11 @@ where
         items: &[Self::Item],
     ) -> impl Future<Output = Result<(), BatchError>> + Send {
         self.0.write(items)
+    }
+
+    /// Delegates to the wrapped writer, which is where the buffer is.
+    fn close(&mut self) -> impl Future<Output = Result<(), BatchError>> + Send {
+        self.0.close()
     }
 }
 

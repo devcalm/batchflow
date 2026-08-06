@@ -70,6 +70,7 @@
 //! [`tokio-cron-scheduler`]: https://docs.rs/tokio-cron-scheduler
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
+#![warn(missing_debug_implementations)]
 
 #[cfg(feature = "cron")]
 mod cron;

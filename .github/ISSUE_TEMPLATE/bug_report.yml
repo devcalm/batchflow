@@ -1,0 +1,74 @@
+name: Bug report
+description: Something behaves differently from what the docs say
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report. The two questions that resolve most issues
+        fastest are **which backend** and **does it reproduce in memory** —
+        they separate an engine bug from a store-specific one.
+
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: The `batchflow` version, or the commit if you are on `main`.
+      placeholder: "0.1.0"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: backend
+    attributes:
+      label: Metadata store
+      options:
+        - InMemoryJobRepository
+        - batchflow-postgres
+        - batchflow-redis
+        - a third-party JobRepository
+    validations:
+      required: true
+
+  - type: dropdown
+    id: in_memory
+    attributes:
+      label: Does it reproduce against InMemoryJobRepository?
+      description: >
+        If it does, it is an engine bug. If it does not, it is in the backend or
+        in its configuration — which is a completely different search.
+      options:
+        - "Yes"
+        - "No"
+        - "Not tried"
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected, and what happened
+      description: >
+        Please quote the documentation or the guarantee you were relying on if
+        there is one.
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: Reproduction
+      description: >
+        Ideally a small `Job` with the reader/processor/writer that shows it.
+        The examples in `crates/batchflow/examples/` are a good starting shape.
+      render: rust
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: >
+        `rustc --version`, OS, and — for a backend issue — the server version
+        and any non-default configuration. For Redis specifically, please
+        include `appendonly`, `appendfsync` and `maxmemory-policy`.
+      render: shell

@@ -11,7 +11,7 @@
 //! crate root, so neither can `use` the other's items; sharing would mean a
 //! `tests/common/mod.rs` that the example still could not reach.
 
-use batchflow::batchflow_core::{
+use batchflow::{
     BatchError, BatchStatus, ChunkStep, ContextValue, ExecutionContext, InMemoryJobRepository,
     ItemProcessor, ItemReader, ItemWriter, Job, JobLauncher, JobParameter, JobParameters,
     JobRepository, Unmanaged,

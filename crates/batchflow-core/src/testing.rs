@@ -389,6 +389,15 @@ impl SharedSink {
     pub(crate) fn written(&self) -> Vec<u32> {
         self.0.lock().expect("sink poisoned").clone()
     }
+
+    /// Appends directly, for writers built by a test rather than by
+    /// [`writer`](Self::writer).
+    pub(crate) fn record(&self, items: &[u32]) {
+        self.0
+            .lock()
+            .expect("sink poisoned")
+            .extend_from_slice(items);
+    }
 }
 
 pub(crate) struct SharedWriter {
@@ -621,6 +630,149 @@ impl Step for FailingStep {
     ) -> Result<(), BatchError> {
         Err(BatchError::process("boom"))
     }
+}
+
+/// A writer that buffers, so the last chunk only lands on `close`.
+///
+/// The whole reason `close` exists: without it the tail sits in `pending`
+/// forever and the step reports success having written a truncated result.
+#[derive(Default)]
+pub(crate) struct BufferingWriter {
+    /// Holds items until a flush; a real one would be a `BufWriter`.
+    pub pending: Vec<u32>,
+    pub flushed: Arc<Mutex<Vec<u32>>>,
+    pub closes: Arc<Mutex<usize>>,
+    /// Fails the flush, as a full disk would.
+    pub fail_on_close: bool,
+}
+
+impl BufferingWriter {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn failing() -> Self {
+        Self {
+            fail_on_close: true,
+            ..Self::default()
+        }
+    }
+
+    pub fn flushed(&self) -> Vec<u32> {
+        self.flushed.lock().expect("flushed poisoned").clone()
+    }
+
+    pub fn closes(&self) -> usize {
+        *self.closes.lock().expect("closes poisoned")
+    }
+}
+
+impl ItemWriter for BufferingWriter {
+    type Item = u32;
+
+    async fn write(&mut self, items: &[u32]) -> Result<(), BatchError> {
+        self.pending.extend_from_slice(items);
+        Ok(())
+    }
+
+    async fn close(&mut self) -> Result<(), BatchError> {
+        *self.closes.lock().expect("closes poisoned") += 1;
+
+        if self.fail_on_close {
+            return Err(BatchError::write("flush failed: no space left on device"));
+        }
+
+        self.flushed
+            .lock()
+            .expect("flushed poisoned")
+            .append(&mut self.pending);
+        Ok(())
+    }
+}
+
+/// Records whether `close` was called, so the failure path can assert it too.
+pub(crate) struct ClosingReader {
+    pub inner: VecReader,
+    pub closes: Arc<Mutex<usize>>,
+}
+
+impl ClosingReader {
+    pub fn new(items: Vec<u32>) -> Self {
+        Self {
+            inner: VecReader::new(items),
+            closes: Arc::new(Mutex::new(0)),
+        }
+    }
+
+    pub fn closes(&self) -> usize {
+        *self.closes.lock().expect("closes poisoned")
+    }
+}
+
+impl ItemReader for ClosingReader {
+    type Item = u32;
+
+    async fn read(&mut self) -> Result<Option<u32>, BatchError> {
+        self.inner.read().await
+    }
+
+    async fn close(&mut self) -> Result<(), BatchError> {
+        *self.closes.lock().expect("closes poisoned") += 1;
+        Ok(())
+    }
+}
+
+/// Fails `open`, to pin that `close` is paired with it rather than run
+/// unconditionally.
+pub(crate) struct UnopenableReader;
+
+impl ItemReader for UnopenableReader {
+    type Item = u32;
+
+    async fn read(&mut self) -> Result<Option<u32>, BatchError> {
+        Ok(None)
+    }
+
+    async fn open(&mut self, _context: &ExecutionContext) -> Result<(), BatchError> {
+        Err(BatchError::read("cannot open input"))
+    }
+
+    async fn close(&mut self) -> Result<(), BatchError> {
+        panic!("close must not run for a reader whose open failed");
+    }
+}
+
+/// Panics rather than returning an error — an `unwrap()` in user code.
+///
+/// The panic boundary in `Job::run` is what stops this from unwinding past the
+/// terminal status write and leaving the instance blocked forever.
+pub(crate) struct PanickingStep;
+
+#[async_trait]
+impl Step for PanickingStep {
+    fn name(&self) -> &str {
+        "panicking"
+    }
+
+    async fn run(
+        &mut self,
+        _context: &mut ExecutionContext,
+        _commit: &mut dyn StepCommit<()>,
+    ) -> Result<(), BatchError> {
+        panic!("called `Option::unwrap()` on a `None` value");
+    }
+}
+
+/// Runs `body` with the panic hook suppressed.
+///
+/// Without it the harness prints a backtrace for every deliberately caught
+/// panic, which makes a passing run look like a failing one.
+pub(crate) fn without_panic_output<T>(body: impl FnOnce() -> T) -> T {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let outcome = body();
+    std::panic::set_hook(previous);
+    outcome
 }
 
 /// What happened at a transaction boundary, in order.
@@ -868,12 +1020,12 @@ pub(crate) fn recorded(body: impl FnOnce()) -> Recorded {
 
 /// A current-thread runtime, so emissions land on the thread the recorder
 /// is scoped to.
-pub(crate) fn block_on(future: impl Future<Output = ()>) {
+pub(crate) fn block_on<T>(future: impl Future<Output = T>) -> T {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .unwrap()
-        .block_on(future);
+        .block_on(future)
 }
 
 /// The counter named `name` whose `phase` label matches, or `None` if no

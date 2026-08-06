@@ -53,7 +53,7 @@ cron job from double-billing when it fires twice.
 ## Your first job
 
 ```rust
-use batchflow::batchflow_core::{
+use batchflow::{
     BatchError, ChunkStep, InMemoryJobRepository, ItemProcessor, ItemReader, ItemWriter,
     Job, JobLauncher, JobParameter, JobParameters, Unmanaged,
 };
@@ -175,7 +175,7 @@ That is a `Tasklet`, and it is a peer of `ChunkStep`, not a lesser form of one:
 both become a `Step` and a `Job` cannot tell them apart.
 
 ```rust
-use batchflow::batchflow_core::{
+use batchflow::{
     BatchError, ExecutionContext, RepeatStatus, StepContribution, Tasklet,
     TaskletStep, Unmanaged,
 };
@@ -249,7 +249,7 @@ overrides neither is simply not restartable**, which is honest rather than
 hidden:
 
 ```rust
-use batchflow::batchflow_core::{ContextValue, ExecutionContext};
+use batchflow::{ContextValue, ExecutionContext};
 
 const POSITION: &str = "position";
 
@@ -299,7 +299,7 @@ actually ran; "what did this instance do across all attempts?" is an
 A writer that can join the step's transaction implements `TransactionalWriter`:
 
 ```rust
-use batchflow::batchflow_core::TransactionalWriter;
+use batchflow::TransactionalWriter;
 use sqlx::{Postgres, Transaction};
 
 type PgTx = Transaction<'static, Postgres>;
@@ -342,7 +342,7 @@ Failures are classified, not caught. You write a `Classifier` over your own
 error type:
 
 ```rust
-use batchflow::batchflow_core::{Classifier, ErrorAction, BatchError, FaultTolerance, RetryPolicy};
+use batchflow::{Classifier, ErrorAction, BatchError, FaultTolerance, RetryPolicy};
 use std::num::NonZeroU32;
 
 struct FeedClassifier;

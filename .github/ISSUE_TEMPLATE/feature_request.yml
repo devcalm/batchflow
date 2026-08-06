@@ -1,0 +1,46 @@
+name: Feature request
+description: Something the framework should be able to do and cannot
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Known gaps are already listed under **Known limitations** in
+        [CHANGELOG.md](../../CHANGELOG.md) and in `docs/audit/FINDINGS.md` —
+        worth a look first, since several of them are planned rather than
+        unnoticed.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: >
+        What are you trying to do, and what stops you? Please describe the
+        situation rather than the API you have in mind — the shape of the
+        solution is usually the easier half.
+    validations:
+      required: true
+
+  - type: textarea
+    id: workaround
+    attributes:
+      label: What you are doing instead
+      description: >
+        If there is a workaround, its cost is the best evidence for how much the
+        feature is worth.
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed API, if you have one
+      render: rust
+
+  - type: checkboxes
+    id: scope
+    attributes:
+      label: Scope
+      options:
+        - label: >
+            This belongs in the framework rather than in application code —
+            i.e. it needs something only the engine knows (the transaction
+            boundary, the bookmark, the metadata store).

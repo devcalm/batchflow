@@ -9,7 +9,7 @@
 //! exists to hold, and writing one for your own error type is what most users
 //! need. `batchflow-postgres` ships the same shape for real SQLSTATEs.
 
-use batchflow::batchflow_core::{
+use batchflow::{
     BatchError, ChunkStep, Classifier, ErrorAction, FaultTolerance, InMemoryJobRepository,
     ItemProcessor, ItemReader, ItemWriter, Job, JobLauncher, JobParameter, JobParameters,
     JobRepository, RetryPolicy, Unmanaged,
