@@ -184,6 +184,186 @@ pub async fn create_execution_rejects_an_unknown_instance<R: JobRepository>(repo
     assert!(result.is_err(), "an unknown instance must not open");
 }
 
+// ------------------------------------------------------- the launch gate
+
+/// `start_execution` opens an execution that already holds the instance.
+///
+/// `Started`, not `Starting`: a row that exists but does not yet hold the
+/// instance is a window the gate does not cover, and closing that window is
+/// half the point of the method.
+pub async fn start_execution_opens_a_started_execution<R: JobRepository>(repository: &R) {
+    let instance = repository
+        .find_or_create_instance("nightly", &params(&[("date", "2026-08-06")]))
+        .await
+        .unwrap();
+
+    let execution = repository
+        .start_execution("nightly", instance.id())
+        .await
+        .unwrap();
+
+    assert_eq!(execution.status(), BatchStatus::Started);
+    assert_eq!(execution.instance_id(), instance.id());
+
+    // Persisted, not merely returned.
+    let reloaded = repository
+        .last_execution(instance.id())
+        .await
+        .unwrap()
+        .expect("the launch must be durable");
+    assert_eq!(reloaded.id(), execution.id());
+    assert_eq!(reloaded.status(), BatchStatus::Started);
+}
+
+/// FR-4.4: a completed instance refuses a relaunch, and refuses it *without*
+/// leaving a new execution behind.
+pub async fn start_execution_refuses_a_completed_instance<R: JobRepository>(repository: &R) {
+    let instance = repository
+        .find_or_create_instance("nightly", &params(&[("date", "2026-08-06")]))
+        .await
+        .unwrap();
+
+    let mut first = repository
+        .start_execution("nightly", instance.id())
+        .await
+        .unwrap();
+    first.set_status(BatchStatus::Completed);
+    repository.update_execution(&first).await.unwrap();
+
+    let refused = repository.start_execution("nightly", instance.id()).await;
+
+    assert!(
+        matches!(refused, Err(BatchError::JobInstanceAlreadyComplete { .. })),
+        "expected JobInstanceAlreadyComplete, got {refused:?}"
+    );
+
+    // A refusal that inserted first would pass a status assertion alone.
+    assert_eq!(
+        repository.executions(instance.id()).await.unwrap().len(),
+        1,
+        "a refused launch must not leave an execution behind"
+    );
+}
+
+/// The running-execution gate. An implementation that checks and then inserts
+/// non-atomically still passes this one — the race case below is what catches
+/// that — but an implementation with no check at all fails here.
+pub async fn start_execution_refuses_a_live_execution<R: JobRepository>(repository: &R) {
+    let instance = repository
+        .find_or_create_instance("nightly", &params(&[("date", "2026-08-06")]))
+        .await
+        .unwrap();
+
+    let running = repository
+        .start_execution("nightly", instance.id())
+        .await
+        .unwrap();
+
+    let refused = repository.start_execution("nightly", instance.id()).await;
+
+    let Err(BatchError::JobExecutionAlreadyRunning { execution_id, .. }) = refused else {
+        panic!("expected JobExecutionAlreadyRunning, got {refused:?}");
+    };
+    assert_eq!(
+        execution_id,
+        running.id(),
+        "the refusal must name the execution actually holding the instance"
+    );
+
+    assert_eq!(repository.executions(instance.id()).await.unwrap().len(), 1);
+}
+
+/// The restart door, and the control for the two refusals above: a terminal
+/// *unsuccessful* status must let the instance run again, or a failed job could
+/// never be retried.
+pub async fn start_execution_allows_a_terminal_unsuccessful_instance<R: JobRepository>(
+    repository: &R,
+) {
+    let instance = repository
+        .find_or_create_instance("nightly", &params(&[("date", "2026-08-06")]))
+        .await
+        .unwrap();
+
+    for status in [
+        BatchStatus::Failed,
+        BatchStatus::Stopped,
+        BatchStatus::Abandoned,
+    ] {
+        let mut attempt = repository
+            .start_execution("nightly", instance.id())
+            .await
+            .unwrap_or_else(|error| panic!("a {status:?} instance must be launchable: {error:?}"));
+
+        attempt.set_status(status);
+        repository.update_execution(&attempt).await.unwrap();
+    }
+
+    // Three attempts, each opened after the previous reached a restartable
+    // terminal status.
+    assert_eq!(repository.executions(instance.id()).await.unwrap().len(), 3);
+}
+
+pub async fn start_execution_rejects_an_unknown_instance<R: JobRepository>(repository: &R) {
+    let result = repository
+        .start_execution("nightly", JobInstanceId::new(9999))
+        .await;
+
+    assert!(
+        matches!(result, Err(BatchError::Repository(_))),
+        "expected a repository error, got {result:?}"
+    );
+}
+
+/// **The race.** Two launchers going for the same instance at the same moment:
+/// exactly one may win.
+///
+/// This is the audit's CONC-1. The gate used to be a read, a decision and a
+/// write in `JobLauncher`, which two processes could interleave — both read
+/// "no live execution", both inserted, and one instance ran twice. For a
+/// billing job that is a duplicated financial effect, and it happens exactly
+/// when it is most likely to: two replicas of one `CronJob`.
+///
+/// A check-then-act implementation fails this by producing **two** executions.
+/// `tokio::join!` interleaves the two futures at every `.await` inside them,
+/// which is precisely where a non-atomic implementation can be split.
+pub async fn only_one_of_two_concurrent_launches_wins<R: JobRepository>(repository: &R) {
+    let instance = repository
+        .find_or_create_instance("nightly", &params(&[("date", "2026-08-06")]))
+        .await
+        .unwrap();
+
+    let (first, second) = tokio::join!(
+        repository.start_execution("nightly", instance.id()),
+        repository.start_execution("nightly", instance.id()),
+    );
+
+    let winners = usize::from(first.is_ok()) + usize::from(second.is_ok());
+    assert_eq!(
+        winners, 1,
+        "exactly one launch may win; got first={first:?} second={second:?}"
+    );
+
+    // The store is the record: two rows here means both inserted, whatever the
+    // return values claimed.
+    assert_eq!(
+        repository.executions(instance.id()).await.unwrap().len(),
+        1,
+        "a refused launch must not leave an execution behind"
+    );
+
+    // The loser is told why, rather than getting an opaque constraint error it
+    // cannot act on.
+    let loser = if first.is_err() { first } else { second };
+    assert!(
+        matches!(
+            loser,
+            Err(BatchError::JobExecutionAlreadyRunning { .. })
+                | Err(BatchError::JobInstanceAlreadyComplete { .. })
+        ),
+        "the loser must get a launch refusal, got {loser:?}"
+    );
+}
+
 pub async fn update_execution_persists_a_status_change<R: JobRepository>(repository: &R) {
     let mut execution = open_execution(repository, "nightly").await;
     execution.set_status(BatchStatus::Completed);
@@ -733,6 +913,12 @@ macro_rules! job_repository_conformance {
             an_instance_can_have_several_distinct_executions,
             a_new_execution_starts_in_starting,
             create_execution_rejects_an_unknown_instance,
+            start_execution_opens_a_started_execution,
+            start_execution_refuses_a_completed_instance,
+            start_execution_refuses_a_live_execution,
+            start_execution_allows_a_terminal_unsuccessful_instance,
+            start_execution_rejects_an_unknown_instance,
+            only_one_of_two_concurrent_launches_wins,
             update_execution_persists_a_status_change,
             update_execution_replaces_rather_than_appending,
             update_execution_rejects_an_unknown_execution,

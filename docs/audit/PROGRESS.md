@@ -8,14 +8,14 @@ Findings keep their audit IDs, so a row here and a row there are the same item.
 | | |
 |---|---:|
 | Findings raised | 68 |
-| **Resolved** | **21** |
+| **Resolved** | **23** |
 | Closed as "no change recommended" (verified at audit time) | 7 |
-| Outstanding | 40 |
+| Outstanding | 38 |
 
 Verification for everything below: `cargo fmt --all --check`,
-`cargo clippy --workspace --all-targets --all-features -- -D warnings`, and
-`cargo test` over the four crates that need no Docker — 14 test binaries, all
-green. `batchflow-postgres` and `batchflow-redis` compile and lint clean but
+`cargo clippy --workspace --all-targets --all-features -- -D warnings`,
+`cargo doc` with `RUSTDOCFLAGS=-D warnings`, and `cargo test` over the four
+crates that need no Docker — **214 tests, all green**. `batchflow-postgres` and `batchflow-redis` compile and lint clean but
 their integration suites were **not** run in this session (no Docker daemon
 available); see [Not verified here](#not-verified-here).
 
@@ -231,15 +231,94 @@ key construction.
 
 ---
 
+## Round 2 — CONC-1
+
+### CONC-1 / TEST-1 — The launcher gate is atomic ✅
+
+**Was:** the FR-4.4 gate was a read, a decision and a write in `JobLauncher`:
+
+```
+P1: last_execution(7) -> None
+P2: last_execution(7) -> None
+P1: create_execution(7) -> id 100
+P2: create_execution(7) -> id 101
+P1, P2: both run the same instance concurrently
+```
+
+Both launch. Both readers open at the same bookmark. Both write the same rows.
+The 0.1.0 CHANGELOG disclosed this under "known limitations", and
+`docs/Operations.md` carried an instruction to run one replica per instance.
+
+**Now:** `JobRepository::start_execution(job_name, instance_id)` decides *and*
+inserts as one operation, returning an execution already `Started`.
+
+**The design decision worth recording: the gate moved out of the launcher and
+into the store.** `JobLauncher` cannot close this race — it has no way to make
+two calls atomic, and the trait deliberately offers no cross-method transaction
+(exposing one would let a caller hold a metadata transaction across a whole job
+run, which is the one-transaction-per-step anti-pattern the chunk loop exists to
+avoid). The store can, so the decision belongs there and the launcher now reads
+as "ask whether we may run".
+
+Returning `Started` rather than `Starting` is the second half: a row that exists
+but does not yet hold the instance is a window the gate does not cover. It also
+removes a round trip.
+
+| Backend | Mechanism |
+|---|---|
+| Postgres | `SELECT id FROM job_instance WHERE id = $1 FOR UPDATE`, then the gate and the insert in the same transaction. Per instance, so unrelated jobs never contend. |
+| Redis | One Lua script returning a `(tag, id)` pair, so the caller can tell three refusals apart. |
+| In-memory | One `Mutex` acquisition with no `.await` between check and insert. |
+
+`create_execution` is **unchanged** and stays the unconditional primitive — it
+is what the conformance suite and tooling use to mint a row without the gate. A
+partial unique index over live executions was considered as defence in depth and
+rejected for now: it would also constrain `create_execution`, and a primitive
+that mints a row is worth keeping. It remains available as later hardening.
+
+**Six conformance cases**, so the contract binds every backend including
+third-party ones: opens a `Started` execution; refuses a completed instance;
+refuses a live one (naming it); **allows `Failed`/`Stopped`/`Abandoned`** (the
+restart door — the control that stops the gate from refusing everything);
+rejects an unknown instance; and `only_one_of_two_concurrent_launches_wins`.
+
+Plus two at the launcher level, where a user actually calls: two concurrent
+`run`s of one instance do the work once, and — the control —
+**two concurrent runs of *different* instances both proceed**, which a gate that
+simply serialised everything would fail.
+
+**The race test was verified against a deliberately broken implementation.** I
+temporarily rewrote the in-memory `start_execution` as check-then-`yield_now`-
+then-act and confirmed that `only_one_of_two_concurrent_launches_wins` fails
+while **the other five `start_execution` cases still pass** — which is the point,
+and is now recorded in that case's doc comment: the ordinary gate tests cannot
+detect non-atomicity, only the race test can.
+
+**`docs/Operations.md` §8 "Running more than one replica"** replaces the old
+warning, and states plainly what this does *not* buy: the loser is refused, not
+queued, so two replicas are redundancy rather than a way to make one job faster.
+
+---
+
 ## Not verified here
 
 - **`batchflow-postgres` and `batchflow-redis` integration suites.** No Docker
   daemon in this environment. Both crates build and lint clean under
-  `--all-features`, and the Postgres SQL change was made byte-identical to the
-  committed `.sqlx/` cache precisely so it needs no re-preparation — but the
-  conformance suites have not been executed against a live server since these
-  changes. **Run `cargo test --workspace --all-features` on a machine with
-  Docker before releasing.**
+  `--all-features`, but the conformance suites have not been executed against a
+  live server. **Run `cargo test --workspace --all-features` on a machine with
+  Docker before releasing.** The six new `start_execution` conformance cases run
+  automatically against both backends, so that command is also the verification
+  for CONC-1.
+- **The Postgres `.sqlx` cache entry for CONC-1 was authored by hand**, because
+  `cargo sqlx prepare` needs a live database. It is
+  `SELECT id FROM job_instance WHERE id = $1 FOR UPDATE` — one `Int8` parameter,
+  one non-nullable `Int8` column, both derivable from the schema — and the
+  filename is `sha256(query)`, which is how sqlx keys the cache. The macro
+  accepts it and the crate compiles. Everything else in `start_execution`
+  deliberately reuses existing query text **byte-for-byte**, since the cache is
+  keyed on the query string and not on whether it runs against a pool or a
+  transaction. Re-run `cargo sqlx prepare` when a database is available to
+  confirm it round-trips.
 - **The Redis eviction path** is a code change with no test behind it; a test
   needs a container that can be made to evict. Worth adding with the rest of
   SEC-2.
@@ -248,16 +327,9 @@ key construction.
 
 ## Outstanding, in the order the roadmap wants them
 
-### Phase 1 remainder
+### Phase 1
 
-- **CONC-1** — the launcher's check-then-act race. The largest correctness item
-  left. Needs a partial unique index on live executions plus a conditional
-  insert, and the decision has to move from `JobLauncher` into the repository
-  (only the store can make it atomically). `docs/Operations.md` currently tells
-  operators to run one replica per instance because of this.
-- **TEST-1** — the conformance case for concurrent `create_execution`. Write it
-  `#[ignore]`d now: it fails against all three backends, which is the point, and
-  it becomes the acceptance test for CONC-1.
+Complete. Both Criticals and every High in phase 1 are resolved.
 
 ### Phase 2
 
@@ -297,14 +369,18 @@ ARCH-1), DEBT-4, DEBT-7.
 
 ## Notes for the next session
 
-1. **Get Docker running first** and run the full suite. Nothing below should be
-   started until the backend suites are known green.
-2. **CONC-1 is the next real piece of work.** It is the only remaining item that
-   breaks the framework's headline promise, and `docs/Operations.md` has an
-   operational workaround in it that should not be permanent.
-3. **PROD-2 before PROD-3 and ERR-1** — both depend on its columns.
-4. **Do PERF-4's partition column with PROD-2's migration.** Adding a nullable
+1. **Get Docker running first** and run the full suite. Two things specifically
+   need it: the six new `start_execution` conformance cases against Postgres and
+   Redis, and a `cargo sqlx prepare` to confirm the hand-authored cache entry
+   round-trips. Nothing below should be started until that is green.
+2. **PROD-2 is the next real piece of work** — timestamps, heartbeat and
+   `exit_message`. One migration unlocks four capabilities, and PROD-3 and ERR-1
+   both depend on its columns.
+3. **Do PERF-4's partition column with PROD-2's migration.** Adding a nullable
    column to an empty table is free; adding it to three years of production
    metadata while changing the restart lookup key is not.
-5. **Reindenting a `sqlx::query!` invalidates the offline cache.** It cost time
+4. **Reindenting a `sqlx::query!` invalidates the offline cache.** It cost time
    in this session. `CONTRIBUTING.md` now says so.
+5. **A partial unique index over live executions** is available as defence in
+   depth for CONC-1 if `start_execution` is ever bypassed — see the round 2 note
+   for why it was not taken now.

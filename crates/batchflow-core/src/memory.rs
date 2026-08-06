@@ -134,6 +134,58 @@ impl JobRepository for InMemoryJobRepository {
         Ok(execution)
     }
 
+    /// One lock acquisition covers the check and the insert, with no `.await`
+    /// between them, so the two cannot interleave with another caller's.
+    async fn start_execution(
+        &self,
+        job_name: &str,
+        instance_id: JobInstanceId,
+    ) -> Result<JobExecution, BatchError> {
+        let mut inner = self.lock()?;
+
+        if !inner.instances.values().any(|i| i.id() == instance_id) {
+            return Err(BatchError::repository(format!(
+                "Instance {instance_id:?} not found"
+            )));
+        }
+
+        // Every arm spelled out, as in the launcher this replaces: a new
+        // `BatchStatus` should break the build here rather than defaulting to
+        // "launch over it".
+        if let Some(last) = inner
+            .executions
+            .iter()
+            .rev()
+            .find(|e| e.instance_id() == instance_id)
+        {
+            match last.status() {
+                BatchStatus::Completed => {
+                    return Err(BatchError::JobInstanceAlreadyComplete {
+                        job_name: job_name.to_owned(),
+                        instance_id,
+                    });
+                }
+                BatchStatus::Starting | BatchStatus::Started => {
+                    return Err(BatchError::JobExecutionAlreadyRunning {
+                        job_name: job_name.to_owned(),
+                        execution_id: last.id(),
+                    });
+                }
+                // Terminal but unsuccessful — the restart door.
+                BatchStatus::Failed | BatchStatus::Stopped | BatchStatus::Abandoned => {}
+            }
+        }
+
+        inner.next_id += 1;
+        let mut execution = JobExecution::new(JobExecutionId::new(inner.next_id), instance_id);
+        // `Started`, not `Starting`: the row must hold the instance the moment
+        // it exists, or the gate has a window it does not cover.
+        execution.set_status(BatchStatus::Started);
+        inner.executions.push(execution.clone());
+
+        Ok(execution)
+    }
+
     async fn update_execution(&self, execution: &JobExecution) -> Result<(), BatchError> {
         let mut inner = self.lock()?;
 

@@ -484,6 +484,14 @@ impl JobRepository for CommitFails {
         self.0.create_execution(instance_id).await
     }
 
+    async fn start_execution(
+        &self,
+        job_name: &str,
+        instance_id: JobInstanceId,
+    ) -> Result<JobExecution, BatchError> {
+        self.0.start_execution(job_name, instance_id).await
+    }
+
     async fn update_execution(&self, execution: &JobExecution) -> Result<(), BatchError> {
         self.0.update_execution(execution).await
     }
@@ -930,6 +938,14 @@ impl JobRepository for StatusWriteFails {
         instance_id: JobInstanceId,
     ) -> Result<JobExecution, BatchError> {
         self.0.create_execution(instance_id).await
+    }
+
+    async fn start_execution(
+        &self,
+        job_name: &str,
+        instance_id: JobInstanceId,
+    ) -> Result<JobExecution, BatchError> {
+        self.0.start_execution(job_name, instance_id).await
     }
 
     async fn update_execution(&self, execution: &JobExecution) -> Result<(), BatchError> {

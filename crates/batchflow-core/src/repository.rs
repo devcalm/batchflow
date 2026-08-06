@@ -52,9 +52,63 @@ pub trait JobRepository: Send + Sync {
         parameters: &JobParameters,
     ) -> impl Future<Output = Result<Option<JobInstance>, BatchError>> + Send;
 
-    /// Opens a new attempt at `instance_id`.
+    /// Opens a new attempt at `instance_id`, unconditionally.
+    ///
+    /// The primitive: it mints a row and does not consult FR-4.4. Launching is
+    /// [`start_execution`](Self::start_execution), which is the one a launcher
+    /// calls; this exists for tooling that needs to create an attempt without
+    /// the gate, and for the conformance suite.
     fn create_execution(
         &self,
+        instance_id: JobInstanceId,
+    ) -> impl Future<Output = Result<JobExecution, BatchError>> + Send;
+
+    /// Decides whether `instance_id` may run and opens the attempt if it may —
+    /// **as one atomic operation**.
+    ///
+    /// Returns an execution already in [`BatchStatus::Started`](crate::BatchStatus),
+    /// so a caller needs no follow-up write and there is no window in which the
+    /// row exists but does not yet hold the instance.
+    ///
+    /// # Why this is a repository method and not launcher logic
+    ///
+    /// The gate is a check-then-act: read the last execution, decide, insert.
+    /// Split across two round trips it is a race that two schedulers both win —
+    /// both read "no live execution", both insert, and one job instance runs
+    /// twice. For a billing or ledger job that is a duplicated financial
+    /// effect, and it happens exactly when it is most likely to: two replicas
+    /// of the same `CronJob`, or an operator relaunching by hand while a
+    /// schedule fires.
+    ///
+    /// A [`JobLauncher`](crate::JobLauncher) cannot close that race, because it
+    /// has no way to make two calls atomic — the trait deliberately offers no
+    /// cross-method transaction, since exposing one would let a caller hold a
+    /// metadata transaction across a whole job run, which is the
+    /// one-transaction-per-step anti-pattern the chunk loop exists to avoid.
+    /// The store can close it, so the decision belongs here.
+    ///
+    /// # Implementing it
+    ///
+    /// The check and the insert must not be separable by a concurrent caller.
+    /// Whatever the backend offers: a row lock on the instance, a conditional
+    /// insert, a unique index over live executions, a script, a mutex. What is
+    /// *not* sufficient is calling [`last_execution`](Self::last_execution) and
+    /// then [`create_execution`](Self::create_execution) — that is the bug.
+    ///
+    /// `job_name` is carried only so the refusals can name the job; the
+    /// instance already determines everything else.
+    ///
+    /// # Errors
+    ///
+    /// - [`BatchError::JobInstanceAlreadyComplete`] if this instance has
+    ///   already succeeded (FR-4.4). To a scheduler this means "nothing to do".
+    /// - [`BatchError::JobExecutionAlreadyRunning`] if its last execution is
+    ///   `Starting` or `Started`. If that process is in fact dead, clear it
+    ///   with [`abandon_execution`](Self::abandon_execution).
+    /// - [`BatchError::Repository`] if `instance_id` is unknown.
+    fn start_execution(
+        &self,
+        job_name: &str,
         instance_id: JobInstanceId,
     ) -> impl Future<Output = Result<JobExecution, BatchError>> + Send;
 
@@ -188,6 +242,14 @@ impl<R: JobRepository> JobRepository for std::sync::Arc<R> {
         instance_id: JobInstanceId,
     ) -> impl Future<Output = Result<JobExecution, BatchError>> + Send {
         (**self).create_execution(instance_id)
+    }
+
+    fn start_execution(
+        &self,
+        job_name: &str,
+        instance_id: JobInstanceId,
+    ) -> impl Future<Output = Result<JobExecution, BatchError>> + Send {
+        (**self).start_execution(job_name, instance_id)
     }
 
     fn update_execution(

@@ -15,6 +15,29 @@ version number and are released together.
 
 **From the engineering audit (`docs/audit/`), phase 1**
 
+- **`JobRepository::start_execution` — the launch gate is now atomic.** It
+  decides whether an instance may run *and* opens the execution as one
+  indivisible operation, returning it already `Started`. This closes the race
+  the 0.1.0 CHANGELOG listed under "known limitations": the gate used to be a
+  read, a decision and a write in `JobLauncher`, which two processes could
+  interleave — both read "no live execution", both inserted, and **one job
+  instance ran twice**. For a billing or ledger job that is a duplicated
+  financial effect, and it happened exactly when it was most likely to: two
+  replicas of one `CronJob`, or an operator relaunching by hand while a
+  schedule fired. Running more than one replica is now safe.
+
+  The decision moved into the repository because only the store can make it
+  indivisible — `JobLauncher` has no way to make two calls atomic, and the trait
+  deliberately offers no cross-method transaction. Postgres takes a
+  `SELECT … FOR UPDATE` row lock on the instance and runs the gate and the
+  insert in one transaction (per instance, so unrelated jobs never contend);
+  Redis uses one Lua script; the in-memory store one `Mutex` acquisition.
+  `create_execution` is unchanged and remains the unconditional primitive.
+
+  Six conformance cases cover it, including
+  `only_one_of_two_concurrent_launches_wins` — so a third-party backend that
+  gets this wrong fails its test run rather than duplicating work in
+  production.
 - **Graceful stop** (`StopSignal`, `JobLauncher::with_stop_signal`,
   `StepCommit::stop_requested`, `BatchError::Stopped`). A raised signal ends the
   step at its next *committed* chunk boundary — never mid-chunk — records
@@ -217,10 +240,8 @@ rather than a diff.
 
 ### Known limitations
 
-- **The launcher's gate is not race-free.** Instance identity is enforced by a
-  unique constraint in Postgres, but reading the last execution and creating
-  the next one are two statements outside a transaction, so two processes
-  racing an instance that has no prior execution can both launch.
+- ~~**The launcher's gate is not race-free.**~~ — closed by
+  `JobRepository::start_execution`, see Unreleased.
 - ~~**No scheduling adapters**~~ — shipped as `batchflow-scheduler`, see
   Unreleased.
 - Parallel and partitioned steps are not implemented. A reader is `&mut self`,

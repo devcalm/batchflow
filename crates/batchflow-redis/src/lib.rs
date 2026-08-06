@@ -224,6 +224,34 @@ static CREATE_EXECUTION: LazyLock<Script> = LazyLock::new(|| {
     )
 });
 
+/// The FR-4.4 gate and the insert in one script, so no concurrent launcher can
+/// separate them — the same reason every other check-then-act here is Lua.
+///
+/// Returns a two-element array: an outcome tag, and the execution id it refers
+/// to (empty when there is none). A flat array of strings rather than a bare
+/// value because the caller has to tell three refusals apart, and `tostring`
+/// keeps the decoding uniform.
+static START_EXECUTION: LazyLock<Script> = LazyLock::new(|| {
+    Script::new(
+        r"
+    if redis.call('EXISTS', KEYS[2]) == 0 then return {'missing', ''} end
+
+    local last = redis.call('LINDEX', KEYS[3], -1)
+    if last then
+        local status = redis.call('HGET', ARGV[4] .. ':execution:' .. last, 'status')
+        if status == ARGV[5] then return {'complete', tostring(last)} end
+        if status == ARGV[6] or status == ARGV[2] then return {'running', tostring(last)} end
+    end
+
+    local id = redis.call('INCR', KEYS[1])
+    redis.call('HSET', ARGV[4] .. ':execution:' .. id,
+               'instance_id', ARGV[1], 'status', ARGV[2], 'context', ARGV[3])
+    redis.call('RPUSH', KEYS[3], id)
+    return {'ok', tostring(id)}
+",
+    )
+});
+
 /// Returns 0 when the execution is unknown, so an update cannot silently
 /// insert.
 static UPDATE_EXECUTION: LazyLock<Script> = LazyLock::new(|| {
@@ -488,6 +516,67 @@ impl JobRepository for RedisJobRepository {
             )));
         }
         Ok(JobExecution::new(JobExecutionId::new(id), instance_id))
+    }
+
+    /// One script, so the gate and the insert cannot interleave. Redis's
+    /// single-threaded command execution is what makes that sufficient.
+    async fn start_execution(
+        &self,
+        job_name: &str,
+        instance_id: JobInstanceId,
+    ) -> Result<JobExecution, BatchError> {
+        let outcome: Vec<String> = START_EXECUTION
+            .key(seq_key())
+            .key(instance_key(instance_id.get()))
+            .key(executions_key(instance_id.get()))
+            .arg(instance_id.get())
+            .arg(STARTED)
+            .arg("{}")
+            .arg(NS)
+            .arg(COMPLETED)
+            .arg(STARTING)
+            .invoke_async(&mut self.conn())
+            .await
+            .map_err(re)?;
+
+        let (tag, id) = match outcome.as_slice() {
+            [tag, id] => (tag.as_str(), id.as_str()),
+            other => {
+                return Err(BatchError::repository(format!(
+                    "start_execution returned {other:?}, expected a tag and an id"
+                )));
+            }
+        };
+
+        // Parsed only on the paths that carry one; `complete` and `missing`
+        // have no id to speak of.
+        let parsed = || -> Result<JobExecutionId, BatchError> {
+            id.parse()
+                .map(JobExecutionId::new)
+                .map_err(BatchError::repository)
+        };
+
+        match tag {
+            "ok" => {
+                let mut execution = JobExecution::new(parsed()?, instance_id);
+                execution.set_status(BatchStatus::Started);
+                Ok(execution)
+            }
+            "complete" => Err(BatchError::JobInstanceAlreadyComplete {
+                job_name: job_name.to_owned(),
+                instance_id,
+            }),
+            "running" => Err(BatchError::JobExecutionAlreadyRunning {
+                job_name: job_name.to_owned(),
+                execution_id: parsed()?,
+            }),
+            "missing" => Err(BatchError::repository(format!(
+                "unknown instance {instance_id:?}"
+            ))),
+            other => Err(BatchError::repository(format!(
+                "start_execution returned an unknown outcome {other:?}"
+            ))),
+        }
     }
 
     async fn update_execution(&self, execution: &JobExecution) -> Result<(), BatchError> {

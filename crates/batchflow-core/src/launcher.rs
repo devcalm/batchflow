@@ -1,6 +1,6 @@
 use crate::metrics::{JOBS_FINISHED, JOBS_STARTED, LABEL_JOB, LABEL_STATUS, status_label};
 use crate::tracing::SPAN_JOB;
-use crate::{BatchError, BatchStatus, Job, JobExecution, JobParameters, JobRepository, StopSignal};
+use crate::{BatchError, Job, JobExecution, JobParameters, JobRepository, StopSignal};
 use ::metrics::counter;
 use ::tracing::Instrument;
 
@@ -68,16 +68,33 @@ impl<R: JobRepository> JobLauncher<R> {
     /// let _ = launcher.run(&mut job, &JobParameters::new());
     /// ```
     ///
+    /// # Concurrency
+    ///
+    /// The FR-4.4 gate is
+    /// [`JobRepository::start_execution`](crate::JobRepository::start_execution),
+    /// which decides and inserts as one atomic operation. Two processes racing
+    /// the same instance — two replicas of a `CronJob`, or an operator
+    /// relaunching by hand while a schedule fires — therefore produce exactly
+    /// one run, and the loser is refused. The decision lives in the store
+    /// because only the store can make it indivisible.
+    ///
     /// # Errors
     ///
     /// - [`BatchError::JobInstanceAlreadyComplete`] if this instance has already
-    ///   succeeded (FR-4.4).
+    ///   succeeded (FR-4.4). To a scheduler this means "nothing to do", which is
+    ///   what [`batchflow_scheduler::trigger`] exists to classify.
     /// - [`BatchError::JobExecutionAlreadyRunning`] if its last execution has
     ///   not reached a terminal status. If that process is in fact dead, clear
     ///   it with
     ///   [`JobRepository::abandon_execution`](crate::JobRepository::abandon_execution).
+    /// - [`BatchError::Stopped`] if a [`StopSignal`] ended the run at a commit
+    ///   boundary. The execution is persisted as
+    ///   [`BatchStatus::Stopped`](crate::BatchStatus::Stopped) and relaunching
+    ///   resumes it.
     /// - otherwise the step's own error if the job fails — the execution is
     ///   persisted as `Failed` *before* that error propagates.
+    ///
+    /// [`batchflow_scheduler::trigger`]: https://docs.rs/batchflow-scheduler
     pub async fn run(
         &self,
         job: &mut Job<R::Tx>,
@@ -88,31 +105,19 @@ impl<R: JobRepository> JobLauncher<R> {
             .find_or_create_instance(job.name(), parameters)
             .await?;
 
-        // Runs before `create_execution`, or a refused launch leaves an orphan
-        // row. Every arm is spelled out so a new `BatchStatus` breaks the build
-        // here rather than defaulting to "launch over it".
-        if let Some(last) = self.repository.last_execution(instance.id()).await? {
-            match last.status() {
-                BatchStatus::Completed => {
-                    return Err(BatchError::JobInstanceAlreadyComplete {
-                        job_name: job.name().into(),
-                        instance_id: instance.id(),
-                    });
-                }
-                BatchStatus::Starting | BatchStatus::Started => {
-                    return Err(BatchError::JobExecutionAlreadyRunning {
-                        job_name: job.name().into(),
-                        execution_id: last.id(),
-                    });
-                }
-                // Terminal but unsuccessful — the restart door.
-                BatchStatus::Failed | BatchStatus::Stopped | BatchStatus::Abandoned => {}
-            }
-        }
-
-        let mut execution = self.repository.create_execution(instance.id()).await?;
-        execution.set_status(BatchStatus::Started);
-        self.repository.update_execution(&execution).await?;
+        // The FR-4.4 gate *and* the insert, in one call, because they have to
+        // be one operation. This used to be a read, a decision and a write
+        // here, which two schedulers could interleave: both read "no live
+        // execution", both inserted, and one instance ran twice. Only the store
+        // can make those atomic, so the decision lives there and this reads as
+        // "ask whether we may run".
+        //
+        // Comes back already `Started`, so there is no follow-up write and no
+        // window in which the row exists without holding the instance.
+        let mut execution = self
+            .repository
+            .start_execution(job.name(), instance.id())
+            .await?;
 
         // Past every gate above, so a launch rejected by FR-4.4 is not counted
         // as a start. `jobs_started - jobs_finished` is then the number of runs
@@ -191,7 +196,8 @@ mod tests {
     };
     use crate::tracing::SPAN_STEP;
     use crate::{
-        ChunkStep, FaultTolerance, InMemoryJobRepository, JobExecutionId, JobParameter, Unmanaged,
+        BatchStatus, ChunkStep, FaultTolerance, InMemoryJobRepository, JobExecutionId,
+        JobParameter, Unmanaged,
     };
     use metrics_util::debugging::DebugValue;
     use tracing::Level;
@@ -504,6 +510,91 @@ mod tests {
             .await;
 
         assert!(matches!(result, Err(BatchError::Repository(_))));
+    }
+
+    // ---- the launch gate is atomic (audit CONC-1) ----
+
+    /// Two launchers going for one instance at the same moment: exactly one
+    /// runs.
+    ///
+    /// The conformance suite pins this at the repository level for every
+    /// backend; this pins it at the level a user actually calls, and is what
+    /// would fail if the launcher ever grew its own gate again on top of
+    /// `start_execution`.
+    ///
+    /// `SharedSink` is the evidence rather than the return values: the question
+    /// is whether the *work* happened twice.
+    #[tokio::test]
+    async fn two_concurrent_launches_of_one_instance_run_the_job_once() {
+        let launcher = JobLauncher::new(InMemoryJobRepository::default());
+        let sink = SharedSink::new();
+
+        let job = |sink: &SharedSink| {
+            Job::new(
+                "nightly",
+                vec![Box::new(ChunkStep::new(
+                    "load",
+                    VecReader::new(vec![2, 4]),
+                    EvenDoubler,
+                    Unmanaged(sink.writer(usize::MAX)),
+                    nz(2),
+                ))],
+            )
+        };
+
+        let (mut first, mut second) = (job(&sink), job(&sink));
+        // Bound, so the parameters outlive the `join!` that borrows them.
+        let same_day = params("2026-08-06");
+        let (a, b) = tokio::join!(
+            launcher.run(&mut first, &same_day),
+            launcher.run(&mut second, &same_day),
+        );
+
+        assert_eq!(
+            usize::from(a.is_ok()) + usize::from(b.is_ok()),
+            1,
+            "exactly one launch may win; got a={a:?} b={b:?}"
+        );
+
+        // Without the fix both launches proceeded and this read [4, 8, 4, 8] —
+        // one instance's work done twice, which for a billing job is a
+        // duplicated financial effect.
+        assert_eq!(sink.written(), vec![4, 8]);
+
+        // Either refusal is correct, and which one appears is a scheduling
+        // detail: `InMemoryJobRepository` never awaits anything real, so the
+        // winner here runs to completion before the loser is polled at all and
+        // the loser sees a *completed* instance. Against a backend that yields
+        // on I/O the loser would see a running one. What must hold either way
+        // is that it is a launch refusal and not an opaque constraint error it
+        // cannot act on.
+        let loser = if a.is_err() { a } else { b };
+        assert!(
+            matches!(
+                loser,
+                Err(BatchError::JobExecutionAlreadyRunning { .. })
+                    | Err(BatchError::JobInstanceAlreadyComplete { .. })
+            ),
+            "the loser must be told why, got {loser:?}"
+        );
+    }
+
+    /// The control: two launches of *different* instances are unrelated and
+    /// both run. A gate that serialised everything would pass the test above
+    /// while making the framework single-threaded.
+    #[tokio::test]
+    async fn concurrent_launches_of_different_instances_both_run() {
+        let launcher = JobLauncher::new(InMemoryJobRepository::default());
+
+        let (mut monday, mut tuesday) = (ok_job(), ok_job());
+        let (sixth, seventh) = (params("2026-08-06"), params("2026-08-07"));
+        let (a, b) = tokio::join!(
+            launcher.run(&mut monday, &sixth),
+            launcher.run(&mut tuesday, &seventh),
+        );
+
+        assert!(a.is_ok(), "{a:?}");
+        assert!(b.is_ok(), "{b:?}");
     }
 
     // ---- graceful stop (audit PROD-1) ----

@@ -235,7 +235,34 @@ delivers, so a 1,000-item chunk with one bad row delivers roughly 2,000 items.
 
 ---
 
-## 8. Scheduling
+## 8. Running more than one replica
+
+**Safe.** The launch gate is atomic: `JobRepository::start_execution` decides
+whether an instance may run *and* opens the execution as one indivisible
+operation, so two replicas racing the same instance produce exactly one run and
+the loser is refused with `JobExecutionAlreadyRunning` (or
+`JobInstanceAlreadyComplete`, if the winner finished first).
+
+How each backend achieves it:
+
+| Backend | Mechanism |
+|---|---|
+| Postgres | `SELECT … FOR UPDATE` on the `job_instance` row, with the gate and the insert in one transaction. The lock is per instance, so unrelated jobs never contend. |
+| Redis | One Lua script; Redis's single-threaded execution does the rest. |
+| In-memory | One `Mutex` acquisition with no `.await` inside it. |
+
+The conformance suite pins this for every backend
+(`only_one_of_two_concurrent_launches_wins`), so a third-party `JobRepository`
+that gets it wrong fails its test run rather than duplicating work in
+production.
+
+What this does **not** give you is parallelism *within* one instance: the loser
+does not queue, it is refused. Two replicas are a redundancy and failover
+arrangement, not a way to make one job go faster.
+
+---
+
+## 9. Scheduling
 
 `JobParameters` is what makes a schedule idempotent. Derive them from the tick —
 `date=2026-08-06` for a nightly job, `hour=2026-08-06T14` for an hourly one — so
@@ -255,16 +282,12 @@ restarted by the controller into the same refusal.
 
 ---
 
-## 9. Known gaps
+## 10. Known gaps
 
 Current as of 0.1.1. The full list with severities and proposed fixes is in
 [`docs/audit/FINDINGS.md`](audit/FINDINGS.md); these are the ones that change
 what an operator should do.
 
-- **The launcher's gate is racy.** Two processes racing the same instance can
-  both launch. Instance *identity* is enforced by a unique constraint, but
-  reading the last execution and creating the next are two statements outside a
-  transaction. Until this is closed, **run one replica per job instance**.
 - **No timestamps in the metadata store.** You cannot ask the store when a job
   ran or how long it took; only the process's own metrics and logs know.
 - **No failure reason in the metadata store.** A failed execution records

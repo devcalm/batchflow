@@ -303,6 +303,101 @@ impl JobRepository for PostgresJobRepository {
         Ok(JobExecution::new(JobExecutionId::new(row.id), instance_id))
     }
 
+    /// The gate and the insert in one transaction, serialised by a row lock on
+    /// the instance.
+    ///
+    /// `SELECT … FOR UPDATE` on `job_instance` is what makes this atomic: a
+    /// second launcher racing the same instance blocks on that lock until the
+    /// first has committed its execution, and then reads it and is refused.
+    /// The lock is per instance, so unrelated jobs never contend.
+    ///
+    /// Chosen over a partial unique index on live executions because that would
+    /// also constrain [`create_execution`](JobRepository::create_execution),
+    /// which is deliberately unconditional — a primitive that mints a row is
+    /// worth keeping. The index remains available as later hardening if this
+    /// method is ever bypassed.
+    async fn start_execution(
+        &self,
+        job_name: &str,
+        instance_id: JobInstanceId,
+    ) -> Result<JobExecution, BatchError> {
+        let mut tx = self.pool.begin().await.map_err(db)?;
+
+        // Taken before anything is read, so the whole decision below sees a
+        // state no concurrent launcher can change under it.
+        let locked = sqlx::query!(
+            "SELECT id FROM job_instance WHERE id = $1 FOR UPDATE",
+            instance_id.get(),
+        )
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(db)?;
+
+        if locked.is_none() {
+            return Err(BatchError::repository(format!(
+                "unknown instance {instance_id:?}"
+            )));
+        }
+
+        // Same statement `last_execution` runs, against the transaction rather
+        // than the pool — so it shares the prepared-query cache entry.
+        let last = sqlx::query!(
+            "SELECT id, instance_id, status, execution_context
+               FROM job_execution
+              WHERE instance_id = $1
+              ORDER BY id DESC
+              LIMIT 1",
+            instance_id.get(),
+        )
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(db)?;
+
+        if let Some(row) = last {
+            match status_from(&row.status)? {
+                BatchStatus::Completed => {
+                    return Err(BatchError::JobInstanceAlreadyComplete {
+                        job_name: job_name.to_owned(),
+                        instance_id,
+                    });
+                }
+                BatchStatus::Starting | BatchStatus::Started => {
+                    return Err(BatchError::JobExecutionAlreadyRunning {
+                        job_name: job_name.to_owned(),
+                        execution_id: JobExecutionId::new(row.id),
+                    });
+                }
+                // Terminal but unsuccessful — the restart door.
+                BatchStatus::Failed | BatchStatus::Stopped | BatchStatus::Abandoned => {}
+                other => {
+                    return Err(BatchError::repository(format!(
+                        "status {other:?} has no launch rule"
+                    )));
+                }
+            }
+        }
+
+        // `STARTED`, not `STARTING`: the row has to hold the instance the
+        // moment it becomes visible, which is when this transaction commits.
+        let row = sqlx::query!(
+            "INSERT INTO job_execution (instance_id, status, execution_context)
+                  VALUES ($1, $2, $3)
+               RETURNING id",
+            instance_id.get(),
+            STARTED,
+            json(&ExecutionContext::new())?,
+        )
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(db)?;
+
+        tx.commit().await.map_err(db)?;
+
+        let mut execution = JobExecution::new(JobExecutionId::new(row.id), instance_id);
+        execution.set_status(BatchStatus::Started);
+        Ok(execution)
+    }
+
     async fn update_execution(&self, execution: &JobExecution) -> Result<(), BatchError> {
         let affected = sqlx::query!(
             "UPDATE job_execution SET status = $2, execution_context = $3 WHERE id = $1",
