@@ -1,0 +1,33 @@
+[package]
+name = "batchflow-scheduler"
+description = "Scheduler adapters for BatchFlow, a Spring Batch-inspired batch processing framework for Rust."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+documentation = "https://docs.rs/batchflow-scheduler"
+keywords = ["batch", "cron", "scheduler", "orchestration", "job"]
+categories = ["asynchronous", "date-and-time"]
+
+# `cron` is off by default, so without this docs.rs would document only half the
+# crate — and the adapter is the half most readers come for.
+[package.metadata.docs.rs]
+all-features = true
+
+[features]
+# The `tokio-cron-scheduler` adapter. Off by default: the trigger semantics are
+# the part every user needs, and an in-process cron engine is the part most
+# deployments replace with Kubernetes or systemd.
+cron = ["dep:tokio-cron-scheduler"]
+
+[dependencies]
+batchflow-core.workspace = true
+metrics.workspace = true
+tracing.workspace = true
+tokio-cron-scheduler = { workspace = true, optional = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt", "time"] }
+metrics-util.workspace = true

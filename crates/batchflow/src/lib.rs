@@ -6,14 +6,18 @@
 //! async-first execution engine.
 //!
 //! This is the **facade crate**: the one users depend on. It re-exports
-//! [`batchflow_core`] and, over time, will feature-gate the storage backends,
-//! observability, and I/O adapters so a single dependency pulls in a coherent
-//! framework.
+//! [`batchflow_core`]; the storage backends (`batchflow-postgres`,
+//! `batchflow-redis`), the Prometheus wiring (`batchflow-metrics`) and the
+//! scheduler adapters (`batchflow-scheduler`) are separate crates you add
+//! alongside it, because each carries a dependency tree — and in two cases an
+//! MSRV — that nobody should pay for a backend they do not use.
 //!
 //! ## Status
 //!
-//! **Under active development.** This `0.0.0` release reserves the crate name
-//! while the framework is built in the open. It is **not yet usable**.
+//! `0.1.0` — the first usable release. A job runs end to end, commits per chunk,
+//! restarts from a durable bookmark, and retries or skips by classified error.
+//! Pre-1.0, so the API may still change; see the CHANGELOG for the known
+//! limitations.
 //!
 //! ## This crate is where user-facing API tests belong
 //!
@@ -55,6 +59,52 @@
 //!         Ok(())
 //!     }
 //! }
+//! ```
+//!
+//! A [`Tasklet`] needs no macro at all — it is a plain trait with a native
+//! `async fn`, since nothing about it has to be `dyn`. The check below is that
+//! the four names it takes are all re-exported, and that [`Unmanaged`] adapts a
+//! tasklet to a job's transaction type exactly as it does a writer:
+//!
+//! [`Tasklet`]: batchflow_core::Tasklet
+//! [`Unmanaged`]: batchflow_core::Unmanaged
+//!
+//! ```
+//! use batchflow::batchflow_core::{
+//!     BatchError, ContextValue, ExecutionContext, Job, RepeatStatus,
+//!     StepContribution, Tasklet, TaskletStep, Unmanaged,
+//! };
+//!
+//! /// Archives one file per pass, so each pass commits and a restart resumes.
+//! struct Archive { total: i64 }
+//!
+//! impl Tasklet for Archive {
+//!     async fn execute(
+//!         &mut self,
+//!         context: &mut ExecutionContext,
+//!         contribution: &mut StepContribution,
+//!     ) -> Result<RepeatStatus, BatchError> {
+//!         let done = context.get_long("archived")?.unwrap_or(0) + 1;
+//!         context.put("archived", ContextValue::Long(done));
+//!         contribution.increment_write(1);
+//!
+//!         Ok(if done >= self.total {
+//!             RepeatStatus::Finished
+//!         } else {
+//!             RepeatStatus::Continuable
+//!         })
+//!     }
+//! }
+//!
+//! // The annotation is load-bearing, and not only here: anything built from
+//! // `Unmanaged` implements its step trait for *every* `Tx`, so nothing in the
+//! // expression pins one. Naming the job's type is what chooses it — `Job` is
+//! // `Job<()>`, and a Postgres job is `Job<PgTx>` by the same one word.
+//! let job: Job = Job::builder("nightly")
+//!     .step(TaskletStep::new("archive", Unmanaged(Archive { total: 3 })))
+//!     .build();
+//!
+//! assert_eq!(job.name(), "nightly");
 //! ```
 //!
 //! ## Observability

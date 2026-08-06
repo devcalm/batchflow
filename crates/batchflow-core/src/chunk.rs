@@ -257,6 +257,28 @@ where
 
         let chunk = read_chunk(reader, chunk_size, fault, &mut skipped).await?;
         if chunk.is_empty() {
+            // An empty chunk is not necessarily an idle one: a file whose last
+            // rows are all malformed skips its way to exhaustion, and those
+            // skips are real work. Breaking straight out would drop them from
+            // `skip_count` and from the metric — the step would report zero
+            // skips for exactly the input segment that was unreadable — and
+            // would leave the bookmark short of them, so a restart re-reads
+            // rows already known to be poison.
+            //
+            // Found by `skips_and_reads_partition_the_input`, which no
+            // example-based test had covered: it only bites when the *tail* of
+            // the input is skippable.
+            let trailing = skipped - skipped_before;
+            if trailing > 0 {
+                let tx = commit.begin().await?;
+                reader.update(context);
+
+                let mut contribution = StepContribution::new();
+                contribution.increment_skip(trailing);
+                commit.commit(tx, &contribution, context).await?;
+
+                metrics.skipped_reading.increment(trailing as u64);
+            }
             break;
         }
         let read = chunk.len();
@@ -913,6 +935,71 @@ mod tests {
         assert_eq!(commit.commits, 1);
         assert_eq!(commit.total.read_count(), 3);
         assert_eq!(commit.total.skip_count(), 1);
+    }
+
+    /// Skips in the *tail* of the input are counted, even though the chunk they
+    /// happened in is empty and never becomes a write.
+    ///
+    /// Found by the property test `skips_and_reads_partition_the_input`; no
+    /// example test had put a poison row last, and breaking straight out of the
+    /// loop on an empty chunk discarded those skips silently. A step reporting
+    /// zero skips for an unreadable trailing segment is exactly the quiet data
+    /// loss Phase 12 exists to prevent.
+    #[tokio::test]
+    async fn skips_at_the_end_of_the_input_are_still_counted() {
+        let mut reader = PoisonReader::new(vec![2, 4, 99], 99);
+        let mut processor = PoisonProcessor { poison: 0 };
+        let mut writer = Unmanaged(CollectingWriter::new());
+        let mut commit = RecordingCommit::new();
+        let mut context = ExecutionContext::new();
+
+        // chunk_size 2, so the poison row is alone in a third read that yields
+        // an empty chunk.
+        let fault = FaultTolerance::new().classifier(SkipAll).skip_limit(1);
+
+        run_step(
+            &mut reader,
+            &mut processor,
+            &mut writer,
+            &ChunkConfig::new(nz(2), &fault, "test-job", "test-step"),
+            &mut context,
+            &mut commit,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(writer.0.written, vec![4, 8]);
+        assert_eq!(commit.total.read_count(), 2);
+        assert_eq!(commit.total.skip_count(), 1, "the trailing skip is counted");
+        // The extra commit is metadata only: no items, but the skip and the
+        // bookmark past it have to become durable somewhere.
+        assert_eq!(commit.commits, 2);
+    }
+
+    /// The other half of the rule: an ordinary exhausted read commits nothing.
+    /// Without this, "always commit on an empty chunk" would pass the test
+    /// above while adding a pointless transaction to every step in the system.
+    #[tokio::test]
+    async fn an_exhausted_reader_with_no_skips_commits_nothing_extra() {
+        let mut reader = VecReader::new(vec![2, 4]);
+        let mut processor = PoisonProcessor { poison: 0 };
+        let mut writer = Unmanaged(CollectingWriter::new());
+        let mut commit = RecordingCommit::new();
+        let mut context = ExecutionContext::new();
+
+        run_step(
+            &mut reader,
+            &mut processor,
+            &mut writer,
+            &ChunkConfig::new(nz(2), &FaultTolerance::default(), "test-job", "test-step"),
+            &mut context,
+            &mut commit,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(commit.commits, 1);
+        assert_eq!(commit.begins, 1);
     }
 
     /// The limit is step-wide, not per chunk: one bad row in each of several

@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 20d609dfedfbe487778b649dfb4eb14cf38e7626c54de0e5fcafda48c247bd80 # shrinks to items = [1, 2, 3, 4, 5, 6], chunk_size = 1, poison_modulus = 2

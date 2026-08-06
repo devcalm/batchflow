@@ -49,6 +49,21 @@ metrics-exporter-prometheus = { version = "0.18", default-features = false }
 # makes check-then-act operations atomic in a store with no transactions.
 redis = { version = "1.5", features = ["tokio-comp", "connection-manager"] }
 
+# `batchflow-scheduler`, behind its `cron` feature. Default features are already
+# empty upstream, so there is nothing to trim: the storage backends (Postgres,
+# NATS) and `english-to-cron` are all opt-in there.
+tokio-cron-scheduler = { version = "0.15", default-features = false }
+
+# Property tests only. `default-features = false` drops `fork`/`timeout` and
+# with them `rusty-fork` and `tempfile` — a process-forking harness buys
+# crash isolation this suite has no use for. Declared here rather than in the
+# member because a workspace dependency's default features cannot be turned off
+# downstream.
+proptest = { version = "1", default-features = false, features = [
+    "std",
+    "bit-set",
+] }
+
 # Benchmarks only. `default-features = false` drops plotters, rayon and
 # html_reports; `cargo_bench_support` is not optional — without it `cargo bench`
 # refuses to run the harness at all.

@@ -72,7 +72,8 @@ pub trait TransactionalWriter<Tx>: Send {
     ) -> impl Future<Output = Result<(), BatchError>> + Send;
 }
 
-/// Adapts a plain [`ItemWriter`] to any transaction by ignoring it.
+/// Adapts a plain [`ItemWriter`] — or a plain [`Tasklet`](crate::Tasklet) — to
+/// any transaction by ignoring it.
 ///
 /// A blanket `impl<W: ItemWriter, Tx> TransactionalWriter<Tx> for W` is not
 /// possible: it would overlap every direct impl, and Rust cannot prove a type

@@ -5,11 +5,48 @@ All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-All five crates — `batchflow`, `batchflow-core`, `batchflow-postgres`,
-`batchflow-redis` and `batchflow-metrics` — share one version number and are
-released together.
+All six crates — `batchflow`, `batchflow-core`, `batchflow-postgres`,
+`batchflow-redis`, `batchflow-metrics` and `batchflow-scheduler` — share one
+version number and are released together.
 
 ## [Unreleased]
+
+### Added
+
+- **`batchflow-scheduler`** — a sixth crate, closing the last untouched phase.
+  `trigger` turns the launcher's two *refusal* errors into an `Outcome`
+  (`Ran` / `AlreadyComplete` / `AlreadyRunning`) and leaves every other error
+  alone, which is the whole of what a schedule needs; per ADR-006 there is still
+  no cron engine here. `ScheduledJob` binds a launcher to a per-tick job
+  factory, and the optional `cron` feature adapts it to `tokio-cron-scheduler`
+  (37 → 66 dependencies, hence the flag). New metric
+  `batchflow_triggers_total{job,outcome}`, because a refusal creates no
+  `JobExecution` and is therefore invisible in the core vocabulary.
+- **Tasklets** (`Tasklet`, `TransactionalTasklet<Tx>`, `TaskletStep`,
+  `RepeatStatus`) — the second kind of step FR-1.2 always named. One transaction
+  per `execute` call, repeated while the tasklet returns `Continuable`, so a long
+  tasklet gets a commit point and a durable bookmark per pass. Adapted to any
+  `Tx` by the existing `Unmanaged<T>` newtype. No retry or skip, deliberately.
+- **Property tests for the chunk loop** (`proptest`, dev-dependency): counter
+  partition, `ceil(n / chunk_size)` commits, chunk size not changing the result,
+  exact output ordering, and bookmark coverage.
+- `metrics::describe()` now covers `batchflow_chunk_scans_total`, which shipped
+  in 0.1.0 without help text.
+
+### Fixed
+
+- **Skips in the tail of the input were silently dropped.** A step whose last
+  rows are all skippable finished with those skips missing from `skip_count` and
+  from `batchflow_items_skipped_total`, and with its bookmark short of them — so
+  a restart re-read rows already known to be poison. The empty chunk that ends
+  the loop now commits its trailing skips and the bookmark past them. Found by
+  the new property test; no example-based test had put a poison row last.
+
+### Changed
+
+- CI runs `--all-features` for test, clippy and doc, and the 1.85 MSRV lane now
+  covers `batchflow-scheduler` including its `cron` feature. Without it a
+  feature-gated half of the workspace would ship uncompiled.
 
 ## [0.1.0]
 
@@ -98,9 +135,13 @@ rather than a diff.
   unique constraint in Postgres, but reading the last execution and creating
   the next one are two statements outside a transaction, so two processes
   racing an instance that has no prior execution can both launch.
-- **No scheduling adapters** (planned; additive).
+- ~~**No scheduling adapters**~~ — shipped as `batchflow-scheduler`, see
+  Unreleased.
 - Parallel and partitioned steps are not implemented. A reader is `&mut self`,
   so parallelism comes from partitioning, which is future work.
+- No built-in readers or writers (CSV, JSON, SQL). FR-3.4 is open; the traits
+  are small enough to implement in a few lines, which is what every example
+  does.
 
 [Unreleased]: https://github.com/devcalm/batchflow/compare/v0.1.0...HEAD
 [0.1.0]: https://github.com/devcalm/batchflow/releases/tag/v0.1.0

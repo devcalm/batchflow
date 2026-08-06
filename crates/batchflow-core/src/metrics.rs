@@ -49,7 +49,8 @@ pub const LABEL_JOB: &str = "job";
 pub const LABEL_STEP: &str = "step";
 /// The terminal [`BatchStatus`](crate::BatchStatus), lowercased.
 pub const LABEL_STATUS: &str = "status";
-/// Where an item was dropped: `read` or `process`.
+/// Where an item was dropped: `read`, `process`, `write` (chunk scanning), or
+/// `tasklet`. Summing across the values gives every skip in the step.
 pub const LABEL_PHASE: &str = "phase";
 
 /// Counter: chunks re-written one item at a time to isolate a poison row.
@@ -137,6 +138,12 @@ pub fn describe() {
         Unit::Count,
         "Retry attempts after a failed write or commit. First attempts are not counted."
     );
+    describe_counter!(
+        CHUNK_SCANS,
+        Unit::Count,
+        "Chunks re-written one item at a time to isolate a poison row. A non-zero \
+         rate means every good item in those chunks was written twice."
+    );
 
     describe_histogram!(
         CHUNK_DURATION,
@@ -176,6 +183,7 @@ mod tests {
 
         assert_eq!(CHUNKS_COMMITTED, "batchflow_chunks_committed_total");
         assert_eq!(CHUNK_RETRIES, "batchflow_chunk_retries_total");
+        assert_eq!(CHUNK_SCANS, "batchflow_chunk_scans_total");
         assert_eq!(CHUNK_DURATION, "batchflow_chunk_duration_seconds");
         assert_eq!(STEP_DURATION, "batchflow_step_duration_seconds");
 

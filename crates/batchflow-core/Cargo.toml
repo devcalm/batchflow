@@ -11,6 +11,12 @@ documentation = "https://docs.rs/batchflow-core"
 keywords = ["batch", "etl", "pipeline", "orchestration", "job"]
 categories = ["asynchronous", "concurrency"]
 
+# Committed to source control (proptest replays these seeds before generating
+# novel cases) but of no use to anyone downloading the crate: `src/properties.rs`
+# is `#[cfg(test)]` and is not in the package, so the seeds would reference a
+# module the published crate does not contain.
+exclude = ["proptest-regressions/"]
+
 # `conformance` is off by default, so without this docs.rs would not document
 # the suite - and a backend author is exactly who needs to read it.
 [package.metadata.docs.rs]
@@ -35,6 +41,7 @@ tracing-subscriber.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true
+proptest.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
 tracing-subscriber.workspace = true
 serde_json.workspace = true

@@ -2,18 +2,31 @@
 
 > Status: **Living roadmap.** Phased. Each phase: goals · learning objectives · tasks · rationale · acceptance · testing · docs.
 > Mentoring cadence per phase: **concept → Rust lens → minimal sketch → you implement → I review → improve.**
-> Last updated: 2026-07-30
+> Last updated: 2026-08-06 — Phases 0, 4, 6 and 14 closed; every numbered phase is now done.
 
 **Legend:** ☐ not started · ◐ in progress · ☑ done
 
 ---
 
-## Phase 0 — Research & Architecture ◐
+## Phase 0 — Research & Architecture ☑ (tech eval closed 2026-08-06)
 - **Goals:** Understand Spring Batch as a running machine; pick the Rust ecosystem; write these docs.
 - **Learning objectives:** JobInstance vs JobExecution; the chunk loop; TX boundary = commit interval; StepContribution; atomic bookmark = restart.
-- **Tasks:** ☑ Spring Batch execution-model deep dive · ☑ Requirements.md · ☑ Architecture.md · ☑ Plan.md · ☐ finalize tech eval open items.
+- **Tasks:** ☑ Spring Batch execution-model deep dive · ☑ Requirements.md · ☑ Architecture.md · ☑ Plan.md · ☑ finalize tech eval open items.
 - **Acceptance:** Docs exist and capture the model + crate choices + ADRs.
 - **Testing:** n/a. **Docs:** the three files.
+
+**The four remaining `[OPEN]` rows all closed as "none", and that is a result rather than a dodge.** `Config`
+and `Time` were held for Phase 14 and are argued there. `UUID` — ids stay `i64` newtypes minted by the store
+(a Postgres sequence, a Redis `INCR`); a UUID buys client-side generation the engine never needs and costs an
+index. `rstest` — its value is parameterised cases, and the one place this suite wanted them, the backend
+contract, is served better by the `conformance` macro, which generates 32 cases for *every* backend rather
+than for one test.
+
+**Phase 0's crate map, scored honestly, is in Architecture §4:** nine crates planned, six built.
+`batchflow-memory` collapsed into core, `batchflow-tracing` was killed by ADR-010, `batchflow-io` has no
+content until the first shipped reader, and `batchflow-testing` was replaced by a feature-gated *contract*
+rather than a bag of fakes. **The map was written before the system existed and was wrong about a third of
+itself; keeping the misses visible next to the hits is what makes it a record instead of an advert.**
 
 ## Phase 1 — Workspace ☑
 - **Goals:** Convert single crate → Cargo workspace per Architecture §4.
@@ -33,29 +46,106 @@
 ## Phase 3 — Job Model ☑ (DAG/conditional flow out of scope for 0.1)
 - **Goals:** `Job`, `Step` definitions + builders; linear step ordering.
 - **Learning:** builder pattern in Rust; typestate for build-time validation; DAG deferred.
-- **Tasks:** ☑ `Job`/`Step` types · ☑ heterogeneous step list (trait objects, ADR-002) · ☑ `JobBuilder` with typestate · ☐ `StepBuilder` (`ChunkStep::new` takes five arguments and is not yet painful; revisit if it grows).
-- **Acceptance:** ☑ define a 2-step job in code. **Testing:** ☑ builder unit tests + a `compile_fail` doctest. **Docs:** ☑ rustdoc; ☐ runnable example (Phase 16).
+- **Tasks:** ☑ `Job`/`Step` types · ☑ heterogeneous step list (trait objects, ADR-002) · ☑ `JobBuilder` with typestate · ☑ `StepBuilder` — **decided against** in 18a: all five of `ChunkStep::new`'s arguments are required, and a builder earns its keep on optional ones. Revisit only if a *required* sixth appears.
+- **Acceptance:** ☑ define a 2-step job in code. **Testing:** ☑ builder unit tests + a `compile_fail` doctest. **Docs:** ☑ rustdoc; ☑ runnable example (Phase 16). `StepBuilder` was closed as *decided against* in 18a, not deferred again.
 
 **`JobBuilder` typestate (2026-07-28).** `Job::builder("nightly").step(a).step(b).build()`. `build` is defined only on `JobBuilder<HasSteps>`, so an empty job — one that runs, reports success and processes nothing — is a *compile* error, the same class of silent no-op `NonZeroUsize` rules out for chunk sizes. Consequence: `build` returns `Job`, not `Result<Job, _>`, because the only failure it could report is unrepresentable. `step` takes `S: Step + 'static` by value and boxes internally, so callers never write `Box::new`.
 **Cost, documented not hidden:** a typestate builder changes type on the first `.step(..)`, so it cannot be driven from a loop. `Job::new(name, Vec<Box<dyn Step>>)` stays public as the dynamic escape hatch.
 
-## Phase 4 — Step Model ◐ (`StepContribution` + `StepExecution` done in 7c-2; dedicated tasklet trait pending)
+## Phase 4 — Step Model ☑ (tasklet trait closed 2026-08-06)
 - **Goals:** Chunk-step vs tasklet-step; `StepContribution`; `StepExecution` counters.
 - **Learning:** pending-delta pattern; step status lifecycle.
-- **Tasks:** ☑ `StepExecution` (id/job_execution_id/step_name/status/counters) · ☑ `StepContribution` (private fields, `increment_*` only, `apply` folds) · ☑ status lifecycle (`Starting`→`Started`→`Completed`/`Failed`) · ☐ tasklet trait (today a tasklet is a hand-written `Step` impl that ignores its contribution).
+- **Tasks:** ☑ `StepExecution` (id/job_execution_id/step_name/status/counters) · ☑ `StepContribution` (private fields, `increment_*` only, `apply` folds) · ☑ status lifecycle (`Starting`→`Started`→`Completed`/`Failed`) · ☑ tasklet trait.
+
+**The tasklet, and why it is three decisions rather than one type (2026-08-06).** `Tasklet` /
+`TransactionalTasklet<Tx>` / `TaskletStep<T>` / `RepeatStatus`. Previously a tasklet was a hand-written `Step`
+impl that ignored its contribution — which worked, and quietly cost the two things the framework exists for.
+
+- **`RepeatStatus::{Continuable, Finished}` buys a commit point, and that is the whole argument for it.** A
+  tasklet looping inside one `execute` call commits once at the end; a crash before that loses all of it —
+  precisely bug 11a, re-created one layer up. Returning `Continuable` gives each pass its own transaction and
+  its own durable bookmark, so a tasklet restarts on exactly the machinery a chunk step does, with no new
+  engine code. Cost, stated rather than guarded: **nothing bounds that loop.** 10c's skip limit bounds a
+  non-advancing reader because every spin costs a skip; a tasklet has no counter to spend, so the analogous
+  guard does not exist and cannot be invented honestly.
+- **Two traits and the *existing* `Unmanaged<T>`, not a `Tx` parameter on one trait.** The first sketch was a
+  single `Tasklet<Tx = ()>` taking `&mut Tx`, which is smaller — and wrong for the same reason ADR-007 gave for
+  writers: a tasklet written for `Tx = ()` then cannot go in a `Job<PgTx>` at all, so every non-transactional
+  tasklet would be rewritten the day a job gained a Postgres step. Reusing `Unmanaged` rather than minting a
+  second newtype was free: `impl<T: Tasklet, Tx> TransactionalTasklet<Tx> for Unmanaged<T>` overlaps nothing,
+  because `Unmanaged<T>` is a distinct type. **The wrapper now means one thing in two places — "this does not
+  enlist" — which is a better outcome than the symmetry that motivated it.**
+- **No retry, no skip, and this is the interesting refusal.** Skip is meaningless with no items. Retry *is*
+  meaningful — but `execute` takes `&mut self`, so a second call lands on a tasklet that has already mutated
+  its own state, and the framework would have to write down "your tasklet must be idempotent". That is the
+  exact sentence 10b established ownership had made unnecessary for processors. Declining to re-introduce it is
+  worth more than the feature.
+
+**Reconciliation is why the tasklet emits metrics at all.** Phase 12's property — `sum(items_written_total)`
+equals `sum(write_count)` — is a claim about the *system*, not about `chunk.rs`, so a tasklet folding
+`increment_write(5000)` into its `StepExecution` with no counter would have broken it silently the first time
+anyone used one. `TaskletStep` hoists its own handles and publishes after the commit, under the same two rules.
+Its skips carry `phase="tasklet"`: a new label *value*, not a new metric, since summing across phases must
+still give every skip in the step.
+
+**One test premise was wrong, and the fix is the documentation.** `a_rolled_back_pass_publishes_no_items` was
+written asserting `None` and got `Some(0)` — because hoisting the handles *registers* the series at step start,
+which is 12b's deliberate choice (a job that has never failed must read 0, not be absent). The assertion moved
+to `Some(0)` and the reason is now in the test, where the next person to write `None` will read it.
 - **Acceptance:** ☑ counters fold in correctly. Rollback-discards-deltas is structural today (an errored chunk yields no contribution to fold) and becomes a real transaction in Phase 11. **Testing:** unit. **Docs:** rustdoc.
 
 ## Phase 5 — Execution Engine ☑ (chunk loop + per-step persistence; **real transactions** in Phase 11)
 - **Goals:** Drive a Job through its Steps; the chunk loop.
 - **Learning:** ownership of reader/processor/writer during a run; where `?` triggers failure — and where it must *not* be used, because it skips the status write that follows (see Phase 7).
 - **Tasks:** ☑ step executor running `read_chunk` → process → write · ☑ counters via `StepContribution`, folded per chunk · ☑ `Job::run` persisting a `StepExecution` per step (added in 7c-2; this phase's original "no persistence yet" caveat no longer applies).
-- **Acceptance:** ☑ end-to-end job runs to completion and is fully reconstructible from the repository. **Testing:** integration w/ fakes. **Docs:** ☐ flow diagram.
+- **Acceptance:** ☑ end-to-end job runs to completion and is fully reconstructible from the repository. **Testing:** integration w/ fakes. **Docs:** ☑ flow diagram — Architecture §2.0, a mermaid graph of the whole path. Deliberately drawn at the *job* level rather than the chunk level: §2.1's pseudocode already covers the inner loop, and what no document showed was that every branch in the engine — the two launcher refusals and the restart skip — is a read from the metadata store rather than a flag in memory.
 
-## Phase 6 — Chunk Processing (full) ◐ (semantics + `StepContribution` integration done; property tests + tuning guide pending)
+## Phase 6 — Chunk Processing (full) ☑ (property tests closed 2026-08-06; tuning guide closed by `docs/Performance.md`)
 - **Goals:** commit interval, filtering, empty-chunk termination, chunk-oriented writer semantics.
 - **Learning:** memory vs throughput tradeoff of N; batched writes.
-- **Tasks:** ☑ chunk semantics (`NonZeroUsize` interval, empty chunk terminates, `write(&[O])`) · ☑ `StepContribution` integration — `process_chunk` returns a chunk-local contribution, `run_step` folds it per chunk · ☐ property tests · ☐ tuning guide.
-- **Acceptance:** ☑ filter drops items and is counted at the `None` arm, not derived by subtraction. **Testing:** property tests on counts. **Docs:** tuning guide.
+- **Tasks:** ☑ chunk semantics (`NonZeroUsize` interval, empty chunk terminates, `write(&[O])`) · ☑ `StepContribution` integration — `process_chunk` returns a chunk-local contribution, `run_step` folds it per chunk · ☑ property tests · ☑ tuning guide.
+- **Acceptance:** ☑ filter drops items and is counted at the `None` arm, not derived by subtraction. **Testing:** ☑ six properties in `src/properties.rs`. **Docs:** ☑ `docs/Performance.md`.
+
+**The property tests found a live bug on their first run, which is the entire case for writing them
+(2026-08-06).** Six properties over `proptest`: the counters partition the input, commits are
+`ceil(n / chunk_size)`, chunk size does not change the result, the sink holds exactly the kept items in order,
+and the committed bookmark covers the whole input.
+
+**The bug: skips in the *tail* of the input were silently discarded.** `read_chunk` mutates a step-wide
+`skipped`, and the loop's `if chunk.is_empty() { break }` left before anything folded it — so a file whose
+last rows are all malformed finished with those skips missing from `skip_count`, missing from
+`batchflow_items_skipped_total`, and with the bookmark short of them, meaning a restart re-read rows already
+known to be poison. **A step reporting zero skips for exactly the segment that was unreadable is the quiet data
+loss Phase 12 was built to prevent, and Phase 12 could not see it.** The fix commits a metadata-only
+transaction carrying the trailing skips and the bookmark past them.
+
+**Why no example-based test had it, stated precisely, because the shape recurs.** Nine skip tests existed and
+all nine passed. Every one of them put the poison row somewhere a *non-empty* chunk would carry it — which is
+what a person writing a skip test naturally does, since the interesting case feels like "a bad row among good
+ones". The failing case needs the bad row **last**, where the chunk it lands in is empty and never becomes a
+write. **An example-based suite explores the cases its author imagined; the boundary that bites is the one
+nobody pictured.** proptest's minimal counterexample was `items = [1..=6], chunk_size = 1, poison_modulus = 2`
+— six items to state a bug nine hand-written tests missed.
+
+**Mutation-verified in both directions**, which matters here because the naive fix is worse than the bug:
+disabling the new branch fails the property *and* the named regression test; making it commit unconditionally
+fails **11** tests, including `an_exhausted_reader_with_no_skips_commits_nothing_extra`, which exists purely to
+stop "always commit on an empty chunk" from adding a pointless transaction to every step in the system.
+
+**A property test's counterexample is not a regression test**, so `skips_at_the_end_of_the_input_are_still_counted`
+was written alongside it: it names the case, survives a change of seed, and is what a future reader sees when
+they touch that branch.
+
+**`proptest` is a dev-dependency with `default-features = false`** (`std`, `bit-set`), dropping `fork`/`timeout`
+and with them `rusty-fork` and `tempfile` — a process-forking harness buys crash isolation these properties have
+no use for. As with `sqlx` and `metrics-exporter-prometheus`, the flag has to sit in `[workspace.dependencies]`;
+a member cannot turn off a workspace dependency's defaults. `proptest-regressions/` is committed on purpose: it
+replays the failing seed before any novel case.
+
+**The module is `src/properties.rs`, not `tests/`.** `run_step` is `pub(crate)` (debt 5) and the fakes are
+`#[cfg(test)]`, so an integration test could reach neither — Phase 17's benches hit the same wall from the other
+side. It is also not inside `chunk.rs`, which is 1,600 lines: the parameterised fakes these six share are used
+by nothing else, which is `mod testing`'s own argument applied one level down.
 
 ## Phase 7 — JobRepository ☑  ← **first hard problem**
 > **7a ☑** domain types (`JobParameters`/`JobInstance`/`JobExecution`/`BatchStatus`/newtype ids), module split, `Step::name`.
@@ -96,7 +186,7 @@
 - **Goals:** ☑ resume a failed JobExecution; ☑ skip completed steps; ☑ reader seeks from bookmark.
 - **Learning:** why atomicity (Phase 7) makes restart safe; no duplicate items.
 - **Tasks:** ☑ restart path in engine · ☑ reader open-from-context · ☑ **`abandon_execution` + the `Starting`/`Started` gate**, shipped together.
-- **Acceptance:** ☑ *step returns an error* mid-run → restart resumes, no dupes (`a_restart_resumes_from_the_bookmark_without_duplicating`). ☑ *process killed* mid-step → resumes: **this was NOT met by Phase 9** and was closed in 11a; see there. **Testing:** ☑ failure-injection + restart tests. **Docs:** ☐ restart guide (Phase 18).
+- **Acceptance:** ☑ *step returns an error* mid-run → restart resumes, no dupes (`a_restart_resumes_from_the_bookmark_without_duplicating`). ☑ *process killed* mid-step → resumes: **this was NOT met by Phase 9** and was closed in 11a; see there. **Testing:** ☑ failure-injection + restart tests. **Docs:** ☑ restart guide — `Guide.md` §Restart, shipped in 18c.
 
 **9b design decisions (2026-07-29):**
 - **The lookup is keyed on the `JobInstance`, not the `JobExecution`** — `last_step_execution(instance_id, step_name)`. That is the question restart asks ("has this step ever succeeded for this unit of work?"), and the attempt that succeeded is by definition a *different* execution from the one asking. Phase 11 renders it as a two-table join with `ORDER BY id DESC LIMIT 1`. Mutation-tested: dropping the instance predicate fails `a_bookmark_does_not_leak_across_instances`.
@@ -278,7 +368,7 @@ Two other mutations, both caught: committing instead of rolling back in the iden
 > **12d ☑** `batchflow-metrics`: Prometheus exporter, bucketed histograms, `install()`.
 
 - **Goals:** `metrics` facade + Prometheus; counters/histograms per FR-8.1.
-- **Acceptance:** ☑ a scrape shows items, retries, skips-by-phase and durations. **Testing:** ☑ metric assertions against a `DebuggingRecorder` and a rendered Prometheus scrape. **Docs:** ☐ dashboards note.
+- **Acceptance:** ☑ a scrape shows items, retries, skips-by-phase and durations. **Testing:** ☑ metric assertions against a `DebuggingRecorder` and a rendered Prometheus scrape. **Docs:** ☑ dashboards note — `Guide.md` §Dashboards and alerts (2026-08-06).
 
 **The `metrics` facade is a dependency of `batchflow-core`, not of a side crate.** The emit points are inside the private chunk loop, so no external crate can reach them; a listener trait would have invented a public callback API whose only consumer is metrics. `cargo tree` settled the NFR-3 question with evidence: `metrics` costs core exactly one runtime dependency (`rapidhash`) — lighter than `thiserror`. `batchflow-metrics` still earns its place, holding the exporter.
 
@@ -399,9 +489,65 @@ so an event and a counter cannot come to partition skips differently.
 `StepCommit::job_name` generalised into `StepIdentity`, and debt 3's remaining half closed with the `ERROR` events
 at all three `with_cleanup` sites. Nothing from the original Phase 13 sketch is outstanding.
 
-## Phase 14 — Scheduling ☐ (`JobLauncher` already exists — this phase is the adapters only)
+## Phase 14 — Scheduling ☑ (2026-08-06)
 - **Goals:** launch API + adapters (tokio-cron-scheduler / cron / k8s). No home-grown engine (ADR-006).
-- **Tasks:** `batchflow-scheduler` adapters. `JobLauncher` ☑ landed in 7c-1; a scheduler consumes it and branches on `BatchError::JobInstanceAlreadyComplete` to skip a run it has already done. **Acceptance:** external trigger runs a job. **Testing:** launcher unit. **Docs:** integration guide.
+- **Delivered:** `batchflow-scheduler` — `trigger` / `Outcome` / `Due` / `ScheduledJob`, `metrics::TRIGGERS`, the `cron` feature adapting `tokio-cron-scheduler`, `examples/external_trigger.rs`, 11 tests. MSRV 1.85 verified against a real toolchain *with* `--all-features`.
+- **Acceptance:** ☑ external trigger runs a job (`a_first_firing_runs_the_job`), ☑ an in-process cron schedule fires one (`a_cron_schedule_fires_the_job`). **Docs:** ☑ `Guide.md` §Scheduling, ☑ ADR-006 amended.
+
+**The phase sketch said "adapters" and the adapters turned out to be the small half.** What was actually
+missing is a *classification*, and it is four lines of `match`: `JobLauncher::run` reports "this instance
+already completed" and "another execution is still running" as `BatchError`s — right for a caller that asked
+for a run, wrong for a schedule, to which both mean the system is working. A scheduler wired straight to
+`run` pages someone every night a job finishes on time. `trigger` maps those two onto `Outcome` and leaves
+every other error alone, and **the leaving-alone is the load-bearing half**: a scheduler that absorbed a step
+failure would report a healthy nightly run that never happened.
+
+**The run key is the API, and both ways of getting it wrong compile.** `JobParameters` derived from the tick
+(`date=2026-08-06`) is what makes a schedule idempotent — FR-4.2 identity does the deduplication, so a
+re-fire is refused and tomorrow runs. Constant parameters give a job that runs **once, ever**. Parameters
+containing a timestamp give one with **no deduplication and no restart**, since every attempt mints a fresh
+instance. Neither is detectable by the framework — the type is `JobParameters` in all three cases — so it is
+documented at the crate root and in a table in the guide, which is the only enforcement available.
+
+**A new metric was unavoidable, and the reason generalises.** A refusal creates no `JobExecution`, so it emits
+nothing in the core vocabulary: a nightly job refused every night for a week is indistinguishable, in metrics,
+from a healthy one. `batchflow_triggers_total{job,outcome}` counts firings rather than runs. It obeys 12a's
+rules unchanged — bounded author-written label values, no ids, and a label because
+`ran + already_complete + already_running + failed` is the number of times the schedule fired, which is a
+number worth graphing. **The rule that produced it: when a subsystem's *interesting* case is one where the
+existing metrics are structurally silent, that is a new metric, not a new label.**
+
+**`ScheduledJob` takes a closure returning `Due`, not a `Job`.** A step owns its reader and `Job::run` takes
+`&mut self`, so a reused job hands the second firing a reader already at end of input — 9b's `SharedSink`
+lesson arriving from the scheduling side. Building fresh per tick is also exactly what a restarted *process*
+does, so the scheduled path and the restart path stay one path. `Due` bundles the job with its parameters
+because they are one decision (10b-4), and a `Due` whose parameters came from a different tick than its job
+should not be constructible by accident.
+
+**The cron callback returns `()`, which changes what the observability is for.** Under an external scheduler,
+`trigger`'s `Result` becomes an exit code and the metrics are a supplement. Inside `tokio-cron-scheduler` there
+is no caller: the adapter logs and counts, and that is the *only* channel — an unmonitored in-process schedule
+can fail every night in complete silence. Said plainly in the rustdoc of the method that creates the situation,
+rather than in a general observability section nobody reads first.
+
+**Feature-gated on measurement, not on instinct:** the crate is **37** dependencies by default and **66** with
+`cron` (core is 34). The default half — the classification — is what every deployment needs; the engine is what
+most replace with Kubernetes. This is 12d's and 13c's rule a third time, and the first time it produced a
+*feature* rather than a crate boundary, because unlike the OTel exporter this code genuinely belongs here.
+
+**Two tech-eval items from Phase 0 were resolved by building this, not by deciding harder.** `Config`: no
+config crate — a job is wired in Rust, and a framework reading `batchflow.toml` would need a registry mapping
+names to reader types, i.e. a plugin system nobody asked for. `Time`: **no time crate in any BatchFlow crate** —
+the schema has no timestamps, and the one place a clock looked unavoidable belonged to the caller, since the run
+key is built by whatever fired the schedule. `chrono` appears in the lock file only as `tokio-cron-scheduler`'s
+own dependency and no BatchFlow type mentions it. **An open question that survives to the phase that was
+supposed to answer it is often answered by the phase not needing it.**
+
+**CI gained `--all-features`, and it was needed the day the feature existed.** `cargo test --workspace` compiles
+neither the `cron` adapter nor `batchflow-core`'s `conformance` module — a feature nothing compiles is a feature
+nothing checks. Test, clippy and doc now pass it, and the 1.85 MSRV lane checks `batchflow-scheduler` with the
+whole `tokio-cron-scheduler`/`chrono`/`croner`/`derive_builder` tree, which is what an MSRV claim is a claim
+about.
 
 ## Phase 15 — Storage Backends ☑ (2026-08-05)
 - **Goals:** Redis backend; harden Postgres; backend conformance suite.
@@ -484,17 +630,26 @@ at all three `with_cleanup` sites. Nothing from the original Phase 13 sketch is 
 
 ## Cross-cutting quality gate (every phase)
 **Executed by `.github/workflows/ci.yml` since 12.5 — this list is the specification, that file is the implementation. They must not drift.**
-`cargo fmt --all --check` · `cargo clippy --workspace --all-targets --locked -- -D warnings` · `cargo test --workspace --locked` · **`RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --locked`** · `cargo +<msrv> check` per lane · examples compile · no dead code · no needless clone/alloc.
+`cargo fmt --all --check` · `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings` · `cargo test --workspace --all-features --locked` · **`RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features --locked`** · `cargo +<msrv> check --all-features` per lane · examples compile · no dead code · no needless clone/alloc.
+**`--all-features` was added in Phase 14 and is not cosmetic.** `batchflow-scheduler`'s `cron` adapter and `batchflow-core`'s `conformance` module are both behind flags, and `cargo test --workspace` compiles neither: a feature nothing compiles is a feature nothing checks. It also means the MSRV lanes now check the dependency tree an MSRV claim is actually a claim *about*.
 **`cargo doc` is a gate in its own right — but only with `RUSTDOCFLAGS="-D warnings"`.** `fmt`, `clippy` and `test` were all green in 12a while a broken intra-doc link sat in `lib.rs`, and 12.5 found the *same class of bug still live* at `step.rs:7`, because bare `cargo doc` exits 0 on broken links. Broken links are what docs.rs ships. `#![warn(missing_docs)]` is on in all four crates, so a new public item without rustdoc now fails clippy too.
-**Read the `Doc-tests` counts, do not just read the unit count** — see debt (6). A doctest can disappear without anything going red. Note there are now doctests in four crates (`batchflow_core`, `batchflow`, `batchflow_metrics`, `batchflow_postgres`); the facade's is the one that guards user-facing re-exports.
+**Read the `Doc-tests` counts, do not just read the unit count** — see debt (6). A doctest can disappear without anything going red. Note there are now doctests in five crates (`batchflow_core`, `batchflow`, `batchflow_metrics`, `batchflow_postgres`, `batchflow_scheduler`); the facade's is the one that guards user-facing re-exports.
 Postgres integration tests need Docker running. They are part of the gate, not an optional extra — `cargo test --workspace` silently covers less without it.
 
-## Current position (2026-08-03)
-**Version bumped to 0.1.0 in the manifests on 2026-08-05, and nothing is published.** Publish order is `batchflow-core` → wait for the index → `batchflow` → `batchflow-postgres` / `batchflow-redis` / `batchflow-metrics`.
+## Current position (2026-08-06)
+**Version bumped to 0.1.0 in the manifests on 2026-08-05, and nothing is published.** Publish order is `batchflow-core` → wait for the index → `batchflow` → `batchflow-postgres` / `batchflow-redis` / `batchflow-metrics` / `batchflow-scheduler`. Six crates now, not five.
 
-Phase 0 ◐ docs (tech-eval open items) · 1 ☑ workspace · 2 ☑ traits · 3 ☑ Job + typestate `JobBuilder` · 4 ◐ step model (tasklet trait pending) · 5 ☑ engine · 6 ◐ chunk processing (property tests pending; **tuning guide closed by `docs/Performance.md`**) · 7 ☑ JobRepository · 8 ☑ ExecutionContext · 9 ☑ restart · **10 ☑ retry & skip** · 11 ☑ transactions · 12 ☑ metrics · 12.5 ☑ CI · 13 ☑ tracing · 14 ☐ scheduling · **15 ☑ storage backends** · **16 ☑ examples** · **17 ☑ performance** · **18 ☑ documentation**.
+**184 tests green on 2026-08-06 — but Docker was down, so this run does not include PostgreSQL or Redis.** 155 `batchflow-core` unit · 2 `batchflow-core` integration · 3 `batchflow` integration · 3 `batchflow-metrics` unit · 2 `batchflow-scheduler` unit · 9 `batchflow-scheduler` integration (7 trigger · 2 cron) · 10 doctests across four crates. `cargo fmt --check`, `cargo clippy --workspace --all-targets --all-features -D warnings` and `RUSTDOCFLAGS="-D warnings" cargo doc --all-features` all clean, and both MSRV lanes verified against real 1.85 and 1.88 toolchains with `--all-features`. **The 20 Postgres and 35 Redis tests were not run in this session and are carried forward from 2026-08-05, which is exactly the gap the quality gate warns about: `cargo test --workspace` silently covers less without a Docker daemon.** Nothing in this session touched a backend, but "nothing should have" is not evidence — re-run with Docker up before tagging.
 
-**The roadmap was completed out of order, and that is worth stating rather than hiding behind a row of ticks.** 16, 17 and 18 were promoted past 14 (scheduling adapters) and 15 (Redis + backend conformance suite) because those two are *additive* — a new crate and a new `JobRepository` impl break nothing — while 17 and 18 had to land before the API froze at 0.1.0. So the release path is complete and two numbered phases behind it are untouched. Remaining work, none of it blocking a release: publish · 14 scheduling adapters · Phase 4's tasklet trait · Phase 6's property tests · Phase 0's tech-eval items.
+Phase 0 ☑ docs · 1 ☑ workspace · 2 ☑ traits · 3 ☑ Job + typestate `JobBuilder` · **4 ☑ step model (tasklet trait)** · 5 ☑ engine · **6 ☑ chunk processing (property tests)** · 7 ☑ JobRepository · 8 ☑ ExecutionContext · 9 ☑ restart · 10 ☑ retry & skip · 11 ☑ transactions · 12 ☑ metrics · 12.5 ☑ CI · 13 ☑ tracing · **14 ☑ scheduling** · 15 ☑ storage backends · 16 ☑ examples · 17 ☑ performance · 18 ☑ documentation. **Every numbered phase is closed; publishing is the only thing left.**
+
+**The roadmap was completed out of order, and that is worth stating rather than hiding behind a row of ticks.** 16, 17 and 18 were promoted past 14 (scheduling adapters) and 15 (Redis + backend conformance suite) because those two are *additive* — a new crate and a new `JobRepository` impl break nothing — while 17 and 18 had to land before the API froze at 0.1.0. **The bill for that ordering came due on 2026-08-06, and it was smaller than feared but not zero:** closing 4, 6 and 14 after the API freeze added `Tasklet`, `TransactionalTasklet`, `TaskletStep` and `RepeatStatus` to `batchflow-core`'s public surface. Purely additive, so 0.1.0 is unaffected — but had the tasklet needed to change `Step` or `StepCommit` the way 11a did, it would have been a breaking change arriving *after* the freeze that 17 was sequenced before. **The lesson is not "do not reorder"; it is that "additive" was a prediction, and it happened to hold.**
+
+**Remaining work: publish, and a tag.** Every numbered phase is closed. What is genuinely open is written down rather than converted into a phase: FR-3.4's built-in CSV/JSON/SQL readers (which is when `batchflow-io` starts existing), parallel and partitioned steps, and debt (2), the launcher's gate race.
+
+**Two things `cargo package --list` caught, running 18's gate again on new files.** (1) `proptest-regressions/` was being shipped: seeds are worth committing to *source control*, because proptest replays them before generating novel cases, and worthless in the *package*, since `src/properties.rs` is `#[cfg(test)]` and is not in it — the seeds would reference a module the published crate does not contain. Added to `exclude`. (2) Only the facade carries `LICENSE-APACHE`/`LICENSE-MIT` files; the other five crates state the licence in metadata but ship no text. `batchflow-scheduler` is consistent with its siblings, so this is recorded as a pre-existing gap rather than fixed silently in one crate — the fix is all six or none.
+
+**A last user-facing finding, from writing the facade doctest rather than from reading the code.** `let job = Job::builder(..).step(TaskletStep::new(.., Unmanaged(t))).build()` does **not** compile: `E0283`, ambiguous `Tx`. Anything wrapped in `Unmanaged` implements its step trait for *every* transaction type, so nothing in the expression pins one, and the annotation `let job: Job = ..` is what chooses it. This is not new with tasklets — a `ChunkStep` over an `Unmanaged` writer has always behaved this way, and every existing call site happens to hide it behind a function whose return type is `Job`. It extends Phase 16's finding (4): the typestate builder works with any `Tx` *when the target type is known*, and "known" turns out to be a requirement rather than a convenience. Now stated in the guide and in the doctest's own comment, at the two places someone meets it.
 
 **151 tests green across the whole workspace, Docker up, 2026-08-05** — 116 `batchflow-core` unit · **2 `batchflow-core` integration (`tests/allocations.rs`, new in 17)** · 3 `batchflow` integration · 3 `batchflow-metrics` unit · 2 `batchflow-postgres` unit · 18 Postgres integration (6 classifier · 3 fault-tolerance · 9 repository) · 7 doctests across five crates. Exactly the previous 149 plus the two new allocation tests, which confirms Phase 17 left the Postgres path untouched — worth checking rather than assuming, since core's `Cargo.toml` gained a dev-dependency and a `[[bench]]` target. `cargo fmt --check`, `cargo clippy --workspace --all-targets -D warnings` and `RUSTDOCFLAGS="-D warnings" cargo doc` all clean.
 

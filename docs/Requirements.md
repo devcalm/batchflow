@@ -15,7 +15,7 @@ everything else (async runtime, DB, serialization, tracing, metrics).
 
 ### FR-1 — Job & Step model
 - FR-1.1 A **Job** is an ordered graph of **Steps**. `[DECIDED]` Start linear; DAG/branching `[FUTURE]`.
-- FR-1.2 A **Step** is either a **chunk-oriented step** or a **tasklet** (single unit of work).
+- FR-1.2 A **Step** is either a **chunk-oriented step** or a **tasklet** (single unit of work). `[BUILT]` `ChunkStep`; `Tasklet`/`TransactionalTasklet<Tx>` wrapped by `TaskletStep`, one transaction per `execute` and repeated while it returns `RepeatStatus::Continuable`.
 - FR-1.3 Jobs and Steps are defined in code (builders), not config/reflection. `[DECIDED]`
 
 ### FR-2 — Chunk-oriented processing
@@ -28,7 +28,7 @@ everything else (async runtime, DB, serialization, tracing, metrics).
 - FR-3.1 `ItemReader<Item>` — pull model; `None` signals exhaustion, `Err` signals failure.
 - FR-3.2 `ItemProcessor<In, Out>` — transform; `None` filters the item.
 - FR-3.3 `ItemWriter<Item>` — consume a chunk (`&[Item]`).
-- FR-3.4 Built-in impls (phased): CSV, JSON, SQL. `[FUTURE]` Kafka, S3.
+- FR-3.4 Built-in impls (phased): CSV, JSON, SQL. `[OPEN — none shipped]` Kafka, S3 `[FUTURE]`. The examples implement their own in a few lines each; the first shipped reader is what creates `batchflow-io`.
 - FR-3.5 Composite processors (chaining) and validating/filtering processors.
 
 ### FR-4 — Metadata & persistence (JobRepository)
@@ -84,8 +84,9 @@ everything else (async runtime, DB, serialization, tracing, metrics).
 - FR-8.2 **Tracing**: spans per job/step/chunk; correlation IDs; OpenTelemetry export.
 
 ### FR-9 — Scheduling (integration, not engine)
-- FR-9.1 Provide a clean launch API so external schedulers (cron, k8s CronJob, tokio-cron-scheduler) can trigger jobs.
-- FR-9.2 BatchFlow does **not** implement its own scheduling engine. `[DECIDED]`
+- FR-9.1 Provide a clean launch API so external schedulers (cron, k8s CronJob, tokio-cron-scheduler) can trigger jobs. `[BUILT — Phase 14]` `JobLauncher::run`, plus `batchflow_scheduler::trigger`, which reclassifies the launcher's two *refusal* errors as `Outcome::{AlreadyComplete, AlreadyRunning}` — to a caller they are failures, to a schedule they are the system working.
+- FR-9.2 BatchFlow does **not** implement its own scheduling engine. `[DECIDED — held]` The optional `cron` feature *adapts* `tokio-cron-scheduler`; it does not implement cron parsing, missed-tick policy or leader election, and the default build pulls no scheduler at all.
+- FR-9.3 A schedule must be idempotent per tick. `[BUILT]` Emergent from FR-4.2: a run key derived from the tick makes a re-fire resolve to the same `JobInstance`, which FR-4.4 then refuses. Requires the caller to build the key correctly, which the framework cannot check — documented rather than enforced.
 
 ### FR-10 — Scaling
 - FR-10.1 **Partitioning**: split input into partitions, run step instances in parallel (local). `[FUTURE-ish]`

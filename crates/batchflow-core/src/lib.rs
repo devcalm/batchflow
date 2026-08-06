@@ -12,10 +12,13 @@ mod item;
 mod job;
 mod launcher;
 mod step;
+mod tasklet;
 
 mod classifier;
 mod context;
 mod memory;
+#[cfg(test)]
+mod properties;
 mod repository;
 #[cfg(test)]
 mod testing;
@@ -45,3 +48,4 @@ pub use launcher::JobLauncher;
 pub use memory::InMemoryJobRepository;
 pub use repository::JobRepository;
 pub use step::{ChunkStep, Step, StepCommit, StepContribution, StepIdentity};
+pub use tasklet::{RepeatStatus, Tasklet, TaskletStep, TransactionalTasklet};

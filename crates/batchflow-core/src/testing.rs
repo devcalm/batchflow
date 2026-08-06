@@ -8,8 +8,8 @@ use crate::metrics::LABEL_PHASE;
 use crate::{
     BatchError, BatchStatus, Classifier, ContextValue, ErrorAction, ExecutionContext,
     InMemoryJobRepository, ItemProcessor, ItemReader, ItemWriter, JobExecution, JobExecutionId,
-    JobInstance, JobInstanceId, JobParameters, JobRepository, Step, StepCommit, StepContribution,
-    StepExecution, StepExecutionId, StepIdentity,
+    JobInstance, JobInstanceId, JobParameters, JobRepository, RepeatStatus, Step, StepCommit,
+    StepContribution, StepExecution, StepExecutionId, StepIdentity, Tasklet,
 };
 use ::metrics::{Key, SharedString, Unit};
 use async_trait::async_trait;
@@ -547,6 +547,60 @@ impl Step for LogStep {
         _commit: &mut dyn StepCommit<()>,
     ) -> Result<(), BatchError> {
         Ok(())
+    }
+}
+
+/// A tasklet that does `total` passes, one per `execute` call, and records how
+/// many are done in its context.
+///
+/// Counting passes in the *context* rather than in a field is what makes it a
+/// restart fake: handed a context that already says `2`, it does one pass, not
+/// three — exactly as a real archiver resuming after a crash would.
+pub(crate) struct CountingTasklet {
+    total: i64,
+}
+
+impl CountingTasklet {
+    /// The bookmark key. Public to the tests, which assert on what committed.
+    pub(crate) const DONE: &'static str = "passes.done";
+
+    pub(crate) fn new(total: i64) -> Self {
+        Self { total }
+    }
+}
+
+impl Tasklet for CountingTasklet {
+    async fn execute(
+        &mut self,
+        context: &mut ExecutionContext,
+        contribution: &mut StepContribution,
+    ) -> Result<RepeatStatus, BatchError> {
+        let done = context.get_long(Self::DONE)?.unwrap_or(0) + 1;
+        context.put(Self::DONE, ContextValue::Long(done));
+        contribution.increment_write(1);
+
+        Ok(if done >= self.total {
+            RepeatStatus::Finished
+        } else {
+            RepeatStatus::Continuable
+        })
+    }
+}
+
+/// A tasklet that increments its counters and *then* fails, so a test can see
+/// that the deltas went with the rolled-back transaction rather than being
+/// folded. Failing before incrementing would make the assertion vacuous — the
+/// same trap 10e's retry writer fell into.
+pub(crate) struct FailingTasklet;
+
+impl Tasklet for FailingTasklet {
+    async fn execute(
+        &mut self,
+        _context: &mut ExecutionContext,
+        contribution: &mut StepContribution,
+    ) -> Result<RepeatStatus, BatchError> {
+        contribution.increment_write(7);
+        Err(BatchError::write("tasklet failed"))
     }
 }
 

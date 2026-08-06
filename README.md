@@ -29,7 +29,7 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 
 ## Examples
 
-Four runnable programs, from a ten-item in-memory job to a CSV loaded into
+Five runnable programs, from a ten-item in-memory job to a CSV loaded into
 Postgres through a real transaction — see [docs/Examples.md](docs/Examples.md).
 
 ```sh
@@ -42,15 +42,18 @@ cargo run -p batchflow --example hello_batch
   interval **is** the transaction boundary: a chunk's rows, its counters and
   its reader bookmark become durable together or not at all
 - Trait-based `ItemReader` / `ItemProcessor` / `ItemWriter`
+- Tasklets for steps that are one unit of work rather than a loop, with an
+  optional commit point per pass so they restart like any other step
 - Durable job metadata behind a `JobRepository` trait (in-memory, PostgreSQL, Redis)
 - Restart: skip completed steps, reopen the reader at the last committed chunk
 - Retry and skip driven by a `Classifier` over your own error type, including
   optional chunk scanning to isolate a poison row on write failure
 - Metrics (`metrics`/Prometheus) and tracing (`tracing`/OpenTelemetry)
-- Integration with external schedulers (cron, Kubernetes CronJobs) rather than
-  a bespoke scheduler
+- Adapters for external schedulers (cron, Kubernetes CronJobs) rather than a
+  bespoke scheduler — the framework classifies what a firing produced and lets
+  something else decide when to fire
 
-Not yet: parallel or partitioned steps, scheduling adapters.
+Not yet: parallel or partitioned steps, built-in CSV/JSON/SQL readers.
 
 ## Crates
 
@@ -61,6 +64,7 @@ Not yet: parallel or partitioned steps, scheduling adapters.
 | [`batchflow-postgres`](crates/batchflow-postgres) | PostgreSQL metadata store | 1.94 |
 | [`batchflow-redis`](crates/batchflow-redis) | Redis metadata store (needs `appendfsync always`) | 1.88 |
 | [`batchflow-metrics`](crates/batchflow-metrics) | Prometheus exporter | 1.85 |
+| [`batchflow-scheduler`](crates/batchflow-scheduler) | Trigger semantics; `cron` feature for in-process cron | 1.85 |
 
 ## Documentation
 

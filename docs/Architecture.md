@@ -1,7 +1,7 @@
 # BatchFlow — Architecture
 
-> Status: **Living document.** Phase 0. Records the model, the crate layout, technology choices, and ADRs.
-> Last updated: 2026-07-30
+> Status: **Living document.** Records the model, the crate layout, technology choices, and ADRs.
+> Last updated: 2026-08-06 — §2.0 flow diagram, §2.2 tasklets, §4 as-built crate map, §5 tech-eval closed.
 
 ---
 
@@ -31,7 +31,51 @@ Almost every "feature" is emergent from these two interacting:
 
 ---
 
-## 2. Execution Flow — the chunk loop (spine)
+## 2. Execution Flow
+
+### 2.0 The whole path, at a glance
+
+Every decision the engine makes about *whether* to do work is a read from the
+metadata store. That is the whole design in one picture: the two refusals and
+the one skip below are the only branches, and all three are answered by rows,
+not by flags in memory.
+
+```mermaid
+flowchart TD
+    T["trigger — cron · k8s CronJob · CLI<br/><code>batchflow_scheduler::trigger</code>"] --> L
+    L["<code>JobLauncher::run(job, parameters)</code>"] --> I["<code>find_or_create_instance</code><br/>(job_name, parameters) — FR-4.2"]
+    I --> G{"status of the<br/>last execution?"}
+
+    G -- Completed --> R1["<code>JobInstanceAlreadyComplete</code><br/>→ <code>Outcome::AlreadyComplete</code> — FR-4.4"]
+    G -- "Starting · Started" --> R2["<code>JobExecutionAlreadyRunning</code><br/>→ <code>Outcome::AlreadyRunning</code><br/><i>cleared by abandon_execution</i>"]
+    G -- "none · Failed · Stopped · Abandoned" --> E["<code>create_execution</code> → Started"]
+
+    E --> S["<code>Job::run</code> — each step, in order"]
+    S --> P{"<code>last_step_execution</code><br/>for this <b>instance</b>"}
+
+    P -- Completed --> SK["skip — no StepExecution<br/>on this attempt · FR-5.1"]
+    P -- "Failed · none" --> SE["<code>create_step_execution</code> → Started<br/>context seeded from that<br/>attempt's bookmark · FR-5.2"]
+
+    SE --> C["<b>2.1</b> chunk loop &nbsp;·&nbsp; <b>2.2</b> tasklet<br/><i>commits, repeatedly</i>"]
+    C --> ST["StepExecution → Completed / Failed"]
+
+    SK --> S
+    ST --> S
+    S --> F["JobExecution → Completed / Failed"]
+```
+
+**Restart is not a branch on this diagram.** A fresh run is the same path with
+every lookup returning `None`; the two lookups that make a restart a restart —
+`last_execution` and `last_step_execution` — run identically either way. That is
+why there is no `if restarting` anywhere in the engine, and why the property is
+testable: `a_first_run_starts_every_step_from_an_empty_context`.
+
+**Note where the transaction is not.** The launcher's gate (read the last
+execution, then create one) is two statements outside any transaction, so two
+processes racing an instance that has never run can still both launch. Narrow,
+known, and recorded as debt (2) rather than claimed fixed.
+
+### 2.1 The chunk loop (spine)
 
 Spring Batch splits this across `TaskletStep` / `RepeatTemplate` / `ChunkOrientedTasklet` /
 `ChunkProvider` / `ChunkProcessor`. BatchFlow collapses the Java loop-abstractions (`RepeatTemplate`)
@@ -91,6 +135,52 @@ Step (owns the transaction + StepExecution):
 - **Processing happens once, outside the transaction.** `process` consumes its item, so it *cannot* be re-run; the transaction therefore spans only write-and-commit. Side benefit: a processor making a 200 ms enrichment call per item no longer holds row locks for 200 seconds a chunk.
 - **A retry opens a new transaction.** Enforced by the type system — `rollback(tx)`/`commit(tx)` take `Tx` by value, so the rolled-back one is gone. Reusing it would meet Postgres' `25P02` on every subsequent statement.
 
+### 2.2 The tasklet — one unit of work `[BUILT — Phase 4]`
+
+The other kind of step (FR-1.2). No items, therefore no commit interval to size;
+truncating a staging table, archiving a file, calling a stored procedure.
+
+```
+TaskletStep::run:
+  loop:
+    tx = commit.begin()
+    contribution = StepContribution::new()          # fresh: an errored pass
+    match tasklet.execute(&mut tx, ctx, &mut contribution):   # folds nothing
+        Err(e) => { commit.rollback(tx); return Err(e) }
+        Ok(status) => {
+            commit.commit(tx, &contribution, ctx)    # counters + bookmark + tx
+            if status == Finished: return Ok(())
+        }
+```
+
+Three things are load-bearing and each is a consequence of a signature, not a
+preference:
+
+- **`RepeatStatus::{Continuable, Finished}` exists so that "more work" gets a
+  commit point.** A tasklet looping inside one `execute` call commits once at
+  the end, and a crash before that loses all of it. Returning `Continuable`
+  instead gives each pass its own transaction and its own durable bookmark, so a
+  tasklet is restartable on exactly the same machinery a chunk step is. The cost:
+  nothing bounds that loop, because there is no item count to bound it *with* —
+  a tasklet that always returns `Continuable` runs forever. Documented, not
+  guarded.
+- **Two traits, `Tasklet` and `TransactionalTasklet<Tx>`, adapted by the same
+  `Unmanaged<T>` newtype the writers use.** Identical reasoning to ADR-007: a
+  blanket impl would overlap every direct one, and making non-transactional work
+  visible at the call site is the point. It also means a tasklet written for
+  `Tx = ()` drops into a `Job<PgTx>` unchanged.
+- **No retry, no skip.** Skip is meaningless with nothing to drop. Retry would
+  re-call `execute` on a tasklet that has already mutated its own state — which
+  is exactly the "your code must be idempotent" obligation §2.1 avoids imposing
+  on processors, reappearing here. A tasklet that wants to retry owns that
+  decision, where it can see what it already did.
+
+Counters still reconcile: a tasklet's committed `StepContribution` feeds the same
+`batchflow_items_*` counters the chunk loop does, so
+`sum(items_written_total) == sum(write_count)` holds for a job containing both.
+Its skips carry `phase="tasklet"`, since a tasklet is opaque and has no
+read/process/write distinction to attribute them to.
+
 ### Restart
 Not special code. Load prior `JobExecution`; skip `COMPLETED` steps; hand the failed step's persisted
 `ExecutionContext` back to its reader; resume the same loop. Engine can't distinguish "fresh at row 4000"
@@ -115,7 +205,9 @@ opt-in per step through `ChunkStep::with_fault_tolerance(FaultTolerance)`. The d
   is a broken input file, which a per-chunk counter would call healthy. Past the limit the step fails with
   `SkipLimitExceeded`, carrying the item error as its source.
 - **A write failure still cannot be skipped**, because it does not name an item ⇒ optional **chunk scanning**
-  (one-at-a-time) remains `[OPEN]`, FR-6.4. This is now the only gap in FR-6.
+  (one-at-a-time), FR-6.4. `[BUILT — Phase 10d]`, opt-in via `scan_on_write_failure`, off by default: for an
+  `Unmanaged` writer the identifying pass really delivers, so a 1000-item chunk with one bad row sends roughly
+  2000 items. FR-6 has no remaining gap.
 - **Classification needs the cause, not the message.** The wrapping `BatchError` variants carry
   `Cause = Box<dyn Error + Send + Sync>`; stringifying a `sqlx::Error` at the boundary makes a deadlock and a
   `NOT NULL` violation indistinguishable. Backends supply their own `Classifier` (`PostgresClassifier` reads
@@ -152,20 +244,32 @@ Phase 11 against real Postgres, not against the InMemory fake.
 
 Cargo workspace; core stays dependency-light, backends/observability are separate opt-in crates.
 
-| Crate | Purpose | Why separate |
-|---|---|---|
-| `batchflow-core` | Traits, domain types, `BatchError`, chunk-loop engine | Stable heart; minimal deps; what users import |
-| `batchflow-memory` | InMemory `JobRepository` etc. | Zero-dep testing + reference impl |
-| `batchflow-postgres` | Postgres backend (sqlx) | Heavy dep (sqlx) must be opt-in |
-| `batchflow-redis` | Redis backend | Opt-in |
-| `batchflow-metrics` ☑ | Prometheus exporter + buckets + `install()` | Heavy dep must be opt-in. Note the *facade* (`metrics`) is a dependency of `batchflow-core` — instrumentation points are inside the private chunk loop, so no external crate can reach them; it costs core one runtime dep. |
-| `batchflow-tracing` | `tracing`/OpenTelemetry wiring | Optional observability |
-| `batchflow-scheduler` | Adapters to external schedulers | Integration, not engine |
-| `batchflow-io` | CSV/JSON/SQL readers & writers | Keeps I/O deps out of core |
-| `batchflow-testing` | Test harness, fakes, failure injection | Test-only helpers |
-| `examples/` | Runnable end-to-end examples | Docs that compile |
+**As built.** Six crates, and the differences from the Phase 0 sketch are more
+interesting than the similarities — three planned crates were not built, each
+for a reason worth keeping.
 
-> Today the repo is a single crate (`batchflow`). Split into the workspace at **Phase 1**.
+| Crate | Purpose | MSRV | Why separate |
+|---|---|---|---|
+| `batchflow` | Facade — the crate a user depends on | 1.85 | Its dependency graph *is* a user's, so a doctest here cannot compile something a user cannot (see debt 4) |
+| `batchflow-core` | Traits, domain types, `BatchError`, engine | 1.85 | Stable heart; 34 runtime deps |
+| `batchflow-postgres` | PostgreSQL metadata store (sqlx) | 1.94 | Heavy dep, and sqlx 0.9's own MSRV must not become everyone's |
+| `batchflow-redis` | Redis metadata store | 1.88 | Opt-in; correctness depends on `appendfsync always`, documented in the crate |
+| `batchflow-metrics` | Prometheus exporter, buckets, `install()` | 1.85 | Holds bucket boundaries and `describe()` ordering. Note the `metrics` *facade* is a dependency of core itself — the emit points are inside the private chunk loop, so no external crate could reach them |
+| `batchflow-scheduler` | `trigger` semantics + a `cron` adapter | 1.85 | 37 deps by default, 66 with `cron` — the engine is behind the flag |
+
+**Planned and deliberately not built:**
+
+| Crate | Why not |
+|---|---|
+| `batchflow-memory` | Zero deps, and core's own tests need the in-memory store. It lives in `batchflow-core` (ADR-007, amended) |
+| `batchflow-tracing` | ADR-010. Measured: the layer alone is 39 crates, with `opentelemetry-otlp` 99, against core's 24 at the time. Once the exporter belongs to the application there is no content left, and shipping it would pin users to one `opentelemetry` minor — two semver-incompatible copies means two tracer providers and spans silently going nowhere |
+| `batchflow-io` | No CSV/JSON/SQL readers ship yet. FR-3.4 is still open, and the crate should be created by the first reader that needs it, not before |
+| `batchflow-testing` | The fakes are `#[cfg(test)]` in core; what backend authors need is the **contract**, which ships as `batchflow-core`'s `conformance` feature instead |
+
+> **The general lesson, recorded because it kept recurring:** a planned crate is
+> a hypothesis. Three of nine were falsified by measuring the dependency tree or
+> by noticing the crate would have no content. `batchflow-metrics` survived the
+> same scrutiny and is the control.
 
 ---
 
@@ -185,15 +289,15 @@ Principle: **own orchestration, integrate everything else.** Selections and one-
 | CPU parallelism | **rayon** | — | For CPU-bound processors; bridge to async carefully. |
 | Async streams | **futures / tokio-stream** | — | Reader-as-stream adapters. |
 | Retry | **backon** | tokio-retry (less active) | Ergonomic backoff builder, async-first, maintained. We own *classification*; delegate *backoff*. |
-| Scheduling | **integrate**: tokio-cron-scheduler / k8s CronJob / system cron | building our own | Non-goal to build a scheduler. |
+| Scheduling | **integrate**: tokio-cron-scheduler / k8s CronJob / system cron | building our own | Non-goal to build a scheduler. `[DECIDED — Phase 14]` `batchflow-scheduler`; `tokio-cron-scheduler` behind the `cron` feature (37 → 66 deps). |
 | Metrics | **metrics** (+ Prometheus exporter) | prometheus crate directly | Facade decouples us from exporter choice. |
 | Tracing | **tracing** | log | Spans model job/step/chunk naturally. |
 | OpenTelemetry | **opentelemetry** (+ tracing-opentelemetry) | — | Standard distributed tracing export. |
-| Config | **figment** or **config** | — | `[OPEN]` — decide at Phase 14/scheduler. |
+| Config | **none** | figment, config | `[DECIDED — Phase 14]` **No config crate.** Phase 14 was where this was to be settled, and building it settled it: a job is wired in Rust — `ChunkStep::new(..)`, `FaultTolerance::new().retry(..)` — and there is nothing left for a config file to carry that is not the application's own. A framework that read `batchflow.toml` would have to invent a registry mapping names to reader types, which is a plugin system nobody asked for. |
 | CLI | **clap** | — | Standard; only for `examples`/tooling. |
-| Time | **chrono** | time | `[OPEN]` — chrono for breadth; revisit. |
-| UUID | **uuid** | — | Execution IDs. |
-| Testing | **rstest**, **proptest**, **testcontainers** | — | Params, property tests, real Postgres in integration. |
+| Time | **none** | chrono, time | `[DECIDED — Phase 14]` **No time crate in any BatchFlow crate.** The schema has no timestamps (which is *why* `abandon_execution` is an operator assertion — see 9a), and the one place a clock seemed unavoidable turned out to belong to the caller: the run key in `JobParameters` is built by whatever fired the schedule, from whatever calendar it uses. `chrono` appears in the lock file only as `tokio-cron-scheduler`'s own dependency, behind the `cron` feature, and no BatchFlow type mentions it. Revisit the moment a timestamp column lands in `job_execution`. |
+| UUID | **none** | uuid | `[DECIDED]` Ids are `i64` newtypes minted by the store — a Postgres sequence, a Redis `INCR`. A UUID would buy client-side generation the engine never needs, and cost an index. |
+| Testing | **proptest**, **testcontainers** | rstest | `[DECIDED]` proptest for the chunk-loop invariants (Phase 6), testcontainers for real Postgres and Redis. **rstest not adopted:** its value is parameterised cases, and the one place this suite needed them — the backend contract — is served better by the `conformance` macro, which generates the same 32 cases for *every* backend rather than for one test. |
 | Benchmarking | **criterion** | — | Statistically sound; Phase 17. |
 
 ---
@@ -244,8 +348,28 @@ branch, and a `String` payload is only ever for wrapping a foreign error.
 **Decision:** Define `JobRepository` (+ friends) as traits; ship `batchflow-memory` first, then Postgres, then Redis.
 **Consequences:** Fast tests, clean SPI. The hard open problem is transaction ownership across writer + repository (ADR pending, Phase 7).
 
-### ADR-006 — Scheduling is integration, not an engine `[DECIDED]`
+### ADR-006 — Scheduling is integration, not an engine `[DECIDED — BUILT Phase 14]`
 BatchFlow exposes a launch API; external schedulers trigger it. No home-grown cron engine.
+
+**What building it revealed.** The missing piece was much smaller than "adapters", and it was not
+plumbing: it was a *classification*. `JobLauncher::run` reports "this instance already completed"
+and "another execution is still running" as `BatchError`s — correct for a caller that asked for a
+run, and wrong for a schedule, to which both are the system working. A nightly job whose 03:00 run
+is still going at 04:00 must not start twice; a re-fired tick must be a no-op. `trigger` turns those
+two errors into `Outcome`s and leaves every other error alone, and that is the whole crate's
+substance. Everything else — cron parsing, missed-tick policy, leader election — belongs to
+Kubernetes or systemd, which already do it.
+
+**The corollary is that the run key is the real API.** Deriving `JobParameters` from the tick
+(`date=2026-08-06`) is what makes a schedule idempotent, because FR-4.2 identity then does the
+deduplication. Constant parameters give a job that runs once ever; parameters containing a timestamp
+give one with no deduplication and no restart, since every attempt is a new instance. Neither is what
+a schedule wants, and neither is something the framework can detect — so it is documented at the
+crate root, where the person choosing is reading.
+
+**One new metric, `batchflow_triggers_total{job,outcome}`,** because a refusal creates no
+`JobExecution` at all: a schedule that has been refused every night for a week emits *nothing* in the
+core vocabulary, and the silence is indistinguishable from a healthy deployment.
 
 ### ADR-007 — Transaction ownership: opt-in transactional writer `[DECIDED 2026-07-27]`
 **Context:** §2's chunk loop promises data + metadata + bookmark commit atomically (FR-2.4), which is what makes restart non-duplicating (FR-5.3). But `ItemWriter::write(&mut self, items)` has no access to a transaction, so as written the promise is unachievable — the writer commits independently of the repository.

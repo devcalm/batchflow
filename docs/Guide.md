@@ -1,16 +1,19 @@
 # BatchFlow guide
 
 Concepts first, then recipes. If you want running code instead, start with
-[Examples.md](Examples.md) — four programs, three of which need no database.
+[Examples.md](Examples.md) — five programs, four of which need no database.
 
 - [The model](#the-model)
 - [Your first job](#your-first-job)
 - [The chunk loop](#the-chunk-loop)
+- [Tasklets](#tasklets)
 - [Restart](#restart)
 - [Transactions](#transactions)
 - [Retry and skip](#retry-and-skip)
 - [PostgreSQL](#postgresql)
+- [Scheduling](#scheduling)
 - [Observability](#observability)
+- [Dashboards and alerts](#dashboards-and-alerts)
 - [Choosing a backend](#choosing-a-backend)
 - [Writing your own backend](#writing-your-own-backend)
 - [Mistakes worth avoiding](#mistakes-worth-avoiding)
@@ -163,6 +166,77 @@ BatchFlow's own per-chunk cost is about 102 ns, so **the framework is never the
 reason to raise your chunk size — your database is.** Measurements and the full
 curve are in [Performance.md](Performance.md). A few hundred to a few thousand
 suits most jobs.
+
+## Tasklets
+
+Not every step reads items. Truncating a staging table, archiving yesterday's
+file, calling a stored procedure — one unit of work, no commit interval to size.
+That is a `Tasklet`, and it is a peer of `ChunkStep`, not a lesser form of one:
+both become a `Step` and a `Job` cannot tell them apart.
+
+```rust
+use batchflow::batchflow_core::{
+    BatchError, ExecutionContext, RepeatStatus, StepContribution, Tasklet,
+    TaskletStep, Unmanaged,
+};
+
+struct TruncateStaging;
+
+impl Tasklet for TruncateStaging {
+    async fn execute(
+        &mut self,
+        _context: &mut ExecutionContext,
+        contribution: &mut StepContribution,
+    ) -> Result<RepeatStatus, BatchError> {
+        // ... do the work ...
+        contribution.increment_write(1);
+        Ok(RepeatStatus::Finished)
+    }
+}
+
+let job: Job = Job::builder("nightly")
+    .step(TaskletStep::new("truncate", Unmanaged(TruncateStaging)))
+    .step(load_step)
+    .build();
+```
+
+The `: Job` is load-bearing. Anything wrapped in `Unmanaged` implements its step
+trait for *every* transaction type, so nothing in that expression pins one —
+naming the job's type is what chooses it. `Job` is `Job<()>`; a job whose steps
+enlist in a Postgres transaction is `Job<PgTx>`, by the same one word.
+
+`Unmanaged` means the same thing it means for a writer: *this does not enlist in
+the step's transaction*, stated at the call site rather than inferred. A tasklet
+that does want the transaction implements `TransactionalTasklet<Tx>` instead and
+receives `&mut Tx`, which is how you get "delete the staging rows and record
+that you did" as one atomic act.
+
+**`RepeatStatus` is the interesting part.** Returning `Continuable` runs
+`execute` again in a *fresh transaction*, so a long tasklet gets a commit point
+per pass and — if it leaves a bookmark in the context — restarts from where it
+stopped:
+
+```rust
+let done = context.get_long("archived")?.unwrap_or(0);
+archive_one(done)?;
+context.put("archived", ContextValue::Long(done + 1));
+contribution.increment_write(1);
+
+Ok(if done + 1 == self.total { RepeatStatus::Finished } else { RepeatStatus::Continuable })
+```
+
+Loop inside a single `execute` instead and you commit once at the very end,
+which means a crash loses all of it. The trade is that **nothing bounds a
+`Continuable` loop** — there is no item count to bound it with, the way a skip
+limit bounds a non-advancing reader — so a tasklet that never returns `Finished`
+runs until the process is killed. That is your obligation, not the engine's.
+
+Two things a tasklet deliberately does not get: **retry and skip.** Skip has no
+meaning with no items to drop, and retry would re-call `execute` on a tasklet
+that has already changed its own state — the "must be idempotent" obligation
+this framework is careful not to impose on your processor. If you want a
+tasklet to retry, do it inside `execute`, where you can see what you already
+did.
 
 ## Restart
 
@@ -392,6 +466,77 @@ impl Classifier for LoaderClassifier {
 builder still works — annotating the target is enough
 (`fn build_job() -> Job<PgTx>`).
 
+## Scheduling
+
+BatchFlow has no cron engine and will not grow one. What it has is the three-way
+classification a schedule needs, in `batchflow-scheduler`:
+
+```rust
+use batchflow_scheduler::{Outcome, trigger};
+
+match trigger(&launcher, &mut nightly(), &run_key(today)).await? {
+    Outcome::Ran(execution)          => println!("ran: {:?}", execution.status()),
+    Outcome::AlreadyComplete { .. }  => println!("already done today"),
+    Outcome::AlreadyRunning { .. }   => println!("last night's run is still going"),
+    _ => {}
+}
+```
+
+`JobLauncher::run` reports those last two as errors, which is right for a caller
+that asked for a run and wrong for a schedule, to which both mean the system is
+working. Everything genuinely wrong — a failed step, an unreachable metadata
+store — still propagates, because a scheduler that swallowed those would report
+a healthy nightly run that never happened.
+
+**The run key is the whole design.** Derive `JobParameters` from the tick:
+
+```rust
+fn run_key(date: &str) -> JobParameters {
+    JobParameters::new().with("date", JobParameter::String(date.into()))
+}
+```
+
+A re-fired tick resolves to the same `JobInstance` and is refused; tomorrow's
+tick resolves to a new one and runs. Two mistakes to avoid, both of which look
+fine until they do not:
+
+| Run key | What you get |
+|---|---|
+| `date=2026-08-06` | ✅ idempotent per tick, restartable within it |
+| constant | a job that runs exactly **once, ever** |
+| contains a timestamp | **no deduplication and no restart** — every attempt is a new instance |
+
+**Build a fresh `Job` per tick.** A step owns its reader, so reusing one job
+hands the second firing a reader already at end of input. `ScheduledJob` takes a
+closure precisely so this cannot be got wrong:
+
+```rust
+let nightly = ScheduledJob::new(launcher, move || Due {
+    job: build_job(),
+    parameters: run_key(&today()),
+});
+```
+
+**Which trigger to use.** Under Kubernetes, systemd or system cron, call
+`trigger` from `main` and exit — a refusal is exit 0, since a container that
+exits non-zero here is restarted straight back into the same refusal. For a
+long-lived service, enable the `cron` feature and hand `ScheduledJob` to
+`tokio-cron-scheduler`:
+
+```rust
+scheduler.add(nightly.into_cron_job("0 0 2 * * * *")?).await?;  // 02:00 daily, UTC
+```
+
+Note what that costs in observability: the cron callback returns `()`, so it is
+the end of the line for both outcomes and failures. It logs and emits
+`batchflow_triggers_total`, and there is nowhere else for them to go — an
+unmonitored in-process schedule can fail every night in silence. Under an
+external scheduler you get a failing exit code for free.
+
+Overlapping ticks are refused by the *metadata store*, not by the scheduler, so
+the refusal holds across replicas: two processes on one store cannot both run an
+instance.
+
 ## Observability
 
 Both subsystems are inert until you install something, so a library user pays
@@ -417,6 +562,73 @@ batchflow_metrics::builder().install()?;
 store, because both are published only after the chunk commits. Retries are the
 deliberate exception — counted as they happen, so a chunk that retried five
 times and then failed still reports them.
+
+## Dashboards and alerts
+
+The metric names are chosen so the useful queries are short. These are the ones
+worth having before a job goes to production; all of them are labelled by `job`
+and most by `step`, so each is a panel with a legend rather than one panel per
+job.
+
+**Is it running at all?**
+
+```promql
+# Runs in flight. Should return to 0 between schedules; a floor that creeps up
+# means executions are being started and never finished.
+sum by (job) (batchflow_jobs_started_total) - sum by (job) (batchflow_jobs_finished_total)
+
+# Firings that did no work. Silence here is *not* good news: a refused schedule
+# emits no jobs_started at all, so without this panel a job that has been
+# skipping for a week looks exactly like a healthy one.
+sum by (job, outcome) (rate(batchflow_triggers_total[1d]))
+```
+
+**Is it healthy?**
+
+```promql
+# Success rate. Every series exists from step start, so a job that has never
+# failed reads 0 rather than being absent — which is why this does not go blank
+# for your healthiest jobs.
+sum by (job) (rate(batchflow_jobs_finished_total{status="completed"}[1d]))
+  / sum by (job) (rate(batchflow_jobs_finished_total[1d]))
+
+# Skips by phase. The `phase` label is the diagnosis: `read` is a broken input
+# file, `process` is a bad assumption in your code, `write` is a constraint,
+# `tasklet` is whatever the tasklet decided.
+sum by (job, step, phase) (rate(batchflow_items_skipped_total[5m]))
+```
+
+**Is it fast enough?**
+
+```promql
+# p99 chunk latency. A histogram, not a summary, precisely so this aggregates
+# across replicas — quantiles computed per process cannot be summed.
+histogram_quantile(0.99, sum by (le, job, step) (rate(batchflow_chunk_duration_seconds_bucket[5m])))
+
+# Throughput, in items per second.
+sum by (job, step) (rate(batchflow_items_written_total[5m]))
+```
+
+**Three alerts worth paging on**, and the reasoning behind each:
+
+| Alert | Expression | Why |
+|---|---|---|
+| Chunk scanning is happening | `rate(batchflow_chunk_scans_total[15m]) > 0` | Every good item in a scanned chunk is written twice. With an `Unmanaged` writer that is real duplicate delivery, and it will not stop on its own |
+| Retries without progress | `rate(batchflow_chunk_retries_total[15m]) > 0 and rate(batchflow_chunks_committed_total[15m]) == 0` | Retrying and committing is a contended database; retrying and *not* committing is a stuck job |
+| A schedule stopped running | `rate(batchflow_triggers_total{outcome="ran"}[2d]) == 0` | Catches a job whose run key stopped changing — the failure mode that produces no errors at all |
+
+Two things the metrics deliberately cannot tell you, so do not build a panel
+trying:
+
+- **Which run.** No execution id is ever a label; one label value per run mints
+  one time series per run, written once and kept forever. Correlating a specific
+  execution is tracing's job, where high cardinality is the point — the `job` and
+  `step` spans carry `instance_id` and `execution_id`.
+- **When the skips happened.** A `skip_count` of 400 cannot say whether they were
+  one contiguous block (a corrupt input segment) or evenly scattered (a
+  systematic parse bug), and those have opposite remedies. That is a question
+  about ordering in time, which a counter structurally cannot hold; the skip
+  events in the trace can.
 
 ## Choosing a backend
 
